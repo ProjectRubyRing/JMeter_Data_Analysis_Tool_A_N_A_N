@@ -970,28 +970,49 @@ namespace AuroraTestMock
     Assert-True (@($an.Warnings | Where-Object { $_.Category -eq '大容量ペイロード' -and $_.TableName -eq 'orders' -and $_.ColumnName -eq 'payload_json' }).Count -ge 1) "Detected Large Payload warning on orders.payload_json"
     Assert-True (@($an.Warnings | Where-Object { $_.Category -eq '全NULLカラム' -and $_.TableName -eq 'audit_logs' -and $_.ColumnName -eq 'legacy_trace_id' }).Count -ge 1) "Detected 100% NULL column warning on audit_logs.legacy_trace_id"
 
-    # Execute TWO-STAGE .bat -> .ps1 invocation (Excel COM)
+    # Execute TWO-STAGE .bat -> .ps1 invocation (Excel COM: Default 3 sheets & Detailed 8 sheets)
     $excelBefore = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     $outCom = Join-Path $workDir 'Aurora_Report_COM.xlsx'
     $batCmd = "`"$batPath`" -Mode AnalyzeOnly -NoGui -InputFolder `"$csvDir`" -OutputPath `"$outCom`" -ExcelEngine Com"
     $batOut = cmd.exe /c $batCmd 2>&1
     $batExit = $LASTEXITCODE
-    Assert-True ($batExit -eq 0 -and (Test-Path -LiteralPath $outCom)) "Two-stage Run_AuroraCsvAnalyzer.bat -> .ps1 (Excel COM) exited 0 and created report ($outCom)"
+    Assert-True ($batExit -eq 0 -and (Test-Path -LiteralPath $outCom)) "Two-stage Run_AuroraCsvAnalyzer.bat -> .ps1 (Excel COM Default 3-sheet) exited 0 and created report ($outCom)"
     if ($batExit -ne 0) { Write-Host ($batOut -join "`n") -ForegroundColor Red }
+
+    $outComDetail = Join-Path $workDir 'Aurora_Report_COM_Detail.xlsx'
+    $batOutDetail = cmd.exe /c "`"$batPath`" -Mode AnalyzeOnly -NoGui -DetailedAnalysis -InputFolder `"$csvDir`" -OutputPath `"$outComDetail`" -ExcelEngine Com" 2>&1
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $outComDetail)) "Two-stage Run_AuroraCsvAnalyzer.bat -> .ps1 (Excel COM Detailed 8-sheet) exited 0 and created report"
+    if ($LASTEXITCODE -ne 0) { Write-Host ($batOutDetail -join "`n") -ForegroundColor Red }
 
     Start-Sleep -Milliseconds 500
     $excelAfter = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
     $leakedExcel = @($excelAfter | Where-Object { $excelBefore -notcontains $_ })
     Assert-True ($leakedExcel.Count -eq 0) "Zero lingering EXCEL.EXE COM processes after generation"
 
-    # Also test OpenXML Fallback engine via .bat
+    # Also test OpenXML Fallback engine via .bat (Default 3 sheets & Detailed 8 sheets)
     $outXml = Join-Path $workDir 'Aurora_Report_OpenXML.xlsx'
     $batOut2 = cmd.exe /c "`"$batPath`" -Mode AnalyzeOnly -NoGui -InputFolder `"$csvDir`" -OutputPath `"$outXml`" -ExcelEngine OpenXml" 2>&1
-    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $outXml)) "Two-stage Run_AuroraCsvAnalyzer.bat -> .ps1 (OpenXML fallback) exited 0 and created report"
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $outXml)) "Two-stage Run_AuroraCsvAnalyzer.bat -> .ps1 (OpenXML fallback Default 3-sheet) exited 0 and created report"
+    if ($LASTEXITCODE -ne 0) { Write-Host ($batOut2 -join "`n") -ForegroundColor Red }
 
-    Write-Host "`n=== 6. Deep OOXML Verification (Sheets, Font Meiryo UI, Exact RGB #333333 / #1A2B4C / #800020, Charts) ===" -ForegroundColor Cyan
+    $outXmlDetail = Join-Path $workDir 'Aurora_Report_OpenXML_Detail.xlsx'
+    $batOut2Detail = cmd.exe /c "`"$batPath`" -Mode AnalyzeOnly -NoGui -DetailedAnalysis -InputFolder `"$csvDir`" -OutputPath `"$outXmlDetail`" -ExcelEngine OpenXml" 2>&1
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $outXmlDetail)) "Two-stage Run_AuroraCsvAnalyzer.bat -> .ps1 (OpenXML fallback Detailed 8-sheet) exited 0 and created report"
+    if ($LASTEXITCODE -ne 0) { Write-Host ($batOut2Detail -join "`n") -ForegroundColor Red }
+
+    Write-Host "`n=== 6. Deep OOXML Verification (Default 3 Sheets vs Detailed 8 Sheets, Header Term, Rich Contents, Font/Colors/Charts) ===" -ForegroundColor Cyan
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    foreach ($pair in @(@{ Name = 'Excel COM'; Path = $outCom; MinCharts = 8 }, @{ Name = 'OpenXML Fallback'; Path = $outXml; MinCharts = 1 })) {
+    $defaultSheets = @('01_サマリー','02_テーブル一覧','03_カラム分析')
+    $detailOnlySheets = @('04_分布・割合分析','05_数値統計・ヒストグラム','06_時系列分析','07_リレーション・ファンアウト','08_性能試験ガイド・警告')
+    $allEightSheets = $defaultSheets + $detailOnlySheets
+
+    $auditTargets = @(
+        @{ Name = 'Excel COM (Default 3-sheet)';      Path = $outCom;       Detailed = $false; MinCharts = 5 },
+        @{ Name = 'OpenXML Fallback (Default 3-sheet)'; Path = $outXml;     Detailed = $false; MinCharts = 1 },
+        @{ Name = 'Excel COM (Detailed 8-sheet)';     Path = $outComDetail; Detailed = $true;  MinCharts = 9 },
+        @{ Name = 'OpenXML Fallback (Detailed 8-sheet)'; Path = $outXmlDetail; Detailed = $true; MinCharts = 1 }
+    )
+    foreach ($pair in $auditTargets) {
         $z = [System.IO.Compression.ZipFile]::OpenRead($pair.Path)
         try {
             $wbEntry = $z.GetEntry('xl/workbook.xml')
@@ -999,10 +1020,32 @@ namespace AuroraTestMock
             $stEntry = $z.GetEntry('xl/styles.xml')
             $stSr = New-Object System.IO.StreamReader($stEntry.Open()); $stText = $stSr.ReadToEnd(); $stSr.Dispose()
 
-            $expectedSheets = @('01_サマリー','02_テーブル一覧','03_カラム分析','04_分布・割合分析','05_数値統計・ヒストグラム','06_時系列分析','07_リレーション・ファンアウト','08_性能試験ガイド・警告')
-            $allSheetsPresent = $true
-            foreach ($sn in $expectedSheets) { if ($wbText -notmatch [regex]::Escape($sn)) { $allSheetsPresent = $false } }
-            Assert-True $allSheetsPresent "[$($pair.Name)] All 8 Japanese worksheets exist in xl/workbook.xml"
+            $wbDoc = New-Object System.Xml.XmlDocument
+            $wbDoc.LoadXml($wbText)
+            $nsmWb = New-Object System.Xml.XmlNamespaceManager (New-Object System.Xml.NameTable)
+            $nsmWb.AddNamespace('x', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+            $actualSheetNames = @($wbDoc.SelectNodes('//x:sheets/x:sheet', $nsmWb) | ForEach-Object { $_.GetAttribute('name') })
+
+            if ($pair.Detailed) {
+                $exactMatch = ($actualSheetNames.Count -eq 8) -and (($actualSheetNames -join '|') -ceq ($allEightSheets -join '|'))
+                Assert-True $exactMatch "[$($pair.Name)] Exact 8 worksheets present (got: $($actualSheetNames -join ', '))"
+            }
+            else {
+                $exactMatch = ($actualSheetNames.Count -eq 3) -and (($actualSheetNames -join '|') -ceq ($defaultSheets -join '|'))
+                $noneDetail = $true
+                foreach ($dn in $detailOnlySheets) { if ($actualSheetNames -contains $dn) { $noneDetail = $false } }
+                Assert-True ($exactMatch -and $noneDetail) "[$($pair.Name)] Default mode outputs ONLY 3 worksheets (01/02/03) and omits 04-08 (got: $($actualSheetNames -join ', '))"
+            }
+
+            # Read sheet1/2/3 + sharedStrings to verify header terminology and enriched detailed content
+            $allText123 = ''
+            foreach ($ze in $z.Entries | Where-Object { $_.FullName -match '^xl/(sharedStrings|worksheets/sheet[123])\.xml$' }) {
+                $sr = New-Object System.IO.StreamReader($ze.Open()); $allText123 += $sr.ReadToEnd(); $sr.Dispose()
+            }
+            Assert-True (($allText123 -notmatch 'エグゼクティブサマリー') -and ($allText123 -match '性能試験用データ分析レポート — サマリー')) "[$($pair.Name)] 01_サマリー header uses 'サマリー' (no 'エグゼクティブサマリー')"
+            Assert-True (($allText123 -match '推定役割別テーブル構成サマリー') -and ($allText123 -match 'データ型別カラム構成') -and ($allText123 -match '主要警告・リスクサマリー') -and ($allText123 -match '推定ACU目安')) "[$($pair.Name)] 01_サマリー includes enriched KPIs, role/type breakdowns, and risk highlights"
+            Assert-True (($allText123 -match '最小行長\(B\)') -and ($allText123 -match '推定InnoDBページ数') -and ($allText123 -match 'データ型構成') -and ($allText123 -match '日時データ期間') -and ($allText123 -match 'JMeter並列適性')) "[$($pair.Name)] 02_テーブル一覧 includes enriched detailed table metrics"
+            Assert-True (($allText123 -match '列順') -and ($allText123 -match '有効件数') -and ($allText123 -match '正規化エントロピー') -and ($allText123 -match '上位値分布 \(Top5\)') -and ($allText123 -match '型別詳細統計') -and ($allText123 -match 'リレーション推定')) "[$($pair.Name)] 03_カラム分析 includes enriched detailed column metrics"
 
             Assert-True ($stText -match 'Meiryo UI') "[$($pair.Name)] Meiryo UI font verified in xl/styles.xml"
             Assert-True ($stText -match '333333') "[$($pair.Name)] Exact Dark Gray (#333333) verified in xl/styles.xml"
@@ -1042,29 +1085,60 @@ namespace AuroraTestMock
         $outputField = $pathGroup.Controls | Where-Object Text -eq $guiReport
         $dbGroup = $guiForm.Controls | Where-Object Text -like '3. A5:*'
         $openReport = $guiForm.Controls | Where-Object Text -like '完了後にExcel*'
+        $detailedChk = $guiForm.Controls.Find('DetailedAnalysis', $true)[0]
         $resumeChk = $guiForm.Controls.Find('ResumeExport', $true)[0]
+        $compareOption = $guiForm.Controls.Find('CompareMode', $true)[0]
         $runButton = $guiForm.Controls | Where-Object Text -eq '実行開始'
         $cancelButton = $guiForm.Controls.Find('CancelButton', $true)[0]
 
         $guiForm.Show() # Button.PerformClick() requires a visible, selectable control.
         $openReport.Checked = $false
+        Assert-True ($null -ne $detailedChk -and -not $detailedChk.Checked -and $detailedChk.Right -lt $runButton.Left) "GUI includes DetailedAnalysis checkbox, unchecked by default, with zero overlap against Run button (Right=$($detailedChk.Right) < $($runButton.Left))"
         Assert-True ($null -ne $resumeChk -and $null -ne $cancelButton -and -not $cancelButton.Enabled) "GUI includes ResumeExport checkbox and initially disabled CancelButton"
-        Assert-True ($analyzeOption.Checked -and -not $dbGroup.Enabled -and $outputField.Enabled -and -not $resumeChk.Enabled) "AnalyzeOnly is selected initially with ResumeExport disabled"
+        Assert-True ($analyzeOption.Checked -and -not $dbGroup.Enabled -and $outputField.Enabled -and -not $resumeChk.Enabled -and $detailedChk.Enabled) "AnalyzeOnly is selected initially with ResumeExport disabled and DetailedAnalysis enabled"
         $directOption.Checked = $true
-        Assert-True ($dbGroup.Visible -and $dbGroup.Enabled -and -not $inputField.Enabled -and $outputField.Enabled -and $openReport.Enabled -and -not $resumeChk.Enabled) "DirectAnalyze enables DB and report settings while disabling CSV folder input and ResumeExport"
+        Assert-True ($dbGroup.Visible -and $dbGroup.Enabled -and -not $inputField.Enabled -and $outputField.Enabled -and $openReport.Enabled -and -not $resumeChk.Enabled -and $detailedChk.Enabled) "DirectAnalyze enables DB, report settings, and DetailedAnalysis while disabling CSV folder input and ResumeExport"
         $fullOption.Checked = $true
-        Assert-True ($dbGroup.Enabled -and $inputField.Enabled -and $outputField.Enabled -and $openReport.Enabled -and $resumeChk.Enabled) "ExportAndAnalyze enables DB, folder, report settings, and ResumeExport"
+        Assert-True ($dbGroup.Enabled -and $inputField.Enabled -and $outputField.Enabled -and $openReport.Enabled -and $resumeChk.Enabled -and $detailedChk.Enabled) "ExportAndAnalyze enables DB, folder, report settings, DetailedAnalysis, and ResumeExport"
         $exportOption.Checked = $true
-        Assert-True ($dbGroup.Enabled -and $inputField.Enabled -and -not $outputField.Enabled -and -not $openReport.Enabled -and $resumeChk.Enabled) "ExportOnly disables report settings while keeping ResumeExport enabled"
+        Assert-True ($dbGroup.Enabled -and $inputField.Enabled -and -not $outputField.Enabled -and -not $openReport.Enabled -and $resumeChk.Enabled -and -not $detailedChk.Enabled) "ExportOnly disables report settings and DetailedAnalysis while keeping ResumeExport enabled"
+        $compareOption.Checked = $true
+        Assert-True (-not $detailedChk.Enabled -and $outputField.Enabled) "CompareAnalysis disables DetailedAnalysis checkbox"
         $analyzeOption.Checked = $true
-        Assert-True (-not $dbGroup.Enabled -and $inputField.Enabled -and $outputField.Enabled -and $openReport.Enabled -and -not $resumeChk.Enabled) "Switching back to AnalyzeOnly restores report settings and disables ResumeExport"
+        Assert-True (-not $dbGroup.Enabled -and $inputField.Enabled -and $outputField.Enabled -and $openReport.Enabled -and -not $resumeChk.Enabled -and $detailedChk.Enabled) "Switching back to AnalyzeOnly restores report settings and DetailedAnalysis"
 
         $inputField.Text = ''
         $runButton.PerformClick()
         Assert-True ($notice.Caption -eq '入力チェック') "Run with an empty input folder shows the validation message"
         $inputField.Text = $csvDir
         $runButton.PerformClick()
-        Assert-True ($notice.Caption -eq '完了' -and (Test-Path -LiteralPath $guiReport) -and $runButton.Enabled -and -not $cancelButton.Enabled) "Run analyzes the CSV fixture and creates the report ($($notice.Text))"
+        Assert-True ($notice.Caption -eq '完了' -and (Test-Path -LiteralPath $guiReport) -and $runButton.Enabled -and -not $cancelButton.Enabled) "Run analyzes the CSV fixture and creates default 3-sheet report ($($notice.Text))"
+
+        $zGuiDef = [System.IO.Compression.ZipFile]::OpenRead($guiReport)
+        try {
+            $wbGuiDef = New-Object System.Xml.XmlDocument
+            $srG = New-Object System.IO.StreamReader($zGuiDef.GetEntry('xl/workbook.xml').Open()); $wbGuiDef.LoadXml($srG.ReadToEnd()); $srG.Dispose()
+            $nsmG = New-Object System.Xml.XmlNamespaceManager (New-Object System.Xml.NameTable); $nsmG.AddNamespace('x', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+            $guiDefSheets = @($wbGuiDef.SelectNodes('//x:sheets/x:sheet', $nsmG) | ForEach-Object { $_.GetAttribute('name') })
+            Assert-True ($guiDefSheets.Count -eq 3 -and ($guiDefSheets -join '|') -ceq '01_サマリー|02_テーブル一覧|03_カラム分析') "GUI run with DetailedAnalysis unchecked outputs exact 3 default sheets ($($guiDefSheets -join ', '))"
+        }
+        finally { $zGuiDef.Dispose() }
+
+        # Check DetailedAnalysis in GUI and verify 8 sheets are output
+        $guiReportDetail = Join-Path $workDir 'Aurora_Report_GUI_Detail.xlsx'
+        $outputField.Text = $guiReportDetail
+        $detailedChk.Checked = $true
+        $runButton.PerformClick()
+        Assert-True ($notice.Caption -eq '完了' -and (Test-Path -LiteralPath $guiReportDetail) -and $runButton.Enabled) "GUI run with DetailedAnalysis checked succeeds ($($notice.Text))"
+        $zGuiDet = [System.IO.Compression.ZipFile]::OpenRead($guiReportDetail)
+        try {
+            $wbGuiDet = New-Object System.Xml.XmlDocument
+            $srG2 = New-Object System.IO.StreamReader($zGuiDet.GetEntry('xl/workbook.xml').Open()); $wbGuiDet.LoadXml($srG2.ReadToEnd()); $srG2.Dispose()
+            $nsmG2 = New-Object System.Xml.XmlNamespaceManager (New-Object System.Xml.NameTable); $nsmG2.AddNamespace('x', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+            $guiDetSheets = @($wbGuiDet.SelectNodes('//x:sheets/x:sheet', $nsmG2) | ForEach-Object { $_.GetAttribute('name') })
+            Assert-True ($guiDetSheets.Count -eq 8 -and $guiDetSheets[7] -eq '08_性能試験ガイド・警告') "GUI run with DetailedAnalysis checked outputs all 8 sheets ($($guiDetSheets -join ', '))"
+        }
+        finally { $zGuiDet.Dispose() }
     }
     finally { $guiForm.Dispose() }
 
@@ -1178,20 +1252,28 @@ namespace AuroraTestMock
     [System.IO.File]::WriteAllLines((Join-Path $cmpAfterDir 'new_batch_results.csv'), $nbLines, (New-Object System.Text.UTF8Encoding($true)))
     # Note: legacy_temp.csv is intentionally absent in After -> 削除（テーブル消失） + Alert!
 
-    # Generate Before (both COM & OpenXML) and After (COM & OpenXML) analysis workbooks
+    # Generate Before (both COM & OpenXML, default 3-sheet) and After (COM & OpenXML, default 3-sheet) + Detailed 8-sheet comparison parity
     $beforeComXlsx = Join-Path $workDir 'Before_Analysis_COM.xlsx'
     $beforeXmlXlsx = Join-Path $workDir 'Before_Analysis_XML.xlsx'
     $afterComXlsx  = Join-Path $workDir 'After_Analysis_COM.xlsx'
     $afterXmlXlsx  = Join-Path $workDir 'After_Analysis_XML.xlsx'
+    $beforeDetXlsx = Join-Path $workDir 'Before_Analysis_Detail.xlsx'
+    $afterDetXlsx  = Join-Path $workDir 'After_Analysis_Detail.xlsx'
 
     $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $cmpBeforeDir -ExcelOutputPath $beforeComXlsx -Engine 'Com'
     $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $cmpBeforeDir -ExcelOutputPath $beforeXmlXlsx -Engine 'OpenXml'
     $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $cmpAfterDir  -ExcelOutputPath $afterComXlsx  -Engine 'Com'
     $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $cmpAfterDir  -ExcelOutputPath $afterXmlXlsx  -Engine 'OpenXml'
+    $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $cmpBeforeDir -ExcelOutputPath $beforeDetXlsx -Engine 'OpenXml' -DetailedAnalysis
+    $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $cmpAfterDir  -ExcelOutputPath $afterDetXlsx  -Engine 'OpenXml' -DetailedAnalysis
 
-    # 8.7 Cross-engine identity test (Before COM vs Before OpenXML -> 0 false positives!)
+    # 8.7 Cross-engine identity test (Before COM vs Before OpenXML, and Default 3-sheet vs Detailed 8-sheet -> 0 false positives!)
     $sameCmp = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($beforeComXlsx, $beforeXmlXlsx)
-    Assert-True ($sameCmp.TotalUniqueTableCount -eq 7 -and $sameCmp.UnchangedTableCount -eq 7 -and $sameCmp.UpdatedSheetCount -eq 0 -and $sameCmp.AddedSheetCount -eq 0 -and $sameCmp.DeletedTableCount -eq 0) "Cross-engine identical comparison (COM vs OpenXML) yields 0 false positives (7/7 unchanged)"
+    Assert-True ($sameCmp.TotalUniqueTableCount -eq 7 -and $sameCmp.UnchangedTableCount -eq 7 -and $sameCmp.UpdatedSheetCount -eq 0 -and $sameCmp.AddedSheetCount -eq 0 -and $sameCmp.DeletedTableCount -eq 0) "Cross-engine identical comparison (COM vs OpenXML, default 3-sheet) yields 0 false positives (7/7 unchanged)"
+    $crossDetailSameCmp = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($beforeComXlsx, $beforeDetXlsx)
+    Assert-True ($crossDetailSameCmp.TotalUniqueTableCount -eq 7 -and $crossDetailSameCmp.UnchangedTableCount -eq 7 -and $crossDetailSameCmp.UpdatedSheetCount -eq 0 -and $crossDetailSameCmp.AddedSheetCount -eq 0) "Cross-mode identical comparison (default 3-sheet COM vs detailed 8-sheet OpenXML) yields 0 false positives (7/7 unchanged)"
+    $detCmpRes = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($beforeDetXlsx, $afterDetXlsx)
+    Assert-True ($detCmpRes.TotalUniqueTableCount -eq 8 -and $detCmpRes.UnchangedTables.Count -eq 2 -and $detCmpRes.AddedTables.Count -eq 3 -and $detCmpRes.UpdatedTables.Count -eq 3 -and $detCmpRes.DeletedTables.Count -eq 1) "Detailed 8-sheet Before/After comparison matches exact bucket counts (Unchanged=2, Added=3, Updated=3, Deleted=1)"
 
     # 8.8 Full Before vs After classification accuracy verification
     $cmpRes = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($beforeComXlsx, $afterComXlsx)
@@ -1341,7 +1423,7 @@ namespace AuroraTestMock
     }
 
     function Test-WorkbookVisualAudit {
-        param([string]$Label, [string]$XlsxPath, [bool]$IsAnalysisWorkbook = $true, [bool]$IsComWorkbook = $true)
+        param([string]$Label, [string]$XlsxPath, [bool]$IsAnalysisWorkbook = $true, [bool]$IsComWorkbook = $true, [bool]$HasDetailedSheets = $false)
         $z = [System.IO.Compression.ZipFile]::OpenRead($XlsxPath)
         try {
             $nsm = New-Object System.Xml.XmlNamespaceManager (New-Object System.Xml.NameTable)
@@ -1486,7 +1568,7 @@ namespace AuroraTestMock
             Assert-True ($falseOptimalWarn -eq 0) "[$Label] Zero false Burgundy warnings on positive ratings like '最適 (高並列対応)'"
             Assert-True ($brokenFmtCount -eq 0) "[$Label] Zero broken C# format artifacts ('02 MB', '111倍', '61/51') or Excel errors"
 
-            if ($IsAnalysisWorkbook -and $IsComWorkbook) {
+            if ($IsAnalysisWorkbook -and $IsComWorkbook -and $HasDetailedSheets) {
                 Assert-True ($has00TimeText -and $coercedTimeFloat -eq 0) "[$Label] 06_時系列分析 preserves '00:00' text verbatim without Excel float coercion"
             }
 
@@ -1511,10 +1593,12 @@ namespace AuroraTestMock
         finally { $z.Dispose() }
     }
 
-    Test-WorkbookVisualAudit -Label 'Analysis COM'    -XlsxPath $outCom     -IsAnalysisWorkbook $true  -IsComWorkbook $true
-    Test-WorkbookVisualAudit -Label 'Analysis OpenXML' -XlsxPath $outXml    -IsAnalysisWorkbook $true  -IsComWorkbook $false
-    Test-WorkbookVisualAudit -Label 'Compare COM'     -XlsxPath $diffComOut -IsAnalysisWorkbook $false -IsComWorkbook $true
-    Test-WorkbookVisualAudit -Label 'Compare OpenXML' -XlsxPath $diffXmlOut -IsAnalysisWorkbook $false -IsComWorkbook $false
+    Test-WorkbookVisualAudit -Label 'Analysis COM (Default 3-sheet)'      -XlsxPath $outCom       -IsAnalysisWorkbook $true  -IsComWorkbook $true  -HasDetailedSheets $false
+    Test-WorkbookVisualAudit -Label 'Analysis OpenXML (Default 3-sheet)'  -XlsxPath $outXml       -IsAnalysisWorkbook $true  -IsComWorkbook $false -HasDetailedSheets $false
+    Test-WorkbookVisualAudit -Label 'Analysis COM (Detailed 8-sheet)'     -XlsxPath $outComDetail -IsAnalysisWorkbook $true  -IsComWorkbook $true  -HasDetailedSheets $true
+    Test-WorkbookVisualAudit -Label 'Analysis OpenXML (Detailed 8-sheet)' -XlsxPath $outXmlDetail -IsAnalysisWorkbook $true  -IsComWorkbook $false -HasDetailedSheets $true
+    Test-WorkbookVisualAudit -Label 'Compare COM'                         -XlsxPath $diffComOut   -IsAnalysisWorkbook $false -IsComWorkbook $true  -HasDetailedSheets $false
+    Test-WorkbookVisualAudit -Label 'Compare OpenXML'                     -XlsxPath $diffXmlOut   -IsAnalysisWorkbook $false -IsComWorkbook $false -HasDetailedSheets $false
 
     # 9.1 Analyzer accuracy regressions (junction table role, dotted email, single-digit slash date, new table AlertNote)
     Assert-True ($oiTbl.InferredRole -eq '中間・関連テーブル') "order_items (2 FK columns, 5 cols) inferred as 中間・関連テーブル (got: $($oiTbl.InferredRole))"

@@ -62,7 +62,8 @@ param(
     [switch]$OpenAfterCreate,
     [switch]$NoGui,
     [string]$A5DbListPath = '',
-    [switch]$Resume
+    [switch]$Resume,
+    [switch]$DetailedAnalysis
 )
 
 Set-StrictMode -Version Latest
@@ -1640,15 +1641,28 @@ namespace AuroraAnalyzer
         public List<HistogramBin> Histogram;
 
         public string Top1Value;
+        public long Top1Count;
         public double Top1Share;
         public double Top3Share;
         public double Top5Share;
         public double Top10Share;
+        public double ConcentrationRatio;
         public double GiniCoefficient;
         public double NormalizedEntropy;
         public string SkewRisk;
         public bool IsCategorical;
         public List<ValueShareItem> TopValues;
+
+        public long WhitespaceOnlyCount;
+        public long MultilineCount;
+        public long NonAsciiCount;
+        public double NonAsciiRate;
+        public string KeyRole;
+        public string MinValueText;
+        public string MaxValueText;
+        public string TopValuesSummary;
+        public string DetailStatsSummary;
+        public string RelationSummary;
 
         public bool IsDateTime;
         public bool HasTimeComponent;
@@ -1675,6 +1689,12 @@ namespace AuroraAnalyzer
             AlertNote = "";
             Top1Value = "";
             PeakDay = "";
+            KeyRole = "一般";
+            MinValueText = "-";
+            MaxValueText = "-";
+            TopValuesSummary = "-";
+            DetailStatsSummary = "-";
+            RelationSummary = "-";
         }
     }
 
@@ -1688,17 +1708,30 @@ namespace AuroraAnalyzer
         public long RowCount;
         public int ColumnCount;
         public long RaggedRowCount;
+        public long MinRowBytes;
         public double AvgRowBytes;
         public long MaxRowBytes;
         public long EstInnoDbBytes;
+        public long EstInnoDbPages;
+        public double RowsPerInnoDbPage;
         public double RowShare;
         public double SizeShare;
         public double AvgNullRate;
         public double AvgCardinalityRate;
         public string InferredRole;
+        public string ColumnTypeBreakdown;
+        public int AllNullColumnCount;
+        public int ConstantColumnCount;
+        public int HighSkewColumnCount;
+        public int LargeColumnCount;
+        public string QualityRiskBreakdown;
         public string CandidatePks;
         public string DateColumns;
+        public string PrimaryDateRange;
         public string CategoricalColumns;
+        public string RelationSummary;
+        public string JMeterReadiness;
+        public int HighWarningCount;
         public int WarningCount;
         public string WarningSummary;
         public List<ColumnAnalysis> Columns;
@@ -1706,9 +1739,14 @@ namespace AuroraAnalyzer
         public TableAnalysis()
         {
             Columns = new List<ColumnAnalysis>();
+            ColumnTypeBreakdown = "-";
+            QualityRiskBreakdown = "問題なし";
             CandidatePks = "";
             DateColumns = "";
+            PrimaryDateRange = "-";
             CategoricalColumns = "";
+            RelationSummary = "-";
+            JMeterReadiness = "対象外";
             WarningSummary = "";
         }
     }
@@ -1769,8 +1807,23 @@ namespace AuroraAnalyzer
         public long TotalColumns;
         public long TotalFileBytes;
         public long TotalEstInnoDbBytes;
+        public long TotalEstInnoDbPages;
         public int HighWarningCount;
+        public int MediumWarningCount;
+        public int LowWarningCount;
         public int TotalWarningCount;
+        public int EmptyTableCount;
+        public long RaggedRowTotal;
+        public int CandidatePkColumnCount;
+        public int AllNullColumnCount;
+        public int HighSkewColumnCount;
+        public int LargeColumnCount;
+        public long TotalOrphanRows;
+        public double OverallAvgNullRate;
+        public double OverallAvgRowBytes;
+        public long OverallMaxRowBytes;
+        public double EstMinAcuCurrent;
+        public double EstMinAcu10x;
 
         public List<TableAnalysis> Tables;
         public List<RelationshipAnalysis> Relationships;
@@ -1820,6 +1873,9 @@ namespace AuroraAnalyzer
         public long UuidCount;
         public long JsonCount;
         public long EmailCount;
+        public long WhitespaceOnlyCount;
+        public long MultilineCount;
+        public long NonAsciiCount;
 
         public int MinCharLen;
         public int MaxCharLen;
@@ -1923,6 +1979,9 @@ namespace AuroraAnalyzer
                 if (slot < MAX_BYTE_SAMPLE) ByteLenSample[slot] = byteLen;
             }
 
+            if (raw.IndexOf('\n') >= 0 || raw.IndexOf('\r') >= 0) MultilineCount++;
+            if (byteLen > charLen) NonAsciiCount++;
+
             // Frequency tracking (truncate ultra-long keys to 120 chars for safe memory)
             string fkey = raw.Length <= 120 ? raw : (raw.Substring(0, 117) + "...");
             long existing;
@@ -1940,7 +1999,11 @@ namespace AuroraAnalyzer
             }
 
             string trimmed = raw.Trim();
-            if (trimmed.Length == 0) return;
+            if (trimmed.Length == 0)
+            {
+                WhitespaceOnlyCount++;
+                return;
+            }
 
             // Check Boolean/Flag
             if (trimmed == "0" || trimmed == "1" ||
@@ -2072,7 +2135,7 @@ namespace AuroraAnalyzer
         internal readonly Dictionary<string, Dictionary<string, long>> KeyMaps =
             new Dictionary<string, Dictionary<string, long>>(StringComparer.OrdinalIgnoreCase);
         private List<ColumnAccumulator> _columns;
-        private long _rows, _raggedRows, _sumRowBytes, _maxRowBytes;
+        private long _rows, _raggedRows, _sumRowBytes, _minRowBytes = long.MaxValue, _maxRowBytes;
 
         internal CsvTableProfile(string path, string encodingName, IList<string> headers)
         {
@@ -2096,13 +2159,15 @@ namespace AuroraAnalyzer
             }
             _rows++;
             _sumRowBytes += bytes;
+            if (bytes < _minRowBytes) _minRowBytes = bytes;
             _maxRowBytes = Math.Max(_maxRowBytes, bytes);
         }
 
         internal void Complete(long size)
         {
             Table.FileSizeBytes = size;
-            CsvAnalysisEngine.FinalizeTableAnalysis(Table, _columns, _rows, _raggedRows, _sumRowBytes, _maxRowBytes, KeyMaps);
+            long effectiveMin = _rows > 0 && _minRowBytes != long.MaxValue ? _minRowBytes : 0L;
+            CsvAnalysisEngine.FinalizeTableAnalysis(Table, _columns, _rows, _raggedRows, _sumRowBytes, effectiveMin, _maxRowBytes, KeyMaps);
             _columns = null; // Only finalized statistics and FK key maps survive between tables.
         }
     }
@@ -2401,12 +2466,14 @@ namespace AuroraAnalyzer
             long rowCount,
             long raggedRows,
             long sumRowBytes,
+            long minRowBytes,
             long maxRowBytes,
             Dictionary<string, Dictionary<string, long>> tableKeyMaps)
         {
             ta.RowCount = rowCount;
             ta.ColumnCount = accs.Count;
             ta.RaggedRowCount = raggedRows;
+            ta.MinRowBytes = rowCount > 0 ? minRowBytes : 0L;
             ta.AvgRowBytes = rowCount > 0 ? ((double)sumRowBytes / rowCount) : 0.0;
             ta.MaxRowBytes = maxRowBytes;
             if (rowCount > 0)
@@ -2415,17 +2482,28 @@ namespace AuroraAnalyzer
                 long pages = (long)Math.Ceiling(rawInno / 16384.0);
                 if (pages < 1) pages = 1;
                 ta.EstInnoDbBytes = pages * 16384L;
+                ta.EstInnoDbPages = pages;
+                ta.RowsPerInnoDbPage = (double)rowCount / pages;
             }
             else
             {
                 ta.EstInnoDbBytes = 16384L; // 1 empty InnoDB page
+                ta.EstInnoDbPages = 1L;
+                ta.RowsPerInnoDbPage = 0.0;
             }
 
             List<string> pkCols = new List<string>();
             List<string> dtCols = new List<string>();
             List<string> catCols = new List<string>();
+            Dictionary<string, int> typeCounts = new Dictionary<string, int>(StringComparer.Ordinal);
             double nullRateSum = 0.0;
             double cardRateSum = 0.0;
+            int allNullCnt = 0;
+            int constCnt = 0;
+            int highSkewCnt = 0;
+            int largeColCnt = 0;
+            ColumnAnalysis bestDtCol = null;
+            long bestDtScore = -1;
 
             foreach (ColumnAccumulator acc in accs)
             {
@@ -2434,8 +2512,29 @@ namespace AuroraAnalyzer
                 nullRateSum += ca.NullRate;
                 cardRateSum += ca.CardinalityRate;
 
+                string shortType = ShortTypeName(ca.InferredType);
+                int tc;
+                typeCounts[shortType] = typeCounts.TryGetValue(shortType, out tc) ? (tc + 1) : 1;
+
+                if (ca.TotalRows > 0 && ca.NullRate >= 0.999) allNullCnt++;
+                if (ca.SelectivityRating.StartsWith("定数")) constCnt++;
+                if (ca.SkewRisk.StartsWith("高リスク")) highSkewCnt++;
+                if (ca.MaxByteLen >= 4000) largeColCnt++;
+
                 if (ca.IsCandidatePk) pkCols.Add(ca.ColumnName);
-                if (ca.IsDateTime) dtCols.Add(ca.ColumnName);
+                if (ca.IsDateTime)
+                {
+                    dtCols.Add(ca.ColumnName);
+                    if (ca.MinDate.HasValue && ca.MaxDate.HasValue)
+                    {
+                        long dScore = ca.NonNullCount * (ca.HasTimeComponent ? 2L : 1L);
+                        if (dScore > bestDtScore)
+                        {
+                            bestDtScore = dScore;
+                            bestDtCol = ca;
+                        }
+                    }
+                }
                 if (ca.IsCategorical) catCols.Add(ca.ColumnName);
 
                 // Retain bounded key map for FK/Fan-Out detection
@@ -2459,6 +2558,42 @@ namespace AuroraAnalyzer
             ta.CandidatePks = string.Join(", ", pkCols.ToArray());
             ta.DateColumns = string.Join(", ", dtCols.ToArray());
             ta.CategoricalColumns = string.Join(", ", catCols.ToArray());
+            ta.AllNullColumnCount = allNullCnt;
+            ta.ConstantColumnCount = constCnt;
+            ta.HighSkewColumnCount = highSkewCnt;
+            ta.LargeColumnCount = largeColCnt;
+
+            if (typeCounts.Count > 0)
+            {
+                ta.ColumnTypeBreakdown = string.Join(" / ", typeCounts
+                    .OrderByDescending(kv => kv.Value)
+                    .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                    .Select(kv => kv.Key + ":" + kv.Value.ToString(CultureInfo.InvariantCulture))
+                    .ToArray());
+            }
+            else
+            {
+                ta.ColumnTypeBreakdown = "-";
+            }
+
+            List<string> qRisks = new List<string>();
+            if (allNullCnt > 0) qRisks.Add("全NULL:" + allNullCnt.ToString(CultureInfo.InvariantCulture));
+            if (constCnt > 0) qRisks.Add("定数:" + constCnt.ToString(CultureInfo.InvariantCulture));
+            if (highSkewCnt > 0) qRisks.Add("高偏り:" + highSkewCnt.ToString(CultureInfo.InvariantCulture));
+            if (largeColCnt > 0) qRisks.Add("大容量:" + largeColCnt.ToString(CultureInfo.InvariantCulture));
+            ta.QualityRiskBreakdown = qRisks.Count > 0 ? string.Join(" / ", qRisks.ToArray()) : "問題なし";
+
+            if (bestDtCol != null && bestDtCol.MinDate.HasValue && bestDtCol.MaxDate.HasValue)
+            {
+                ta.PrimaryDateRange = string.Format(CultureInfo.InvariantCulture, "{0}〜{1} ({2:0}日)",
+                    bestDtCol.MinDate.Value.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture),
+                    bestDtCol.MaxDate.Value.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture),
+                    Math.Round(bestDtCol.DateSpanDays));
+            }
+            else
+            {
+                ta.PrimaryDateRange = "-";
+            }
 
             // Infer Table Role for Performance Testing
             int fkLikeCount = ta.Columns.Count(c =>
@@ -2500,6 +2635,29 @@ namespace AuroraAnalyzer
             }
         }
 
+        private static string ShortTypeName(string inferredType)
+        {
+            if (string.IsNullOrEmpty(inferredType)) return "その他";
+            if (inferredType.StartsWith("整数")) return "整数";
+            if (inferredType.StartsWith("小数")) return "小数";
+            if (inferredType.StartsWith("文字列")) return "文字";
+            if (inferredType.StartsWith("長文")) return "長文";
+            if (inferredType.StartsWith("日時")) return "日時";
+            if (inferredType.StartsWith("日付")) return "日付";
+            if (inferredType.StartsWith("フラグ")) return "フラグ";
+            if (inferredType.StartsWith("メール")) return "メール";
+            if (inferredType.StartsWith("空")) return "空";
+            return inferredType;
+        }
+
+        private static string SanitizeCompactLabel(string raw, int maxLen)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            string s = raw.Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
+            if (s.Length > maxLen && maxLen > 3) s = s.Substring(0, maxLen - 3) + "...";
+            return s;
+        }
+
         private static ColumnAnalysis FinalizeColumn(string tableName, ColumnAccumulator acc)
         {
             ColumnAnalysis ca = new ColumnAnalysis();
@@ -2513,12 +2671,18 @@ namespace AuroraAnalyzer
             ca.DistinctCount = acc.Freq.Count;
             ca.DistinctCapped = acc.DistinctCapped;
             ca.CardinalityRate = acc.NonNullCount > 0 ? ((double)acc.Freq.Count / acc.NonNullCount) : 0.0;
+            ca.WhitespaceOnlyCount = acc.WhitespaceOnlyCount;
+            ca.MultilineCount = acc.MultilineCount;
+            ca.NonAsciiCount = acc.NonAsciiCount;
+            ca.NonAsciiRate = acc.NonNullCount > 0 ? ((double)acc.NonAsciiCount / acc.NonNullCount) : 0.0;
 
             if (acc.NonNullCount == 0)
             {
                 ca.InferredType = "空 (全NULL)";
+                ca.KeyRole = "データなし";
                 ca.SelectivityRating = "データなし";
                 ca.SkewRisk = "要注意 (全NULL)";
+                ca.DetailStatsSummary = "有効データなし (全行NULL)";
                 ca.AlertNote = "全行NULLまたは空文字";
                 return ca;
             }
@@ -2642,6 +2806,7 @@ namespace AuroraAnalyzer
             if (ca.TopValues.Count > 0)
             {
                 ca.Top1Value = ca.TopValues[0].Value;
+                ca.Top1Count = ca.TopValues[0].Count;
                 ca.Top1Share = ca.TopValues[0].Share;
                 ca.Top3Share = ca.TopValues[Math.Min(2, ca.TopValues.Count - 1)].CumulativeShare;
                 ca.Top5Share = ca.TopValues[Math.Min(4, ca.TopValues.Count - 1)].CumulativeShare;
@@ -2816,6 +2981,7 @@ namespace AuroraAnalyzer
 
             bool isBinaryFlag = (acc.Freq.Count <= 2 && (ca.InferredType.IndexOf("フラグ") >= 0 || nameLooksFlag));
             double concentrationRatio = (acc.Freq.Count > 0) ? (ca.Top1Share * acc.Freq.Count) : 1.0;
+            ca.ConcentrationRatio = concentrationRatio;
             bool isWhaleHotKey = (acc.Freq.Count >= 5 && ca.Top1Share >= 0.20 && concentrationRatio >= 10.0);
             if (acc.Freq.Count >= 3 && !acc.DistinctCapped && acc.NonNullCount >= 20 &&
                 (ca.Top1Share >= 0.50 || ca.GiniCoefficient >= 0.70 || isWhaleHotKey))
@@ -2840,6 +3006,90 @@ namespace AuroraAnalyzer
             if (ca.IsNumeric && ca.OutlierRate >= 0.05 && !ca.IsCandidatePk)
             {
                 alerts.Add(string.Format("外れ値多({0:P1})", ca.OutlierRate));
+            }
+
+            // Key / Role classification
+            if (ca.IsCandidatePk) ca.KeyRole = "PK/UK候補";
+            else if (ca.IsDateTime) ca.KeyRole = "日時軸";
+            else if (ca.IsCategorical) ca.KeyRole = "カテゴリ区分";
+            else ca.KeyRole = "一般";
+
+            // Min / Max display values
+            if (ca.IsNumeric && acc.NumCount > 0)
+            {
+                ca.MinValueText = ca.NumMin.ToString("#,##0.##", CultureInfo.InvariantCulture);
+                ca.MaxValueText = ca.NumMax.ToString("#,##0.##", CultureInfo.InvariantCulture);
+            }
+            else if (ca.IsDateTime && ca.MinDate.HasValue && ca.MaxDate.HasValue)
+            {
+                string dfmt = ca.HasTimeComponent ? "yyyy/MM/dd HH:mm:ss" : "yyyy/MM/dd";
+                ca.MinValueText = ca.MinDate.Value.ToString(dfmt, CultureInfo.InvariantCulture);
+                ca.MaxValueText = ca.MaxDate.Value.ToString(dfmt, CultureInfo.InvariantCulture);
+            }
+
+            // Top5 value distribution summary
+            if (ca.TopValues.Count > 0)
+            {
+                if (ca.IsCandidatePk && ca.DistinctCount >= 3)
+                {
+                    List<string> exVals = new List<string>();
+                    for (int i = 0; i < Math.Min(3, ca.TopValues.Count); i++)
+                    {
+                        exVals.Add(SanitizeCompactLabel(ca.TopValues[i].Value, 20));
+                    }
+                    ca.TopValuesSummary = "全件一意 (例: " + string.Join(", ", exVals.ToArray()) + ")";
+                }
+                else
+                {
+                    List<string> topParts = new List<string>();
+                    int takeN = Math.Min(5, ca.TopValues.Count);
+                    for (int i = 0; i < takeN; i++)
+                    {
+                        ValueShareItem tv = ca.TopValues[i];
+                        topParts.Add(string.Format(CultureInfo.InvariantCulture, "{0}: {1:#,##0} ({2:0.0%})",
+                            SanitizeCompactLabel(tv.Value, 24), tv.Count, tv.Share));
+                    }
+                    ca.TopValuesSummary = string.Join(" / ", topParts.ToArray());
+                }
+            }
+
+            // Type-specific detailed statistical profile
+            if (ca.IsNumeric && acc.NumCount > 0)
+            {
+                ca.DetailStatsSummary = string.Format(CultureInfo.InvariantCulture,
+                    "平均:{0:#,##0.##} / 中央値:{1:#,##0.##} / P25:{2:#,##0.##} / P75:{3:#,##0.##} / P95:{4:#,##0.##} / P99:{5:#,##0.##} / 標準偏差:{6:#,##0.##} / ゼロ率:{7:0.0%} / 負値率:{8:0.0%} / 外れ値率:{9:0.0%}",
+                    ca.NumMean, ca.NumMedian, ca.NumP25, ca.NumP75, ca.NumP95, ca.NumP99, ca.NumStdDev, ca.ZeroRate, ca.NegativeRate, ca.OutlierRate);
+            }
+            else if (ca.IsDateTime && ca.MinDate.HasValue && ca.MaxDate.HasValue)
+            {
+                StringBuilder ds = new StringBuilder();
+                ds.AppendFormat(CultureInfo.InvariantCulture, "期間:{0:0.0}日 / 日平均:{1:#,##0.0}件 / ピーク日:{2} ({3:#,##0}件, {4:0.0}倍)",
+                    ca.DateSpanDays, ca.AvgPerDay, ca.PeakDay, ca.PeakDayCount, ca.PeakBurstRatio);
+                if (ca.HasTimeComponent)
+                {
+                    int pkHr = 0;
+                    long pkHrCnt = 0;
+                    long sumHr = 0;
+                    for (int h = 0; h < 24; h++)
+                    {
+                        sumHr += ca.HourlyCounts[h];
+                        if (ca.HourlyCounts[h] > pkHrCnt) { pkHrCnt = ca.HourlyCounts[h]; pkHr = h; }
+                    }
+                    if (sumHr > 0)
+                    {
+                        ds.AppendFormat(CultureInfo.InvariantCulture, " / ピーク時間帯:{0:00}:00台 ({1:0.0%})", pkHr, (double)pkHrCnt / sumHr);
+                    }
+                }
+                ca.DetailStatsSummary = ds.ToString();
+            }
+            else
+            {
+                StringBuilder ss = new StringBuilder();
+                ss.AppendFormat(CultureInfo.InvariantCulture, "文字長:{0}〜平均{1:0.0}〜最大{2}文字 / 非ASCII率:{3:0.0%}",
+                    ca.MinCharLen, ca.AvgCharLen, ca.MaxCharLen, ca.NonAsciiRate);
+                if (ca.MultilineCount > 0) ss.AppendFormat(CultureInfo.InvariantCulture, " / 改行含:{0:#,##0}件", ca.MultilineCount);
+                if (ca.WhitespaceOnlyCount > 0) ss.AppendFormat(CultureInfo.InvariantCulture, " / 空白のみ:{0:#,##0}件", ca.WhitespaceOnlyCount);
+                ca.DetailStatsSummary = ss.ToString();
             }
 
             ca.AlertNote = string.Join(" / ", alerts.ToArray());
@@ -3026,6 +3276,72 @@ namespace AuroraAnalyzer
                 .OrderByDescending(r => r.FanOutMax)
                 .ThenByDescending(r => r.OrphanRows)
                 .ToList();
+
+            // Attach concise relation summaries to tables and columns
+            Dictionary<string, TableAnalysis> tblMap = new Dictionary<string, TableAnalysis>(StringComparer.OrdinalIgnoreCase);
+            foreach (TableAnalysis ta in result.Tables) tblMap[ta.TableName] = ta;
+
+            Dictionary<string, List<string>> tblRelNotes = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, List<string>> parentColRefs = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (RelationshipAnalysis rel in result.Relationships)
+            {
+                string orphanTxt = rel.OrphanRows > 0 ? string.Format(CultureInfo.InvariantCulture, ", 孤立{0:#,##0}", rel.OrphanRows) : "";
+                string childTblTxt = string.Format(CultureInfo.InvariantCulture, "親:{0}(最大{1:#,##0}倍{2})", rel.ParentTable, rel.FanOutMax, orphanTxt);
+                string parentTblTxt = string.Format(CultureInfo.InvariantCulture, "子:{0}(最大{1:#,##0}倍)", rel.ChildTable, rel.FanOutMax);
+
+                List<string> cList;
+                if (!tblRelNotes.TryGetValue(rel.ChildTable, out cList)) { cList = new List<string>(); tblRelNotes[rel.ChildTable] = cList; }
+                cList.Add(childTblTxt);
+
+                List<string> pList;
+                if (!tblRelNotes.TryGetValue(rel.ParentTable, out pList)) { pList = new List<string>(); tblRelNotes[rel.ParentTable] = pList; }
+                pList.Add(parentTblTxt);
+
+                TableAnalysis cTa;
+                if (tblMap.TryGetValue(rel.ChildTable, out cTa))
+                {
+                    ColumnAnalysis cCol = cTa.Columns.FirstOrDefault(x => string.Equals(x.ColumnName, rel.ChildColumn, StringComparison.OrdinalIgnoreCase));
+                    if (cCol != null)
+                    {
+                        if (!cCol.IsCandidatePk) cCol.KeyRole = "FK候補";
+                        cCol.RelationSummary = string.Format(CultureInfo.InvariantCulture,
+                            "参照先: {0}.{1} (一致{2:0.0%}, 平均{3:0.0}/最大{4:#,##0}件/親{5})",
+                            rel.ParentTable, rel.ParentColumn, rel.MatchRate, rel.FanOutAvg, rel.FanOutMax, orphanTxt);
+                    }
+                }
+
+                string pKey = rel.ParentTable + "." + rel.ParentColumn;
+                List<string> refList;
+                if (!parentColRefs.TryGetValue(pKey, out refList)) { refList = new List<string>(); parentColRefs[pKey] = refList; }
+                refList.Add(string.Format(CultureInfo.InvariantCulture, "{0}.{1}(最大{2:#,##0}倍)", rel.ChildTable, rel.ChildColumn, rel.FanOutMax));
+            }
+
+            foreach (TableAnalysis ta in result.Tables)
+            {
+                List<string> rn;
+                if (tblRelNotes.TryGetValue(ta.TableName, out rn) && rn.Count > 0)
+                {
+                    ta.RelationSummary = string.Join(" / ", rn.Distinct().ToArray());
+                }
+                else
+                {
+                    ta.RelationSummary = "-";
+                }
+
+                foreach (ColumnAnalysis ca in ta.Columns)
+                {
+                    string pKey = ta.TableName + "." + ca.ColumnName;
+                    List<string> refs;
+                    if (parentColRefs.TryGetValue(pKey, out refs) && refs.Count > 0)
+                    {
+                        string pNote = "被参照: " + string.Join(", ", refs.ToArray());
+                        ca.RelationSummary = (ca.RelationSummary == "-" || string.IsNullOrEmpty(ca.RelationSummary))
+                            ? pNote
+                            : (ca.RelationSummary + " / " + pNote);
+                    }
+                }
+            }
         }
 
         private static void BuildGlobalTimeSeries(FolderAnalysisResult result)
@@ -3196,33 +3512,159 @@ namespace AuroraAnalyzer
 
             result.TotalWarningCount = result.Warnings.Count;
             result.HighWarningCount = result.Warnings.Count(w => w.Severity == "高");
+            result.MediumWarningCount = result.Warnings.Count(w => w.Severity == "中");
+            result.LowWarningCount = result.Warnings.Count(w => w.Severity == "低");
             result.JMeterCandidates = result.JMeterCandidates.OrderByDescending(j => j.UniqueCount).ToList();
 
-            // Synthesize Aurora Serverless v2 (MySQL 8.4.7) Insights
+            // Reconcile per-table warning counts (including relationship warnings) and JMeter readiness
+            Dictionary<string, List<WarningItem>> warnByTable = new Dictionary<string, List<WarningItem>>(StringComparer.OrdinalIgnoreCase);
+            foreach (WarningItem w in result.Warnings)
+            {
+                List<WarningItem> wl;
+                if (!warnByTable.TryGetValue(w.TableName, out wl)) { wl = new List<WarningItem>(); warnByTable[w.TableName] = wl; }
+                wl.Add(w);
+            }
+            Dictionary<string, JMeterCandidateItem> bestJmByTable = new Dictionary<string, JMeterCandidateItem>(StringComparer.OrdinalIgnoreCase);
+            foreach (JMeterCandidateItem jc in result.JMeterCandidates)
+            {
+                if (!bestJmByTable.ContainsKey(jc.TableName)) bestJmByTable[jc.TableName] = jc;
+            }
+
+            long totalCells = 0L;
+            long totalNullCells = 0L;
+            double weightedRowBytesSum = 0.0;
+            long overallMaxRowB = 0L;
+            long totalInnoPages = 0L;
+            int emptyTblCnt = 0;
+            long raggedTotal = 0L;
+            int pkColTotal = 0;
+            int allNullTotal = 0;
+            int highSkewTotal = 0;
+            int largeColTotal = 0;
+
+            foreach (TableAnalysis ta in result.Tables)
+            {
+                totalInnoPages += ta.EstInnoDbPages;
+                if (ta.RowCount == 0) emptyTblCnt++;
+                raggedTotal += ta.RaggedRowCount;
+                weightedRowBytesSum += ta.AvgRowBytes * ta.RowCount;
+                if (ta.MaxRowBytes > overallMaxRowB) overallMaxRowB = ta.MaxRowBytes;
+                allNullTotal += ta.AllNullColumnCount;
+                highSkewTotal += ta.HighSkewColumnCount;
+                largeColTotal += ta.LargeColumnCount;
+
+                foreach (ColumnAnalysis ca in ta.Columns)
+                {
+                    totalCells += ca.TotalRows;
+                    totalNullCells += ca.NullCount;
+                    if (ca.IsCandidatePk) pkColTotal++;
+                }
+
+                List<WarningItem> twList;
+                if (warnByTable.TryGetValue(ta.TableName, out twList))
+                {
+                    ta.WarningCount = twList.Count;
+                    ta.HighWarningCount = twList.Count(x => x.Severity == "高");
+                    List<string> extraRelWarns = new List<string>();
+                    foreach (WarningItem rw in twList)
+                    {
+                        if (rw.Category == "参照整合性(孤立行)") extraRelWarns.Add(rw.ColumnName + ":孤立FK");
+                        else if (rw.Category == "極端な1:Nファンアウト") extraRelWarns.Add(rw.ColumnName + ":極端ファンアウト");
+                    }
+                    if (extraRelWarns.Count > 0)
+                    {
+                        string extraStr = string.Join(", ", extraRelWarns.Distinct().ToArray());
+                        ta.WarningSummary = string.IsNullOrEmpty(ta.WarningSummary) ? extraStr : (ta.WarningSummary + ", " + extraStr);
+                    }
+                }
+                else
+                {
+                    ta.WarningCount = 0;
+                    ta.HighWarningCount = 0;
+                }
+
+                JMeterCandidateItem bestJc;
+                if (ta.RowCount == 0)
+                {
+                    ta.JMeterReadiness = "対象外 (空テーブル)";
+                }
+                else if (bestJmByTable.TryGetValue(ta.TableName, out bestJc))
+                {
+                    ta.JMeterReadiness = string.Format(CultureInfo.InvariantCulture, "{0} ({1}: {2:#,##0}件)",
+                        bestJc.Suitability, bestJc.KeyColumn, bestJc.UniqueCount);
+                }
+                else if (!string.IsNullOrEmpty(ta.CandidatePks))
+                {
+                    ta.JMeterReadiness = "要注意 (キー数少 <10件)";
+                }
+                else
+                {
+                    ta.JMeterReadiness = "PK候補なし";
+                }
+            }
+
+            result.TotalEstInnoDbPages = totalInnoPages;
+            result.EmptyTableCount = emptyTblCnt;
+            result.RaggedRowTotal = raggedTotal;
+            result.CandidatePkColumnCount = pkColTotal;
+            result.AllNullColumnCount = allNullTotal;
+            result.HighSkewColumnCount = highSkewTotal;
+            result.LargeColumnCount = largeColTotal;
+            result.TotalOrphanRows = result.Relationships.Sum(r => r.OrphanRows);
+            result.OverallAvgNullRate = totalCells > 0 ? ((double)totalNullCells / totalCells) : 0.0;
+            result.OverallAvgRowBytes = result.TotalRows > 0 ? (weightedRowBytesSum / result.TotalRows) : 0.0;
+            result.OverallMaxRowBytes = overallMaxRowB;
+
+            double estInnoGb = result.TotalEstInnoDbBytes / (1024.0 * 1024.0 * 1024.0);
+            result.EstMinAcuCurrent = Math.Max(0.5, Math.Ceiling((estInnoGb / 1.5) * 2.0) / 2.0);
+            result.EstMinAcu10x = Math.Max(0.5, Math.Ceiling(((estInnoGb * 10.0) / 1.5) * 2.0) / 2.0);
+
+            // Synthesize detailed Aurora Serverless v2 (MySQL 8.4.7) Insights
             double estInnoMb = result.TotalEstInnoDbBytes / (1024.0 * 1024.0);
             string sizeMetricLabel = result.IsDirectDb ? "DB直接取得(CSV換算)" : "CSV合計";
-            result.AuroraInsights.Add(string.Format(
-                "【データ規模・Buffer Pool】全 {0} テーブル / 総レコード {1:#,##0} 件 / {2} {3:#,##0.00} MB / 推定InnoDB容量 {4:#,##0.00} MB。Aurora Serverless v2 では1 ACUあたり約2GBメモリ(Buffer Pool約75%)が割り当てられるため、本番想定倍率を乗算してMin/Max ACUとウォームアップ時間を設計してください。",
-                result.TableCount, result.TotalRows, sizeMetricLabel, result.TotalFileBytes / (1024.0 * 1024.0), estInnoMb));
+            result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                "【データ規模・Buffer Pool・ACU設計】全 {0} テーブル / 総レコード {1:#,##0} 件 / {2} {3:#,##0.00} MB / 推定InnoDB容量 {4:#,##0.00} MB ({5:#,##0} ページ, 全体平均行長 {6:#,##0.0} B / 最大 {7:#,##0} B)。1 ACU≒Buffer Pool約1.5GB換算での最低ACU目安は現状 {8:0.0} ACU・10倍データ時 {9:0.0} ACUです。本番想定倍率と同時接続ワークメモリを加味してMin/Max ACUとウォームアップ時間を設計してください。",
+                result.TableCount, result.TotalRows, sizeMetricLabel, result.TotalFileBytes / (1024.0 * 1024.0), estInnoMb,
+                result.TotalEstInnoDbPages, result.OverallAvgRowBytes, result.OverallMaxRowBytes, result.EstMinAcuCurrent, result.EstMinAcu10x));
 
             if (result.Tables.Count > 0)
             {
                 TableAnalysis topT = result.Tables[0];
-                result.AuroraInsights.Add(string.Format(
-                    "【支配的テーブル】最大テーブルは `{0}` ({1:#,##0} 件 / 全体レコードの {2:P1})。性能試験の主要スキャン・書込負荷およびINDEX設計(カバリングインデックス・パーティション検討)の最優先対象です。",
-                    topT.TableName, topT.RowCount, topT.RowShare));
+                int topN = Math.Min(3, result.Tables.Count);
+                double top3RowShare = result.Tables.Take(topN).Sum(t => t.RowShare);
+                double top3SizeShare = result.Tables.Take(topN).Sum(t => t.SizeShare);
+                string top3Names = string.Join(", ", result.Tables.Take(topN).Select(t => "`" + t.TableName + "`").ToArray());
+                result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                    "【支配的テーブル・負荷集中】最大テーブルは `{0}` ({1:#,##0} 件 / 全体レコードの {2:P1}, 推定InnoDB {3:#,##0.0} KB)。上位 {4} テーブル ({5}) で全レコードの {6:P1}・全容量の {7:P1} を占有しており、INDEX設計(カバリングインデックス・パーティション検討)および負荷シナリオの最優先対象です。",
+                    topT.TableName, topT.RowCount, topT.RowShare, topT.EstInnoDbBytes / 1024.0, topN, top3Names, top3RowShare, top3SizeShare));
             }
 
-            int skewCols = result.Warnings.Count(w => w.Category == "ホットキー・偏り");
-            if (skewCols > 0)
+            result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                "【スキーマ構成・データ品質】全 {0:#,##0} カラム (PK/UK候補 {1:#,##0} 列)、全体セルNULL率 {2:P1}。全NULLカラム {3} 列・大容量ペイロード(>=4KB) {4} 列・CSV列数不一致行 {5:#,##0} 行を検出。{6}",
+                result.TotalColumns, result.CandidatePkColumnCount, result.OverallAvgNullRate,
+                result.AllNullColumnCount, result.LargeColumnCount, result.RaggedRowTotal,
+                (result.LargeColumnCount > 0 ? "大容量列を含むテーブルは SELECT * を避け必要列のみ取得するクエリ設計を推奨します。" : "極端な大容量ペイロードによるOff-Page I/O要因は検出されませんでした。")));
+
+            List<WarningItem> skewWarns = result.Warnings.Where(w => w.Category == "ホットキー・偏り").ToList();
+            if (skewWarns.Count > 0)
             {
-                result.AuroraInsights.Add(string.Format(
-                    "【ロック競合・ホットスポット】偏り高リスクカラムが {0} 件検出されました。MySQL 8.4 InnoDB の行ロック・ギャップロック競合を再現するため、JMeterでは均一ランダムではなく実データのTop-N重み付け分布を使用してください。",
-                    skewCols));
+                string skewEx = string.Join(", ", skewWarns.Take(4).Select(w => "`" + w.TableName + "." + w.ColumnName + "`").ToArray());
+                result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                    "【ロック競合・ホットスポット】偏り高リスクカラムが {0} 件検出されました ({1}{2})。MySQL 8.4 InnoDB の行ロック・ギャップロック競合を再現するため、JMeterでは均一ランダムではなく実データのTop-N重み付け分布を使用してください。",
+                    skewWarns.Count, skewEx, skewWarns.Count > 4 ? " 他" : ""));
             }
             else
             {
                 result.AuroraInsights.Add("【データ偏り状況】極端なホットキー偏りは検出されませんでした。標準的な分布ベースおよび境界値シナリオで負荷試験を構成できます。");
+            }
+
+            if (result.Relationships.Count > 0)
+            {
+                RelationshipAnalysis maxRel = result.Relationships[0];
+                result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                    "【リレーション・1:Nファンアウト・参照整合性】テーブル間FKリレーションを {0} 件推定。孤立子レコード合計 {1:#,##0} 行、最大ファンアウトは `{2}.{3}` → `{4}.{5}` の {6:#,##0} 件/親 (平均 {7:0.0} / P95 {8:0.0}, Key={9})。スーパーユーザー検索・JOIN・ページング時のレスポンス劣化とN+1発生有無を検証してください。",
+                    result.Relationships.Count, result.TotalOrphanRows, maxRel.ParentTable, maxRel.ParentColumn,
+                    maxRel.ChildTable, maxRel.ChildColumn, maxRel.FanOutMax, maxRel.FanOutAvg, maxRel.FanOutP95, maxRel.MaxFanOutKey));
             }
 
             if (!string.IsNullOrEmpty(result.PrimaryTimeSeriesSource))
@@ -3239,20 +3681,37 @@ namespace AuroraAnalyzer
                         peakHour = h;
                     }
                 }
+                string[] dowLabels = new string[] { "月曜", "火曜", "水曜", "木曜", "金曜", "土曜", "日曜" };
+                int peakDow = 0;
+                long peakDowCnt = 0;
+                long totalDow = 0;
+                for (int d = 0; d < 7; d++)
+                {
+                    totalDow += result.GlobalDayOfWeekCounts[d];
+                    if (result.GlobalDayOfWeekCounts[d] > peakDowCnt) { peakDowCnt = result.GlobalDayOfWeekCounts[d]; peakDow = d; }
+                }
                 if (totalHourly > 0)
                 {
-                    result.AuroraInsights.Add(string.Format(
-                        "【ピーク時間帯モデル】`{0}` の分析では {1:00}:00台 が最大ピーク ({2:#,##0}件 / 全体の{3:P1})。JMeterのStepping/Concurrency Thread Groupのランプアップ・ピーク維持設計の基準として活用できます。",
-                        result.PrimaryTimeSeriesSource, peakHour, peakHourCnt, (double)peakHourCnt / totalHourly));
+                    string dowNote = totalDow > 0 ? string.Format(CultureInfo.InvariantCulture, "、曜日ピークは{0} ({1:P1})", dowLabels[peakDow], (double)peakDowCnt / totalDow) : "";
+                    result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                        "【ピーク時間帯・時系列モデル】代表日時軸 `{0}` では {1:00}:00台 が最大ピーク ({2:#,##0}件 / 全体の{3:P1}){4}。JMeterのStepping/Concurrency Thread Groupのランプアップ・ピーク維持設計の基準として活用できます。",
+                        result.PrimaryTimeSeriesSource, peakHour, peakHourCnt, (double)peakHourCnt / totalHourly, dowNote));
                 }
             }
 
-            int emptyTables = result.Tables.Count(t => t.RowCount == 0);
-            if (emptyTables > 0)
+            int optimalJm = result.JMeterCandidates.Count(j => j.Suitability.StartsWith("最適"));
+            int goodJm = result.JMeterCandidates.Count(j => j.Suitability.StartsWith("良好"));
+            if (result.EmptyTableCount > 0)
             {
-                result.AuroraInsights.Add(string.Format(
-                    "【テストデータ充足性】空テーブルが {0} 個存在します。実運用のJOIN・集計・INDEX統計情報(ANALYZE TABLE)を正確に再現するため、試験前データ投入と統計情報更新を実施してください。",
-                    emptyTables));
+                result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                    "【テストデータ充足性・JMeterパラメータ化】空テーブルが {0} 個存在します。実運用のJOIN・集計・INDEX統計情報(ANALYZE TABLE)を正確に再現するため、試験前データ投入を実施してください。なお現在、JMeter高並列適性キー(>=1,000件)は {1} 列、中規模並列キー(>=100件)は {2} 列検出されています。",
+                    result.EmptyTableCount, optimalJm, goodJm));
+            }
+            else
+            {
+                result.AuroraInsights.Add(string.Format(CultureInfo.InvariantCulture,
+                    "【JMeterパラメータ化適性】空テーブルは0件です。JMeter CSV Data Set向けに高並列適性キー(>=1,000件) {0} 列・中規模並列キー(>=100件) {1} 列を検出しました。同時更新系シナリオではスレッド間で一意キーを分割(Sharing: All threads)してください。",
+                    optimalJm, goodJm));
             }
         }
 
@@ -3323,6 +3782,7 @@ namespace AuroraAnalyzer
             List<ColumnAccumulator> accs = new List<ColumnAccumulator>();
             long rowCount = 0;
             long sumRowBytes = 0;
+            long minRowBytes = long.MaxValue;
             long maxRowBytes = 0;
             long csvEquivBytes = 3L; // UTF-8 BOM equivalent (matches ExportQueryToCsv writeUtf8Bom=true)
             bool receivedColumns = false;
@@ -3353,6 +3813,7 @@ namespace AuroraAnalyzer
                         accs[c].Add(rowVals[c]);
                     }
                     sumRowBytes += rawRowBytes;
+                    if (rawRowBytes < minRowBytes) minRowBytes = rawRowBytes;
                     if (rawRowBytes > maxRowBytes) maxRowBytes = rawRowBytes;
                     csvEquivBytes += csvLineBytes;
                     rowCount++;
@@ -3362,7 +3823,8 @@ namespace AuroraAnalyzer
 
             if (cancelState != null) cancelState.ThrowIfCancelled();
             ta.FileSizeBytes = receivedColumns ? csvEquivBytes : 0L;
-            CsvAnalysisEngine.FinalizeTableAnalysis(ta, accs, rowCount, 0L, sumRowBytes, maxRowBytes, tableKeyMaps);
+            long effectiveMinRowBytes = rowCount > 0 && minRowBytes != long.MaxValue ? minRowBytes : 0L;
+            CsvAnalysisEngine.FinalizeTableAnalysis(ta, accs, rowCount, 0L, sumRowBytes, effectiveMinRowBytes, maxRowBytes, tableKeyMaps);
 
             _result.Tables.Add(ta);
             _keyMaps[ta.TableName] = tableKeyMaps;
@@ -3451,6 +3913,9 @@ namespace AuroraAnalyzer
         public double GiniCoefficient;
         public string SkewRisk;
         public string AlertNote;
+        public string MinValueText;
+        public string MaxValueText;
+        public Dictionary<string, long> TopDistCounts;
 
         public SnapshotColumn()
         {
@@ -3459,6 +3924,9 @@ namespace AuroraAnalyzer
             Top1Value = "";
             SkewRisk = "";
             AlertNote = "";
+            MinValueText = "";
+            MaxValueText = "";
+            TopDistCounts = new Dictionary<string, long>(StringComparer.Ordinal);
         }
     }
 
@@ -4248,6 +4716,79 @@ namespace AuroraAnalyzer
                     colChanged = true;
                     string sev = ac.SkewRisk.StartsWith("高リスク") ? "警告" : "注意";
                     AddDiff(item, ac.ColumnName, "カラム統計", "偏りリスク", bc.SkewRisk, ac.SkewRisk, "偏り評価変化", sev);
+                }
+
+                // Fallback top-value distribution & Min/Max comparison when detailed sheets (04/05/06) are absent
+                bool hasBothDist = bt.Distributions.ContainsKey(ac.ColumnName) && at.Distributions.ContainsKey(ac.ColumnName);
+                if (!hasBothDist && bc.TopDistCounts.Count > 0 && ac.TopDistCounts.Count > 0)
+                {
+                    HashSet<string> topKeys = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (string k in bc.TopDistCounts.Keys) topKeys.Add(k);
+                    foreach (string k in ac.TopDistCounts.Keys) topKeys.Add(k);
+                    foreach (string k in topKeys)
+                    {
+                        long bCnt = 0;
+                        long aCnt = 0;
+                        bool inB = bc.TopDistCounts.TryGetValue(k, out bCnt);
+                        bool inA = ac.TopDistCounts.TryGetValue(k, out aCnt);
+                        if (inB && inA && bCnt != aCnt)
+                        {
+                            colChanged = true;
+                            if (item.RowDelta > 0 && aCnt < bCnt) hasInPlaceMutation = true;
+                            AddDiff(item, ac.ColumnName, "カテゴリ分布", "区分値: " + k,
+                                bCnt.ToString("#,##0") + "件", aCnt.ToString("#,##0") + "件",
+                                FormatSignedInt(aCnt - bCnt) + "件", "通常");
+                        }
+                        else if (bc.DistinctCount <= 5 && ac.DistinctCount <= 5 && inB != inA)
+                        {
+                            colChanged = true;
+                            if (item.RowDelta > 0 && aCnt < bCnt) hasInPlaceMutation = true;
+                            AddDiff(item, ac.ColumnName, "カテゴリ分布", "区分値: " + k,
+                                bCnt.ToString("#,##0") + "件", aCnt.ToString("#,##0") + "件",
+                                FormatSignedInt(aCnt - bCnt) + "件", "通常");
+                        }
+                    }
+                }
+
+                bool hasBothNum = bt.NumericStats.ContainsKey(ac.ColumnName) && at.NumericStats.ContainsKey(ac.ColumnName);
+                bool hasBothDt = bt.DateTimeStats.ContainsKey(ac.ColumnName) && at.DateTimeStats.ContainsKey(ac.ColumnName);
+                if (!hasBothNum && !hasBothDt &&
+                    (!string.IsNullOrEmpty(bc.MinValueText) || !string.IsNullOrEmpty(ac.MinValueText)))
+                {
+                    bool isNumCol = ac.InferredType.IndexOf("整数", StringComparison.Ordinal) >= 0 || ac.InferredType.IndexOf("小数", StringComparison.Ordinal) >= 0;
+                    bool isDtCol = ac.InferredType.IndexOf("日時", StringComparison.Ordinal) >= 0 || ac.InferredType.IndexOf("日付", StringComparison.Ordinal) >= 0;
+                    if (isNumCol)
+                    {
+                        double bMin, aMin, bMax, aMax;
+                        if (TryParseFormattedNumber(bc.MinValueText, out bMin) && TryParseFormattedNumber(ac.MinValueText, out aMin) && !NumbersNearlyEqual(bMin, aMin, 0.005))
+                        {
+                            colChanged = true;
+                            if (item.RowDelta > 0 && aMin > bMin + 0.005) hasInPlaceMutation = true;
+                            AddDiff(item, ac.ColumnName, "数値統計", "最小値", bc.MinValueText, ac.MinValueText, FormatSignedDouble(aMin - bMin, "0.##"), "通常");
+                        }
+                        if (TryParseFormattedNumber(bc.MaxValueText, out bMax) && TryParseFormattedNumber(ac.MaxValueText, out aMax) && !NumbersNearlyEqual(bMax, aMax, 0.005))
+                        {
+                            colChanged = true;
+                            if (item.RowDelta > 0 && aMax < bMax - 0.005) hasInPlaceMutation = true;
+                            AddDiff(item, ac.ColumnName, "数値統計", "最大値", bc.MaxValueText, ac.MaxValueText, FormatSignedDouble(aMax - bMax, "0.##"), "通常");
+                        }
+                    }
+                    else if (isDtCol)
+                    {
+                        DateTime bMinDt, aMinDt, bMaxDt, aMaxDt;
+                        if (TryParseComparableDate(bc.MinValueText, out bMinDt) && TryParseComparableDate(ac.MinValueText, out aMinDt) && Math.Abs((aMinDt - bMinDt).TotalSeconds) >= 1.0)
+                        {
+                            colChanged = true;
+                            if (item.RowDelta > 0 && aMinDt > bMinDt) hasInPlaceMutation = true;
+                            AddDiff(item, ac.ColumnName, "時系列・日時", "最古日時", bc.MinValueText, ac.MinValueText, "最古日時変化", "通常");
+                        }
+                        if (TryParseComparableDate(bc.MaxValueText, out bMaxDt) && TryParseComparableDate(ac.MaxValueText, out aMaxDt) && Math.Abs((aMaxDt - bMaxDt).TotalSeconds) >= 1.0)
+                        {
+                            colChanged = true;
+                            if (item.RowDelta > 0 && aMaxDt < bMaxDt) hasInPlaceMutation = true;
+                            AddDiff(item, ac.ColumnName, "時系列・日時", "最新日時", bc.MaxValueText, ac.MaxValueText, "最新日時更新", "通常");
+                        }
+                    }
                 }
 
                 if (colChanged)
@@ -5048,6 +5589,36 @@ namespace AuroraAnalyzer
             return false;
         }
 
+        private static bool TryParseFormattedNumber(string raw, out double value)
+        {
+            value = 0.0;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            string s = raw.Trim();
+            if (s == "-") return false;
+            return double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out value) && !double.IsNaN(value) && !double.IsInfinity(value);
+        }
+
+        private static void ParseTopDistSummary(string summary, Dictionary<string, long> target)
+        {
+            if (string.IsNullOrWhiteSpace(summary)) return;
+            string trimmed = summary.Trim();
+            if (trimmed == "-" || trimmed.StartsWith("全件一意", StringComparison.Ordinal)) return;
+            string[] parts = trimmed.Split(new string[] { " / " }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                Match m = Regex.Match(parts[i].Trim(), @"^(.+?):\s*([0-9,]+)\s*\([0-9\.]+%\)$");
+                if (m.Success)
+                {
+                    string key = m.Groups[1].Value.Trim();
+                    long cnt;
+                    if (long.TryParse(m.Groups[2].Value.Replace(",", ""), NumberStyles.Integer, CultureInfo.InvariantCulture, out cnt))
+                    {
+                        target[key] = cnt;
+                    }
+                }
+            }
+        }
+
         private static void ParseTablesSheet(AnalysisWorkbookSnapshot snap, List<Dictionary<int, string>> rows)
         {
             Dictionary<string, int> map;
@@ -5078,8 +5649,9 @@ namespace AuroraAnalyzer
             {
                 Dictionary<int, string> row = rows[r];
                 if (IsRowEmptyOrPlaceholder(row)) break;
+                string c1 = GetCell(row, 1).Trim();
                 string tblName = GetCell(row, iTbl).Trim();
-                if (string.IsNullOrEmpty(tblName)) break;
+                if (string.IsNullOrEmpty(tblName) || c1.StartsWith("合計", StringComparison.Ordinal) || tblName == "合計" || tblName.StartsWith("合計", StringComparison.Ordinal)) break;
 
                 SnapshotTable st = new SnapshotTable();
                 st.TableName = tblName;
@@ -5131,6 +5703,9 @@ namespace AuroraAnalyzer
             int iTop3S = GetColIdx(map, "Top3占有率");
             int iGini = GetColIdx(map, "ジニ係数");
             int iSkew = GetColIdx(map, "偏りリスク");
+            int iMinVal = GetColIdx(map, "最小値 / 最古日時");
+            int iMaxVal = GetColIdx(map, "最大値 / 最新日時");
+            int iTopDist = GetColIdx(map, "上位値分布 (Top5)");
             int iAlert = GetColIdx(map, "警告・注意点");
 
             for (int r = hdrIdx + 1; r < rows.Count; r++)
@@ -5171,6 +5746,24 @@ namespace AuroraAnalyzer
                 sc.Top3Share = ParseDouble(GetCell(row, iTop3S));
                 sc.GiniCoefficient = ParseDouble(GetCell(row, iGini));
                 sc.SkewRisk = GetCell(row, iSkew).Trim();
+                if (iMinVal > 0)
+                {
+                    string rvMin = GetCell(row, iMinVal).Trim();
+                    if (sc.InferredType.IndexOf("日時", StringComparison.Ordinal) >= 0) rvMin = ParseDateCell(rvMin, false);
+                    else if (sc.InferredType.IndexOf("日付", StringComparison.Ordinal) >= 0) rvMin = ParseDateCell(rvMin, true);
+                    sc.MinValueText = (rvMin == "-") ? "" : rvMin;
+                }
+                if (iMaxVal > 0)
+                {
+                    string rvMax = GetCell(row, iMaxVal).Trim();
+                    if (sc.InferredType.IndexOf("日時", StringComparison.Ordinal) >= 0) rvMax = ParseDateCell(rvMax, false);
+                    else if (sc.InferredType.IndexOf("日付", StringComparison.Ordinal) >= 0) rvMax = ParseDateCell(rvMax, true);
+                    sc.MaxValueText = (rvMax == "-") ? "" : rvMax;
+                }
+                if (iTopDist > 0)
+                {
+                    ParseTopDistSummary(GetCell(row, iTopDist), sc.TopDistCounts);
+                }
                 string aRaw = GetCell(row, iAlert).Trim();
                 sc.AlertNote = (aRaw == "正常" || aRaw == "-") ? "" : aRaw;
 
@@ -6773,6 +7366,86 @@ function Set-ColumnWidths {
     }
 }
 
+function ConvertTo-ExcelColLetter {
+    param([Parameter(Mandatory = $true)][int]$ColIndex1Based)
+    $dividend = $ColIndex1Based
+    $colName = ''
+    while ($dividend -gt 0) {
+        $modulo = ($dividend - 1) % 26
+        $colName = [char](65 + $modulo) + $colName
+        $dividend = [int][Math]::Floor(($dividend - $modulo) / 26)
+    }
+    return $colName
+}
+
+function Get-RoleSummaryItems {
+    param($Analysis)
+    $groups = @{}
+    foreach ($t in $Analysis.Tables) {
+        $rName = if ([string]::IsNullOrWhiteSpace($t.InferredRole)) { 'その他' } else { $t.InferredRole }
+        if (-not $groups.ContainsKey($rName)) {
+            $groups[$rName] = [PSCustomObject]@{
+                Role           = $rName
+                TableCount     = 0
+                TotalRows      = 0L
+                TotalCols      = 0
+                TotalFileBytes = 0L
+                TotalInnoBytes = 0L
+                WarningCount   = 0
+                Examples       = (New-Object System.Collections.Generic.List[string])
+            }
+        }
+        $g = $groups[$rName]
+        $g.TableCount++
+        $g.TotalRows += $t.RowCount
+        $g.TotalCols += $t.ColumnCount
+        $g.TotalFileBytes += $t.FileSizeBytes
+        $g.TotalInnoBytes += $t.EstInnoDbBytes
+        $g.WarningCount += $t.WarningCount
+        if ($g.Examples.Count -lt 4) { $g.Examples.Add($t.TableName) }
+    }
+    return @($groups.Values | Sort-Object @{ Expression = { $_.TotalRows }; Descending = $true }, @{ Expression = { $_.TableCount }; Descending = $true }, @{ Expression = { $_.Role }; Ascending = $true })
+}
+
+function Get-TypeSummaryItems {
+    param($AllCols)
+    $groups = @{}
+    foreach ($c in $AllCols) {
+        $tName = if ([string]::IsNullOrWhiteSpace($c.InferredType)) { 'その他' } else { $c.InferredType }
+        if (-not $groups.ContainsKey($tName)) {
+            $groups[$tName] = [PSCustomObject]@{
+                DataType     = $tName
+                ColCount     = 0
+                PkCount      = 0
+                CatCount     = 0
+                NullRateSum  = 0.0
+                CardRateSum  = 0.0
+                AvgByteSum   = 0.0
+                NonEmptyCols = 0
+                MaxByteLen   = 0
+                HighSkewCnt  = 0
+                AllNullCnt   = 0
+                Examples     = (New-Object System.Collections.Generic.List[string])
+            }
+        }
+        $g = $groups[$tName]
+        $g.ColCount++
+        if ($c.IsCandidatePk) { $g.PkCount++ }
+        if ($c.IsCategorical) { $g.CatCount++ }
+        $g.NullRateSum += $c.NullRate
+        $g.CardRateSum += $c.CardinalityRate
+        if ($c.NonNullCount -gt 0) {
+            $g.AvgByteSum += $c.AvgByteLen
+            $g.NonEmptyCols++
+        }
+        if ($c.MaxByteLen -gt $g.MaxByteLen) { $g.MaxByteLen = $c.MaxByteLen }
+        if ($c.SkewRisk -like '高リスク*') { $g.HighSkewCnt++ }
+        if ($c.TotalRows -gt 0 -and $c.NullRate -ge 0.999) { $g.AllNullCnt++ }
+        if ($g.Examples.Count -lt 3) { $g.Examples.Add("$($c.TableName).$($c.ColumnName)") }
+    }
+    return @($groups.Values | Sort-Object @{ Expression = { $_.ColCount }; Descending = $true }, @{ Expression = { $_.DataType }; Ascending = $true })
+}
+
 function Add-StyledExcelChart {
     param(
         $Sheet,
@@ -6967,6 +7640,7 @@ function Export-AnalysisToExcelCom {
         [Parameter(Mandatory = $true)]$Analysis,
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [string]$DbLabel = '',
+        [switch]$DetailedAnalysis,
         [scriptblock]$LogCallback = $null,
         [AuroraAnalyzer.OperationCancelState]$CancelState = $null,
         [scriptblock]$PumpCallback = $null
@@ -6993,7 +7667,8 @@ function Export-AnalysisToExcelCom {
     $sheetsToRelease = New-Object System.Collections.Generic.List[object]
 
     try {
-        Write-XlsLog "Excelレポート生成開始 (Excel COM / Meiryo UI モノトーン仕様)..." 60
+        $modeSheetText = if ($DetailedAnalysis) { '詳細分析8シート' } else { '標準3シート' }
+        Write-XlsLog "Excelレポート生成開始 (Excel COM / $modeSheetText / Meiryo UI モノトーン仕様)..." 60
         try { $excel = New-Object -ComObject Excel.Application }
         catch [System.Runtime.InteropServices.COMException] {
             throw [AuroraAnalyzer.ExcelActivationException]::new($_.Exception)
@@ -7002,20 +7677,32 @@ function Export-AnalysisToExcelCom {
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
         $excel.ScreenUpdating = $false
-        $excel.SheetsInNewWorkbook = 8
+        $targetSheetCount = if ($DetailedAnalysis) { 8 } else { 3 }
+        $excel.SheetsInNewWorkbook = $targetSheetCount
         $wb = $excel.Workbooks.Add()
+        while ($wb.Worksheets.Count -lt $targetSheetCount) {
+            [void]$wb.Worksheets.Add([System.Reflection.Missing]::Value, $wb.Worksheets.Item($wb.Worksheets.Count))
+        }
+        while ($wb.Worksheets.Count -gt $targetSheetCount) {
+            $wb.Worksheets.Item($wb.Worksheets.Count).Delete()
+        }
         $excel.Calculation = -4135 # xlCalculationManual
 
         $wsSummary = $wb.Worksheets.Item(1); $wsSummary.Name = '01_サマリー'
         $wsTables  = $wb.Worksheets.Item(2); $wsTables.Name  = '02_テーブル一覧'
         $wsCols    = $wb.Worksheets.Item(3); $wsCols.Name    = '03_カラム分析'
-        $wsDist    = $wb.Worksheets.Item(4); $wsDist.Name    = '04_分布・割合分析'
-        $wsNum     = $wb.Worksheets.Item(5); $wsNum.Name     = '05_数値統計・ヒストグラム'
-        $wsTime    = $wb.Worksheets.Item(6); $wsTime.Name    = '06_時系列分析'
-        $wsRel     = $wb.Worksheets.Item(7); $wsRel.Name     = '07_リレーション・ファンアウト'
-        $wsGuide   = $wb.Worksheets.Item(8); $wsGuide.Name   = '08_性能試験ガイド・警告'
+        $initSheets = @($wsSummary, $wsTables, $wsCols)
+        $wsDist = $null; $wsNum = $null; $wsTime = $null; $wsRel = $null; $wsGuide = $null
+        if ($DetailedAnalysis) {
+            $wsDist  = $wb.Worksheets.Item(4); $wsDist.Name  = '04_分布・割合分析'
+            $wsNum   = $wb.Worksheets.Item(5); $wsNum.Name   = '05_数値統計・ヒストグラム'
+            $wsTime  = $wb.Worksheets.Item(6); $wsTime.Name  = '06_時系列分析'
+            $wsRel   = $wb.Worksheets.Item(7); $wsRel.Name   = '07_リレーション・ファンアウト'
+            $wsGuide = $wb.Worksheets.Item(8); $wsGuide.Name = '08_性能試験ガイド・警告'
+            $initSheets = @($wsSummary, $wsTables, $wsCols, $wsDist, $wsNum, $wsTime, $wsRel, $wsGuide)
+        }
 
-        foreach ($s in @($wsSummary, $wsTables, $wsCols, $wsDist, $wsNum, $wsTime, $wsRel, $wsGuide)) {
+        foreach ($s in $initSheets) {
             $sheetsToRelease.Add($s)
             Initialize-ExcelSheetStyle -Sheet $s
         }
@@ -7023,78 +7710,138 @@ function Export-AnalysisToExcelCom {
         $isDirectDb = [bool]$Analysis.IsDirectDb
         $dbLabelPart = if ([string]::IsNullOrWhiteSpace($DbLabel)) { '' } else { "  |  A5M2登録DB: $DbLabel" }
         $subInfo = if ($isDirectDb) {
-            "分析日時: {0}  |  接続先DB: {1}{2}  |  取得方式: DB直接分析(CSV未出力)  |  ターゲット: Aurora Serverless v2 (MySQL 8.4.7)" -f `
-                $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart
+            "分析日時: {0}  |  接続先DB: {1}{2}  |  取得方式: DB直接分析(CSV未出力)  |  出力構成: {3}  |  ターゲット: Aurora Serverless v2 (MySQL 8.4.7)" -f `
+                $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart, $modeSheetText
         }
         else {
-            "分析日時: {0}  |  対象フォルダ: {1}{2}  |  ターゲット: Aurora Serverless v2 (MySQL 8.4.7)" -f `
-                $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart
+            "分析日時: {0}  |  対象フォルダ: {1}{2}  |  出力構成: {3}  |  ターゲット: Aurora Serverless v2 (MySQL 8.4.7)" -f `
+                $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart, $modeSheetText
         }
         $sizeKpiLabel = if ($isDirectDb) { 'CSV換算サイズ (MB)' } else { '総CSVサイズ (MB)' }
         $sizeColHeader = if ($isDirectDb) { 'CSV換算サイズ(KB)' } else { 'CSVサイズ(KB)' }
         $srcColHeader = if ($isDirectDb) { '取得元 (DB.テーブル)' } else { 'CSVファイル名' }
         $tblSheetTitle = if ($isDirectDb) { 'テーブル別詳細一覧 (DB直接分析プロファイル・CSV未出力)' } else { 'テーブル別詳細一覧 (全CSVファイルプロファイル)' }
 
-        $navyOle   = ConvertTo-ExcelOleColor $script:THEME.AccentHex
-        $textOle   = ConvertTo-ExcelOleColor $script:THEME.TextHex
-        $mutedOle  = ConvertTo-ExcelOleColor $script:THEME.MutedHex
-        $warnOle   = ConvertTo-ExcelOleColor $script:THEME.WarnHex
-        $warnBgOle = ConvertTo-ExcelOleColor $script:THEME.WarnBgHex
-        $cardBgOle = ConvertTo-ExcelOleColor $script:THEME.CardBgHex
-        $borderOle = ConvertTo-ExcelOleColor $script:THEME.BorderHex
-        $zebraOle  = ConvertTo-ExcelOleColor $script:THEME.ZebraHex
+        $navyOle       = ConvertTo-ExcelOleColor $script:THEME.AccentHex
+        $textOle       = ConvertTo-ExcelOleColor $script:THEME.TextHex
+        $mutedOle      = ConvertTo-ExcelOleColor $script:THEME.MutedHex
+        $warnOle       = ConvertTo-ExcelOleColor $script:THEME.WarnHex
+        $warnBgOle     = ConvertTo-ExcelOleColor $script:THEME.WarnBgHex
+        $cardBgOle     = ConvertTo-ExcelOleColor $script:THEME.CardBgHex
+        $borderOle     = ConvertTo-ExcelOleColor $script:THEME.BorderHex
+        $darkBorderOle = ConvertTo-ExcelOleColor $script:THEME.BorderDarkHex
+        $zebraOle      = ConvertTo-ExcelOleColor $script:THEME.ZebraHex
+        $totalBgOle    = ConvertTo-ExcelOleColor $script:THEME.TotalBgHex
+        $whiteOle      = ConvertTo-ExcelOleColor $script:THEME.WhiteHex
 
-        # ======================================================================
-        #  SHEET 1: 01_サマリー (Executive KPI Dashboard + Top Charts)
-        # ======================================================================
-        Write-XlsLog "シート作成中: 01_サマリー..." 64
-        Set-ColumnWidths -Sheet $wsSummary -Widths @(6, 24, 16, 13, 11, 7, 15, 11, 14, 11, 8, 30)
-        Set-SheetTitleBanner -Sheet $wsSummary -Title 'Aurora Serverless v2 (MySQL 8.4.7) 性能試験用データ分析レポート — エグゼクティブサマリー' -Subtitle $subInfo -EndCol 12
+        $allCols = New-Object System.Collections.Generic.List[object]
+        foreach ($t in $Analysis.Tables) {
+            foreach ($c in $t.Columns) { $allCols.Add($c) }
+        }
+        $roleSummary = @(Get-RoleSummaryItems -Analysis $Analysis)
+        $typeSummary = @(Get-TypeSummaryItems -AllCols $allCols)
 
-        # KPI Cards (Rows 4-5, 6 cards across cols 1..12, pure white background + Navy/Burgundy top accent bar)
-        $kpiDefs = @(
-            @{ Col1 = 1;  Col2 = 2;  Label = '総テーブル数';           Value = [double]$Analysis.TableCount;                                Fmt = '#,##0" テーブル"'; Warn = $false },
-            @{ Col1 = 3;  Col2 = 4;  Label = '総レコード数';           Value = [double]$Analysis.TotalRows;                                 Fmt = '#,##0" 件"';       Warn = ($Analysis.TotalRows -eq 0) },
-            @{ Col1 = 5;  Col2 = 6;  Label = $sizeKpiLabel;            Value = [Math]::Round($Analysis.TotalFileBytes / 1MB, 2);            Fmt = '#,##0.00" MB"';    Warn = $false },
-            @{ Col1 = 7;  Col2 = 8;  Label = '推定InnoDB容量 (MB)';    Value = [Math]::Round($Analysis.TotalEstInnoDbBytes / 1MB, 2);       Fmt = '#,##0.00" MB"';    Warn = $false },
-            @{ Col1 = 9;  Col2 = 10; Label = '総カラム数 / 関連数';    Value = ("{0} 列 / {1} 関連" -f $Analysis.TotalColumns, $Analysis.Relationships.Count); Fmt = '@'; Warn = $false },
-            @{ Col1 = 11; Col2 = 12; Label = '検出警告・注意 (高/計)'; Value = ("高 {0} 件 / 計 {1} 件" -f $Analysis.HighWarningCount, $Analysis.TotalWarningCount); Fmt = '@'; Warn = ($Analysis.TotalWarningCount -gt 0) }
-        )
-
-        $wsSummary.Rows.Item(4).RowHeight = 20
-        $wsSummary.Rows.Item(5).RowHeight = 32
-        $wsSummary.Rows.Item(6).RowHeight = 10
-        foreach ($kpi in $kpiDefs) {
-            $lblRng = $wsSummary.Range($wsSummary.Cells.Item(4, $kpi.Col1), $wsSummary.Cells.Item(4, $kpi.Col2))
-            $lblRng.Merge()
-            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item(4, $kpi.Col1), $kpi.Label)
-            $lblRng.Font.Name = $script:THEME.FontName
-            $lblRng.Font.Size = 8.5
-            $lblRng.Font.Bold = $true
-            $lblRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $mutedOle }
-            $lblRng.Interior.Color = $cardBgOle
-            $lblRng.HorizontalAlignment = -4108
-            $lblRng.VerticalAlignment = -4108
-
-            $valRng = $wsSummary.Range($wsSummary.Cells.Item(5, $kpi.Col1), $wsSummary.Cells.Item(5, $kpi.Col2))
-            $valRng.Merge()
-            $valRng.NumberFormat = $kpi.Fmt
-            Set-ExcelCellValue -Cell $wsSummary.Cells.Item(5, $kpi.Col1) -Value $kpi.Value
-            $valRng.Font.Name = $script:THEME.FontName
-            $valRng.Font.Size = 14
-            $valRng.Font.Bold = $true
-            $valRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $navyOle }
-            $valRng.Interior.Color = $cardBgOle
-            $valRng.HorizontalAlignment = -4108
-            $valRng.VerticalAlignment = -4108
-
-            $box = $wsSummary.Range($wsSummary.Cells.Item(4, $kpi.Col1), $wsSummary.Cells.Item(5, $kpi.Col2))
-            $box.Borders.Item(8).LineStyle = 1; $box.Borders.Item(8).Color = if ($kpi.Warn) { $warnOle } else { $navyOle }; $box.Borders.Item(8).Weight = 3
-            foreach ($e in @(7, 9, 10)) { $box.Borders.Item($e).LineStyle = 1; $box.Borders.Item($e).Color = $borderOle; $box.Borders.Item($e).Weight = 2 }
+        function Write-AnalysisTotalRow {
+            param($Sheet, [int]$Row, [int]$StartCol, [object[]]$Values, [hashtable]$Formats = @{}, [int[]]$CenterCols = @(), [int[]]$RightCols = @(), [int[]]$WarnPositiveCols = @())
+            $cnt = $Values.Count
+            $rng = $Sheet.Range($Sheet.Cells.Item($Row, $StartCol), $Sheet.Cells.Item($Row, $StartCol + $cnt - 1))
+            $rng.Font.Name = $script:THEME.FontName
+            $rng.Font.Size = 9.5
+            $rng.Font.Bold = $true
+            $rng.Font.Color = $navyOle
+            $rng.Interior.Color = $totalBgOle
+            $rng.VerticalAlignment = -4108
+            $rng.HorizontalAlignment = -4131
+            foreach ($edge in @(7, 8, 9, 10, 11)) {
+                try {
+                    $b = $rng.Borders.Item($edge)
+                    $b.LineStyle = 1
+                    $b.Weight = 2
+                    $b.Color = if ($edge -eq 8 -or $edge -eq 9) { $navyOle } else { $borderOle }
+                }
+                catch { }
+            }
+            for ($c = 0; $c -lt $cnt; $c++) {
+                $col1 = $c + 1
+                $cell = $Sheet.Cells.Item($Row, $StartCol + $c)
+                if ($Formats.ContainsKey($col1)) { $cell.NumberFormat = $Formats[$col1] }
+                Set-ExcelCellValue -Cell $cell -Value $Values[$c]
+                if ($CenterCols -contains $col1) { $cell.HorizontalAlignment = -4108 }
+                elseif ($RightCols -contains $col1) { $cell.HorizontalAlignment = -4152 }
+                if (($WarnPositiveCols -contains $col1) -and ($Values[$c] -is [double] -or $Values[$c] -is [int] -or $Values[$c] -is [long]) -and [double]$Values[$c] -gt 0) {
+                    $cell.Font.Color = $warnOle
+                }
+            }
+            $Sheet.Rows.Item($Row).RowHeight = 25
         }
 
-        # Top Tables Summary Table (Rows 7..)
-        Set-SectionHeader -Sheet $wsSummary -Row 7 -StartCol 1 -EndCol 12 -Text '1. テーブル別レコード数・容量構成比 TOP15 (性能試験データ規模)'
+        function Write-KpiCardBand {
+            param($Sheet, [int]$LabelRow, [object[]]$Kpis)
+            $Sheet.Rows.Item($LabelRow).RowHeight = 20
+            $Sheet.Rows.Item($LabelRow + 1).RowHeight = 30
+            foreach ($kpi in $Kpis) {
+                $lblRng = $Sheet.Range($Sheet.Cells.Item($LabelRow, $kpi.Col1), $Sheet.Cells.Item($LabelRow, $kpi.Col2))
+                $lblRng.Merge()
+                [AuroraAnalyzer.ComHelper]::SetValue2($Sheet.Cells.Item($LabelRow, $kpi.Col1), $kpi.Label)
+                $lblRng.Font.Name = $script:THEME.FontName
+                $lblRng.Font.Size = 8.5
+                $lblRng.Font.Bold = $true
+                $lblRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $mutedOle }
+                $lblRng.Interior.Color = $cardBgOle
+                $lblRng.HorizontalAlignment = -4108
+                $lblRng.VerticalAlignment = -4108
+
+                $valRng = $Sheet.Range($Sheet.Cells.Item($LabelRow + 1, $kpi.Col1), $Sheet.Cells.Item($LabelRow + 1, $kpi.Col2))
+                $valRng.Merge()
+                $valRng.NumberFormat = $kpi.Fmt
+                Set-ExcelCellValue -Cell $Sheet.Cells.Item($LabelRow + 1, $kpi.Col1) -Value $kpi.Value
+                $valRng.Font.Name = $script:THEME.FontName
+                $valRng.Font.Size = if ($kpi.ContainsKey('FontSize')) { $kpi.FontSize } else { 13.0 }
+                $valRng.Font.Bold = $true
+                $valRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $navyOle }
+                $valRng.Interior.Color = $cardBgOle
+                $valRng.HorizontalAlignment = -4108
+                $valRng.VerticalAlignment = -4108
+
+                $box = $Sheet.Range($Sheet.Cells.Item($LabelRow, $kpi.Col1), $Sheet.Cells.Item($LabelRow + 1, $kpi.Col2))
+                $box.Borders.Item(8).LineStyle = 1; $box.Borders.Item(8).Color = if ($kpi.Warn) { $warnOle } else { $navyOle }; $box.Borders.Item(8).Weight = 3
+                foreach ($e in @(7, 9, 10)) { $box.Borders.Item($e).LineStyle = 1; $box.Borders.Item($e).Color = $borderOle; $box.Borders.Item($e).Weight = 2 }
+            }
+        }
+
+        # ======================================================================
+        #  SHEET 1: 01_サマリー (Comprehensive KPI Dashboard, Breakdowns & Charts)
+        # ======================================================================
+        Write-XlsLog "シート作成中: 01_サマリー..." 64
+        Set-ColumnWidths -Sheet $wsSummary -Widths @(6, 24, 17, 13, 11, 8, 15, 11, 14, 11, 8, 32)
+        Set-SheetTitleBanner -Sheet $wsSummary -Title 'Aurora Serverless v2 (MySQL 8.4.7) 性能試験用データ分析レポート — サマリー' -Subtitle $subInfo -EndCol 12
+
+        # KPI Cards Row 1 (Primary Volume & Schema KPIs: Rows 4-5)
+        $kpiRow1 = @(
+            @{ Col1 = 1;  Col2 = 2;  Label = '総テーブル数';           Value = [double]$Analysis.TableCount;                                Fmt = '#,##0" テーブル"'; Warn = $false; FontSize = 13.5 },
+            @{ Col1 = 3;  Col2 = 4;  Label = '総レコード数';           Value = [double]$Analysis.TotalRows;                                 Fmt = '#,##0" 件"';       Warn = ($Analysis.TotalRows -eq 0); FontSize = 13.5 },
+            @{ Col1 = 5;  Col2 = 6;  Label = $sizeKpiLabel;            Value = [Math]::Round($Analysis.TotalFileBytes / 1MB, 2);            Fmt = '#,##0.00" MB"';    Warn = $false; FontSize = 13.5 },
+            @{ Col1 = 7;  Col2 = 8;  Label = '推定InnoDB容量 (MB)';    Value = [Math]::Round($Analysis.TotalEstInnoDbBytes / 1MB, 2);       Fmt = '#,##0.00" MB"';    Warn = $false; FontSize = 13.5 },
+            @{ Col1 = 9;  Col2 = 10; Label = '総カラム数 / PK候補';    Value = ("{0} 列 / PK {1} 列" -f $Analysis.TotalColumns, $Analysis.CandidatePkColumnCount); Fmt = '@'; Warn = $false; FontSize = 12.0 },
+            @{ Col1 = 11; Col2 = 12; Label = '検出警告 (高/中/低)';    Value = ("高 {0} / 中 {1} / 低 {2} (計 {3})" -f $Analysis.HighWarningCount, $Analysis.MediumWarningCount, $Analysis.LowWarningCount, $Analysis.TotalWarningCount); Fmt = '@'; Warn = ($Analysis.TotalWarningCount -gt 0); FontSize = 11.5 }
+        )
+        Write-KpiCardBand -Sheet $wsSummary -LabelRow 4 -Kpis $kpiRow1
+        $wsSummary.Rows.Item(6).RowHeight = 8
+
+        # KPI Cards Row 2 (Quality, Skew, Relation & ACU KPIs: Rows 7-8)
+        $kpiRow2 = @(
+            @{ Col1 = 1;  Col2 = 2;  Label = '全体セルNULL率';            Value = [double]$Analysis.OverallAvgNullRate; Fmt = '0.0%'; Warn = ($Analysis.OverallAvgNullRate -ge 0.30); FontSize = 13.0 },
+            @{ Col1 = 3;  Col2 = 4;  Label = '平均行長 / 最大行長';       Value = ("{0:#,##0.0} B / {1:#,##0} B" -f $Analysis.OverallAvgRowBytes, $Analysis.OverallMaxRowBytes); Fmt = '@'; Warn = $false; FontSize = 11.0 },
+            @{ Col1 = 5;  Col2 = 6;  Label = '偏り高リスク / 大容量列';   Value = ("偏り {0} 列 / 大容量 {1} 列" -f $Analysis.HighSkewColumnCount, $Analysis.LargeColumnCount); Fmt = '@'; Warn = ($Analysis.HighSkewColumnCount -gt 0 -or $Analysis.LargeColumnCount -gt 0); FontSize = 11.0 },
+            @{ Col1 = 7;  Col2 = 8;  Label = '検出リレーション / 孤立行'; Value = ("{0} 件 / 孤立 {1:#,##0} 行" -f $Analysis.Relationships.Count, $Analysis.TotalOrphanRows); Fmt = '@'; Warn = ($Analysis.TotalOrphanRows -gt 0); FontSize = 11.5 },
+            @{ Col1 = 9;  Col2 = 10; Label = '空テーブル / 書式異常行';   Value = ("空 {0} 表 / 異常 {1:#,##0} 行" -f $Analysis.EmptyTableCount, $Analysis.RaggedRowTotal); Fmt = '@'; Warn = ($Analysis.EmptyTableCount -gt 0 -or $Analysis.RaggedRowTotal -gt 0); FontSize = 11.5 },
+            @{ Col1 = 11; Col2 = 12; Label = '推定ACU目安 (現状 / 10倍)'; Value = ("{0:0.0} ACU / {1:0.0} ACU" -f $Analysis.EstMinAcuCurrent, $Analysis.EstMinAcu10x); Fmt = '@'; Warn = $false; FontSize = 11.5 }
+        )
+        Write-KpiCardBand -Sheet $wsSummary -LabelRow 7 -Kpis $kpiRow2
+        $wsSummary.Rows.Item(9).RowHeight = 10
+
+        # Section 1: Top Tables Summary Table (Rows 10..)
+        Set-SectionHeader -Sheet $wsSummary -Row 10 -StartCol 1 -EndCol 12 -Text '1. テーブル別レコード数・容量構成比 TOP15 (性能試験データ規模)'
         $topTables = @($Analysis.Tables | Select-Object -First 15)
         $mTop = New-Object 'object[,]' ([Math]::Max(1, $topTables.Count)), 12
         for ($i = 0; $i -lt $topTables.Count; $i++) {
@@ -7112,34 +7859,306 @@ function Export-AnalysisToExcelCom {
             $mTop[$i, 10] = [double]$t.WarningCount
             $mTop[$i, 11] = if ([string]::IsNullOrEmpty($t.WarningSummary)) { '正常' } else { $t.WarningSummary }
         }
-        $sumEndRow = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow 8 -StartCol 1 `
+        $sumEndRow = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow 11 -StartCol 1 `
             -Headers @('順位', 'テーブル名', '推定役割', 'レコード数', '件数構成比', '列数', $sizeColHeader, '容量構成比', '推定InnoDB(KB)', '平均NULL率', '警告数', '健全性・注意点') `
             -DataMatrix $mTop -RowCount $topTables.Count `
             -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 4 = '#,##0'; 5 = '0.0%'; 6 = '#,##0'; 7 = '#,##0.00'; 8 = '0.0%'; 9 = '#,##0.0'; 10 = '0.0%'; 11 = '#,##0'; 12 = '@' } `
             -CenterCols @(1, 3, 6, 11) -RightCols @(4, 5, 7, 8, 9, 10) -WrapCols @(12) -WarnCheckCols @(12)
 
-        # Charts on Summary Sheet (placed cleanly below table)
-        $chartTopRow = $sumEndRow + 2
+        for ($i = 0; $i -lt $topTables.Count; $i++) {
+            if ($topTables[$i].WarningCount -gt 0) {
+                $wc = $wsSummary.Cells.Item(12 + $i, 11)
+                $wc.Font.Color = $warnOle; $wc.Font.Bold = $true; $wc.Interior.Color = $warnBgOle
+            }
+        }
+
+        $sumTotalRow = $sumEndRow + 1
+        $totRowLabel = if ($Analysis.TableCount -gt 15) { "全$($Analysis.TableCount)テーブル合計" } else { "全体合計 ($($Analysis.TableCount)テーブル)" }
+        Write-AnalysisTotalRow -Sheet $wsSummary -Row $sumTotalRow -StartCol 1 `
+            -Values @('計', $totRowLabel, '-', [double]$Analysis.TotalRows, 1.0, [double]$Analysis.TotalColumns, [Math]::Round($Analysis.TotalFileBytes / 1024.0, 2), 1.0, [Math]::Round($Analysis.TotalEstInnoDbBytes / 1024.0, 1), [double]$Analysis.OverallAvgNullRate, [double]$Analysis.TotalWarningCount, ("高 {0} / 中 {1} / 低 {2}" -f $Analysis.HighWarningCount, $Analysis.MediumWarningCount, $Analysis.LowWarningCount)) `
+            -Formats @{ 4 = '#,##0'; 5 = '0.0%'; 6 = '#,##0'; 7 = '#,##0.00'; 8 = '0.0%'; 9 = '#,##0.0'; 10 = '0.0%'; 11 = '#,##0'; 12 = '@' } `
+            -CenterCols @(1, 3, 6, 11) -RightCols @(4, 5, 7, 8, 9, 10) -WarnPositiveCols @(11)
+
+        # Charts on Summary Sheet (placed cleanly below total row; data rows are 12..topEndRowIdx)
+        $chartTopRow = $sumTotalRow + 2
         $chartTopPt = $wsSummary.Rows.Item($chartTopRow).Top
-        $chartHeight = 255.0
+        $chartHeight = 250.0
         if ($topTables.Count -ge 1) {
-            $topEndRowIdx = 8 + $topTables.Count
+            $topEndRowIdx = 11 + $topTables.Count
             [void](Add-StyledExcelChart -Sheet $wsSummary -Left 6 -Top $chartTopPt -Width 460 -Height $chartHeight `
                 -ChartType 57 -Title 'テーブル別レコード数 TOP15' `
-                -CategoryAddress "B9:B$topEndRowIdx" -ValueAddresses @("D9:D$topEndRowIdx") `
+                -CategoryAddress "B12:B$topEndRowIdx" -ValueAddresses @("D12:D$topEndRowIdx") `
                 -SeriesNames @('レコード数') -SeriesColors @($script:THEME.AccentHex) -ReverseCategories $true -ShowDataLabels $true)
 
             $pieCount = [Math]::Min(10, $topTables.Count)
-            $pieEndRowIdx = 8 + $pieCount
+            $pieEndRowIdx = 11 + $pieCount
             [void](Add-StyledExcelChart -Sheet $wsSummary -Left 480 -Top $chartTopPt -Width 440 -Height $chartHeight `
                 -ChartType -4120 -Title 'テーブル別データ容量構成比 TOP10 (KB)' `
-                -CategoryAddress "B9:B$pieEndRowIdx" -ValueAddresses @("G9:G$pieEndRowIdx") `
+                -CategoryAddress "B12:B$pieEndRowIdx" -ValueAddresses @("G12:G$pieEndRowIdx") `
                 -SeriesNames @('容量(KB)') -ShowLegend $true -ShowDataLabels $true)
         }
 
-        # Aurora Insights & Key Findings below charts
-        $insRow = if ($topTables.Count -ge 1) { Get-RowBelowPoints -Sheet $wsSummary -StartRow ($chartTopRow + 1) -TargetTopPt ($chartTopPt + $chartHeight + 16) } else { $chartTopRow }
-        Set-SectionHeader -Sheet $wsSummary -Row $insRow -StartCol 1 -EndCol 12 -Text '2. Aurora Serverless v2 (MySQL 8.4.7) 性能試験向け総合所見'
+        # Section 2: Role Breakdown Summary
+        $curRow = if ($topTables.Count -ge 1) { Get-RowBelowPoints -Sheet $wsSummary -StartRow ($chartTopRow + 1) -TargetTopPt ($chartTopPt + $chartHeight + 16) } else { $chartTopRow }
+        Set-SectionHeader -Sheet $wsSummary -Row $curRow -StartCol 1 -EndCol 12 -Text '2. 推定役割別テーブル構成サマリー (データ分類・規模内訳)'
+        $curRow++
+        $mRole = New-Object 'object[,]' ([Math]::Max(1, $roleSummary.Count)), 12
+        for ($i = 0; $i -lt $roleSummary.Count; $i++) {
+            $rg = $roleSummary[$i]
+            $tblShare = if ($Analysis.TableCount -gt 0) { [double]$rg.TableCount / $Analysis.TableCount } else { 0.0 }
+            $rowShare = if ($Analysis.TotalRows -gt 0) { [double]$rg.TotalRows / $Analysis.TotalRows } else { 0.0 }
+            $szShare  = if ($Analysis.TotalFileBytes -gt 0) { [double]$rg.TotalFileBytes / $Analysis.TotalFileBytes } else { 0.0 }
+            $mRole[$i, 0]  = $i + 1
+            $mRole[$i, 1]  = $rg.Role
+            $mRole[$i, 2]  = [double]$rg.TableCount
+            $mRole[$i, 3]  = $tblShare
+            $mRole[$i, 4]  = [double]$rg.TotalRows
+            $mRole[$i, 5]  = $rowShare
+            $mRole[$i, 6]  = [double]$rg.TotalCols
+            $mRole[$i, 7]  = [Math]::Round($rg.TotalFileBytes / 1024.0, 2)
+            $mRole[$i, 8]  = $szShare
+            $mRole[$i, 9]  = [Math]::Round($rg.TotalInnoBytes / 1024.0, 1)
+            $mRole[$i, 10] = [double]$rg.WarningCount
+            $mRole[$i, 11] = ($rg.Examples -join ', ') + $(if ($rg.TableCount -gt $rg.Examples.Count) { " 他$($rg.TableCount - $rg.Examples.Count)" } else { '' })
+        }
+        $roleEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow $curRow -StartCol 1 `
+            -Headers @('No', '推定役割', 'テーブル数', 'テーブル比', '合計レコード数', '件数構成比', '合計列数', $sizeColHeader, '容量構成比', '推定InnoDB(KB)', '警告数', '該当テーブル例 (上位)') `
+            -DataMatrix $mRole -RowCount $roleSummary.Count `
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '#,##0'; 4 = '0.0%'; 5 = '#,##0'; 6 = '0.0%'; 7 = '#,##0'; 8 = '#,##0.00'; 9 = '0.0%'; 10 = '#,##0.0'; 11 = '#,##0'; 12 = '@' } `
+            -CenterCols @(1, 3, 7, 11) -RightCols @(4, 5, 6, 8, 9, 10) -WrapCols @(12) -WarnCheckCols @(2)
+        Write-AnalysisTotalRow -Sheet $wsSummary -Row ($roleEnd + 1) -StartCol 1 `
+            -Values @('計', '全役割合計', [double]$Analysis.TableCount, 1.0, [double]$Analysis.TotalRows, 1.0, [double]$Analysis.TotalColumns, [Math]::Round($Analysis.TotalFileBytes / 1024.0, 2), 1.0, [Math]::Round($Analysis.TotalEstInnoDbBytes / 1024.0, 1), [double]$Analysis.TotalWarningCount, "空テーブル $($Analysis.EmptyTableCount) 件") `
+            -Formats @{ 3 = '#,##0'; 4 = '0.0%'; 5 = '#,##0'; 6 = '0.0%'; 7 = '#,##0'; 8 = '#,##0.00'; 9 = '0.0%'; 10 = '#,##0.0'; 11 = '#,##0'; 12 = '@' } `
+            -CenterCols @(1, 3, 7, 11) -RightCols @(4, 5, 6, 8, 9, 10) -WarnPositiveCols @(11)
+
+        # Section 3: Column Data Type & Quality Breakdown
+        $curRow = $roleEnd + 3
+        Set-SectionHeader -Sheet $wsSummary -Row $curRow -StartCol 1 -EndCol 12 -Text '3. データ型別カラム構成 ＆ 品質サマリー (全カラム内訳)'
+        $curRow++
+        $totColsDenom = [Math]::Max(1, $allCols.Count)
+        $mType = New-Object 'object[,]' ([Math]::Max(1, $typeSummary.Count)), 12
+        for ($i = 0; $i -lt $typeSummary.Count; $i++) {
+            $tg = $typeSummary[$i]
+            $avgNull = if ($tg.ColCount -gt 0) { $tg.NullRateSum / $tg.ColCount } else { 0.0 }
+            $avgCard = if ($tg.ColCount -gt 0) { $tg.CardRateSum / $tg.ColCount } else { 0.0 }
+            $avgB    = if ($tg.NonEmptyCols -gt 0) { [Math]::Round($tg.AvgByteSum / $tg.NonEmptyCols, 1) } else { 0.0 }
+            $riskTxt = if ($tg.HighSkewCnt -gt 0 -or $tg.AllNullCnt -gt 0) { "偏り:$($tg.HighSkewCnt) / 全NULL:$($tg.AllNullCnt)" } else { '正常' }
+            $mType[$i, 0]  = $i + 1
+            $mType[$i, 1]  = $tg.DataType
+            $mType[$i, 2]  = [double]$tg.ColCount
+            $mType[$i, 3]  = [double]$tg.ColCount / $totColsDenom
+            $mType[$i, 4]  = [double]$tg.PkCount
+            $mType[$i, 5]  = [double]$tg.CatCount
+            $mType[$i, 6]  = $avgNull
+            $mType[$i, 7]  = $avgCard
+            $mType[$i, 8]  = $avgB
+            $mType[$i, 9]  = [double]$tg.MaxByteLen
+            $mType[$i, 10] = $riskTxt
+            $mType[$i, 11] = ($tg.Examples -join ', ') + $(if ($tg.ColCount -gt $tg.Examples.Count) { " 他$($tg.ColCount - $tg.Examples.Count)" } else { '' })
+        }
+        $typeEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow $curRow -StartCol 1 `
+            -Headers @('No', '推定データ型', 'カラム数', '構成比', 'PK候補', '区分列', '平均NULL率', '平均ユニーク率', '平均長(B)', '最大長(B)', '偏り/全NULL', '代表カラム例') `
+            -DataMatrix $mType -RowCount $typeSummary.Count `
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '#,##0'; 4 = '0.0%'; 5 = '#,##0'; 6 = '#,##0'; 7 = '0.0%'; 8 = '0.0%'; 9 = '#,##0.0'; 10 = '#,##0'; 11 = '@'; 12 = '@' } `
+            -CenterCols @(1, 3, 5, 6, 11) -RightCols @(4, 7, 8, 9, 10) -WrapCols @(11, 12) -WarnCheckCols @(11)
+
+        # Section 4: Top Warnings & Risk Summary (merged cleanly across cols 1..12)
+        $curRow = $typeEnd + 2
+        $topWarns = @($Analysis.Warnings | Select-Object -First 20)
+        $warnSecTitle = if ($Analysis.Warnings.Count -gt 20) {
+            "4. 検出された主要警告・リスクサマリー (重要度順 上位20件 / 全$($Analysis.Warnings.Count)件)"
+        }
+        else {
+            "4. 検出された主要警告・リスクサマリー (全$($Analysis.Warnings.Count)件)"
+        }
+        Set-SectionHeader -Sheet $wsSummary -Row $curRow -StartCol 1 -EndCol 12 -Text $warnSecTitle
+        $curRow++
+        # Header row for Section 4 (Col 1, 2, 3, 4, 5-7, 8-12)
+        $wSpans = @(
+            @{ C1 = 1; C2 = 1; Title = '重要度' },
+            @{ C1 = 2; C2 = 2; Title = 'カテゴリ' },
+            @{ C1 = 3; C2 = 3; Title = 'テーブル名' },
+            @{ C1 = 4; C2 = 4; Title = 'カラム名' },
+            @{ C1 = 5; C2 = 7; Title = '検出値・指標' },
+            @{ C1 = 8; C2 = 12; Title = 'Aurora / 性能試験への影響 ＆ 推奨アクション' }
+        )
+        $wsSummary.Rows.Item($curRow).RowHeight = 26
+        foreach ($sp in $wSpans) {
+            $rH = $wsSummary.Range($wsSummary.Cells.Item($curRow, $sp.C1), $wsSummary.Cells.Item($curRow, $sp.C2))
+            if ($sp.C2 -gt $sp.C1) { $rH.Merge() }
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, $sp.C1), $sp.Title)
+            $rH.Font.Name = $script:THEME.FontName; $rH.Font.Size = 9.5; $rH.Font.Bold = $true; $rH.Font.Color = $whiteOle
+            $rH.Interior.Color = $navyOle; $rH.HorizontalAlignment = -4108; $rH.VerticalAlignment = -4108
+            foreach ($edge in @(7, 8, 9, 10)) { try { $hb = $rH.Borders.Item($edge); $hb.LineStyle = 1; $hb.Weight = 2; $hb.Color = $navyOle } catch { } }
+        }
+        $curRow++
+        if ($topWarns.Count -eq 0) {
+            $rEmpty = $wsSummary.Range($wsSummary.Cells.Item($curRow, 1), $wsSummary.Cells.Item($curRow, 12))
+            $rEmpty.Merge()
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, 1), '警告・注意項目は検出されませんでした (良好)')
+            $rEmpty.Font.Name = $script:THEME.FontName; $rEmpty.Font.Size = 9.5; $rEmpty.Font.Color = $mutedOle
+            $rEmpty.Interior.Color = $whiteOle; $rEmpty.HorizontalAlignment = -4108; $rEmpty.VerticalAlignment = -4108
+            foreach ($edge in @(7, 8, 9, 10)) { try { $eb = $rEmpty.Borders.Item($edge); $eb.LineStyle = 1; $eb.Weight = 2; $eb.Color = $borderOle } catch { } }
+            $wsSummary.Rows.Item($curRow).RowHeight = 24
+            $curRow++
+        }
+        else {
+            for ($i = 0; $i -lt $topWarns.Count; $i++) {
+                $w = $topWarns[$i]
+                $bgCol = if (($i % 2) -eq 1) { $zebraOle } else { $whiteOle }
+                $isHiMed = ($w.Severity -eq '高' -or $w.Severity -eq '中')
+                $actionText = "【影響】$($w.PerfImpact)  【対策】$($w.Recommendation)"
+                $vals = @($w.Severity, $w.Category, $w.TableName, $w.ColumnName, $w.MetricValue, $actionText)
+                for ($k = 0; $k -lt $wSpans.Count; $k++) {
+                    $sp = $wSpans[$k]
+                    $rng = $wsSummary.Range($wsSummary.Cells.Item($curRow, $sp.C1), $wsSummary.Cells.Item($curRow, $sp.C2))
+                    if ($sp.C2 -gt $sp.C1) { $rng.Merge() }
+                    $rng.NumberFormat = '@'
+                    [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, $sp.C1), $vals[$k])
+                    $rng.Font.Name = $script:THEME.FontName; $rng.Font.Size = 9.5; $rng.VerticalAlignment = -4108
+                    $rng.WrapText = ($k -ge 4)
+                    $rng.HorizontalAlignment = if ($k -le 1) { -4108 } else { -4131 }
+                    if ($isHiMed -and $k -le 1) {
+                        $rng.Font.Color = $warnOle; $rng.Font.Bold = $true; $rng.Interior.Color = $warnBgOle
+                    }
+                    else {
+                        $rng.Font.Color = $textOle; $rng.Interior.Color = $bgCol
+                    }
+                    foreach ($edge in @(7, 8, 9, 10)) { try { $b = $rng.Borders.Item($edge); $b.LineStyle = 1; $b.Weight = 2; $b.Color = $borderOle } catch { } }
+                }
+                $wsSummary.Rows.Item($curRow).RowHeight = Get-EstimatedRowHeight -Texts @($w.MetricValue, $actionText) -ColWidths @(34.0, 76.0) -MinHeight 24.0 -MaxHeight 85.0
+                $curRow++
+            }
+        }
+
+        # Section 5: Relations & JMeter Readiness Highlights
+        $curRow++
+        Set-SectionHeader -Sheet $wsSummary -Row $curRow -StartCol 1 -EndCol 12 -Text '5. テーブル間リレーション概要 ＆ JMeterパラメータ化適性ハイライト'
+        $curRow++
+        $topRels = @($Analysis.Relationships | Select-Object -First 10)
+        $rSpans = @(
+            @{ C1 = 1;  C2 = 1;  Title = 'No' },
+            @{ C1 = 2;  C2 = 3;  Title = '親テーブル.PK → 子テーブル.FK' },
+            @{ C1 = 4;  C2 = 4;  Title = '参照一致率' },
+            @{ C1 = 5;  C2 = 5;  Title = '孤立行数' },
+            @{ C1 = 6;  C2 = 7;  Title = '平均 / P95 (子/親)' },
+            @{ C1 = 8;  C2 = 8;  Title = '最大(子/親)' },
+            @{ C1 = 9;  C2 = 10; Title = 'リスク評価' },
+            @{ C1 = 11; C2 = 12; Title = '所見・スーパーユーザー情報' }
+        )
+        $wsSummary.Rows.Item($curRow).RowHeight = 25
+        foreach ($sp in $rSpans) {
+            $rH = $wsSummary.Range($wsSummary.Cells.Item($curRow, $sp.C1), $wsSummary.Cells.Item($curRow, $sp.C2))
+            if ($sp.C2 -gt $sp.C1) { $rH.Merge() }
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, $sp.C1), $sp.Title)
+            $rH.Font.Name = $script:THEME.FontName; $rH.Font.Size = 9.5; $rH.Font.Bold = $true; $rH.Font.Color = $whiteOle
+            $rH.Interior.Color = $navyOle; $rH.HorizontalAlignment = -4108; $rH.VerticalAlignment = -4108
+            foreach ($edge in @(7, 8, 9, 10)) { try { $hb = $rH.Borders.Item($edge); $hb.LineStyle = 1; $hb.Weight = 2; $hb.Color = $navyOle } catch { } }
+        }
+        $curRow++
+        if ($topRels.Count -eq 0) {
+            $rEmpty = $wsSummary.Range($wsSummary.Cells.Item($curRow, 1), $wsSummary.Cells.Item($curRow, 12))
+            $rEmpty.Merge()
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, 1), '自動推定されたテーブル間FKリレーションはありません')
+            $rEmpty.Font.Name = $script:THEME.FontName; $rEmpty.Font.Size = 9.5; $rEmpty.Font.Color = $mutedOle
+            $rEmpty.Interior.Color = $whiteOle; $rEmpty.HorizontalAlignment = -4108; $rEmpty.VerticalAlignment = -4108
+            foreach ($edge in @(7, 8, 9, 10)) { try { $eb = $rEmpty.Borders.Item($edge); $eb.LineStyle = 1; $eb.Weight = 2; $eb.Color = $borderOle } catch { } }
+            $wsSummary.Rows.Item($curRow).RowHeight = 24
+            $curRow++
+        }
+        else {
+            for ($i = 0; $i -lt $topRels.Count; $i++) {
+                $rl = $topRels[$i]
+                $bgCol = if (($i % 2) -eq 1) { $zebraOle } else { $whiteOle }
+                $relPair = "$($rl.ParentTable).$($rl.ParentColumn) → $($rl.ChildTable).$($rl.ChildColumn)"
+                $avgP95  = ("平均 {0:0.00} / P95 {1:0.0}" -f $rl.FanOutAvg, $rl.FanOutP95)
+                $rVals = @([double]($i + 1), $relPair, [double]$rl.MatchRate, [double]$rl.OrphanRows, $avgP95, [double]$rl.FanOutMax, $rl.RiskLevel, $rl.Note)
+                $rFmts = @('#,##0', '@', '0.0%', '#,##0', '@', '#,##0', '@', '@')
+                for ($k = 0; $k -lt $rSpans.Count; $k++) {
+                    $sp = $rSpans[$k]
+                    $rng = $wsSummary.Range($wsSummary.Cells.Item($curRow, $sp.C1), $wsSummary.Cells.Item($curRow, $sp.C2))
+                    if ($sp.C2 -gt $sp.C1) { $rng.Merge() }
+                    $rng.NumberFormat = $rFmts[$k]
+                    Set-ExcelCellValue -Cell $wsSummary.Cells.Item($curRow, $sp.C1) -Value $rVals[$k]
+                    $rng.Font.Name = $script:THEME.FontName; $rng.Font.Size = 9.5; $rng.VerticalAlignment = -4108
+                    $rng.WrapText = ($k -eq 7)
+                    $rng.HorizontalAlignment = if ($k -in @(0, 4, 6)) { -4108 } elseif ($k -in @(2, 3, 5)) { -4152 } else { -4131 }
+                    $isW = ($k -eq 3 -and $rl.OrphanRows -gt 0) -or (($k -eq 6 -or $k -eq 7) -and (Test-WarningCellText -Text ([string]$rVals[$k])))
+                    if ($isW) { $rng.Font.Color = $warnOle; $rng.Font.Bold = $true; $rng.Interior.Color = $warnBgOle }
+                    else { $rng.Font.Color = $textOle; $rng.Interior.Color = $bgCol }
+                    foreach ($edge in @(7, 8, 9, 10)) { try { $b = $rng.Borders.Item($edge); $b.LineStyle = 1; $b.Weight = 2; $b.Color = $borderOle } catch { } }
+                }
+                $wsSummary.Rows.Item($curRow).RowHeight = Get-EstimatedRowHeight -Texts @($rl.Note) -ColWidths @(40.0) -MinHeight 22.0 -MaxHeight 65.0
+                $curRow++
+            }
+        }
+
+        # Top JMeter Candidates compact table right under relations
+        $curRow++
+        $topJcs = @($Analysis.JMeterCandidates | Select-Object -First 8)
+        $jSpans = @(
+            @{ C1 = 1; C2 = 1;  Title = 'No' },
+            @{ C1 = 2; C2 = 2;  Title = 'テーブル名' },
+            @{ C1 = 3; C2 = 3;  Title = 'キーカラム' },
+            @{ C1 = 4; C2 = 4;  Title = 'データ型' },
+            @{ C1 = 5; C2 = 5;  Title = '一意キー数' },
+            @{ C1 = 6; C2 = 7;  Title = 'JMeter並列適性' },
+            @{ C1 = 8; C2 = 12; Title = '推奨設定・活用指針' }
+        )
+        $wsSummary.Rows.Item($curRow).RowHeight = 25
+        foreach ($sp in $jSpans) {
+            $rH = $wsSummary.Range($wsSummary.Cells.Item($curRow, $sp.C1), $wsSummary.Cells.Item($curRow, $sp.C2))
+            if ($sp.C2 -gt $sp.C1) { $rH.Merge() }
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, $sp.C1), $sp.Title)
+            $rH.Font.Name = $script:THEME.FontName; $rH.Font.Size = 9.5; $rH.Font.Bold = $true; $rH.Font.Color = $whiteOle
+            $rH.Interior.Color = $navyOle; $rH.HorizontalAlignment = -4108; $rH.VerticalAlignment = -4108
+            foreach ($edge in @(7, 8, 9, 10)) { try { $hb = $rH.Borders.Item($edge); $hb.LineStyle = 1; $hb.Weight = 2; $hb.Color = $navyOle } catch { } }
+        }
+        $curRow++
+        if ($topJcs.Count -eq 0) {
+            $rEmpty = $wsSummary.Range($wsSummary.Cells.Item($curRow, 1), $wsSummary.Cells.Item($curRow, 12))
+            $rEmpty.Merge()
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($curRow, 1), '該当するJMeter一意キー候補 (10件以上) はありません')
+            $rEmpty.Font.Name = $script:THEME.FontName; $rEmpty.Font.Size = 9.5; $rEmpty.Font.Color = $mutedOle
+            $rEmpty.Interior.Color = $whiteOle; $rEmpty.HorizontalAlignment = -4108; $rEmpty.VerticalAlignment = -4108
+            foreach ($edge in @(7, 8, 9, 10)) { try { $eb = $rEmpty.Borders.Item($edge); $eb.LineStyle = 1; $eb.Weight = 2; $eb.Color = $borderOle } catch { } }
+            $wsSummary.Rows.Item($curRow).RowHeight = 24
+            $curRow++
+        }
+        else {
+            for ($i = 0; $i -lt $topJcs.Count; $i++) {
+                $jc = $topJcs[$i]
+                $bgCol = if (($i % 2) -eq 1) { $zebraOle } else { $whiteOle }
+                $jVals = @([double]($i + 1), $jc.TableName, $jc.KeyColumn, $jc.DataType, [double]$jc.UniqueCount, $jc.Suitability, $jc.RecommendedUsage)
+                $jFmts = @('#,##0', '@', '@', '@', '#,##0', '@', '@')
+                for ($k = 0; $k -lt $jSpans.Count; $k++) {
+                    $sp = $jSpans[$k]
+                    $rng = $wsSummary.Range($wsSummary.Cells.Item($curRow, $sp.C1), $wsSummary.Cells.Item($curRow, $sp.C2))
+                    if ($sp.C2 -gt $sp.C1) { $rng.Merge() }
+                    $rng.NumberFormat = $jFmts[$k]
+                    Set-ExcelCellValue -Cell $wsSummary.Cells.Item($curRow, $sp.C1) -Value $jVals[$k]
+                    $rng.Font.Name = $script:THEME.FontName; $rng.Font.Size = 9.5; $rng.VerticalAlignment = -4108
+                    $rng.WrapText = ($k -eq 6)
+                    $rng.HorizontalAlignment = if ($k -in @(0, 3, 5)) { -4108 } elseif ($k -eq 4) { -4152 } else { -4131 }
+                    if ($k -eq 5 -and $jc.Suitability -like '最適*') {
+                        $rng.Font.Color = $navyOle; $rng.Font.Bold = $true; $rng.Interior.Color = $bgCol
+                    }
+                    elseif ($k -eq 5 -and (Test-WarningCellText -Text $jc.Suitability)) {
+                        $rng.Font.Color = $warnOle; $rng.Font.Bold = $true; $rng.Interior.Color = $warnBgOle
+                    }
+                    else {
+                        $rng.Font.Color = $textOle; $rng.Interior.Color = $bgCol
+                    }
+                    foreach ($edge in @(7, 8, 9, 10)) { try { $b = $rng.Borders.Item($edge); $b.LineStyle = 1; $b.Weight = 2; $b.Color = $borderOle } catch { } }
+                }
+                $wsSummary.Rows.Item($curRow).RowHeight = Get-EstimatedRowHeight -Texts @($jc.RecommendedUsage) -ColWidths @(76.0) -MinHeight 22.0 -MaxHeight 65.0
+                $curRow++
+            }
+        }
+
+        # Section 6: Aurora Insights & Key Findings
+        $insRow = $curRow + 1
+        Set-SectionHeader -Sheet $wsSummary -Row $insRow -StartCol 1 -EndCol 12 -Text '6. Aurora Serverless v2 (MySQL 8.4.7) 性能試験向け総合所見'
         $insRow++
         foreach ($ins in $Analysis.AuroraInsights) {
             $rIns = $wsSummary.Range($wsSummary.Cells.Item($insRow, 1), $wsSummary.Cells.Item($insRow, 12))
@@ -7156,23 +8175,37 @@ function Export-AnalysisToExcelCom {
             $rIns.Interior.Color = $zebraOle
             $rIns.Borders.Item(7).LineStyle = 1; $rIns.Borders.Item(7).Color = $navyOle; $rIns.Borders.Item(7).Weight = 3
             $rIns.Borders.Item(9).LineStyle = 1; $rIns.Borders.Item(9).Color = $borderOle; $rIns.Borders.Item(9).Weight = 2
-            $wsSummary.Rows.Item($insRow).RowHeight = Get-EstimatedRowHeight -Texts @($ins) -ColWidths @(165.0) -MinHeight 26.0 -MaxHeight 80.0
+            $wsSummary.Rows.Item($insRow).RowHeight = Get-EstimatedRowHeight -Texts @($ins) -ColWidths @(165.0) -MinHeight 26.0 -MaxHeight 85.0
             $insRow++
+        }
+
+        if (-not $DetailedAnalysis) {
+            $rNote = $wsSummary.Range($wsSummary.Cells.Item($insRow + 1, 1), $wsSummary.Cells.Item($insRow + 1, 12))
+            $rNote.Merge()
+            $rNote.NumberFormat = '@'
+            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item($insRow + 1, 1), '※ カテゴリ分布・数値統計ヒストグラム・時系列分析・リレーション詳細・性能試験ガイド全件シートを出力するには、ダイアログの「詳細分析」にチェックを入れて実行してください。')
+            $rNote.Font.Name = $script:THEME.FontName; $rNote.Font.Size = 8.5; $rNote.Font.Color = $mutedOle
+            $rNote.HorizontalAlignment = -4131; $rNote.VerticalAlignment = -4108; $rNote.IndentLevel = 1
+            $wsSummary.Rows.Item($insRow + 1).RowHeight = 20
         }
 
         Format-ExcelSheetCommon -Sheet $wsSummary -FreezeRow 0 -Landscape $true
 
         # ======================================================================
-        #  SHEET 2: 02_テーブル一覧 (All Tables Complete Metrics)
+        #  SHEET 2: 02_テーブル一覧 (All Tables Complete Detailed Metrics - 29 cols)
         # ======================================================================
-        Write-XlsLog "シート作成中: 02_テーブル一覧..." 68
-        Set-ColumnWidths -Sheet $wsTables -Widths @(5, 22, 24, 15, 16, 12, 10, 7, 15, 10, 11, 11, 14, 10, 18, 20, 30)
-        Set-SheetTitleBanner -Sheet $wsTables -Title $tblSheetTitle -Subtitle $subInfo -EndCol 17
+        $pctTbl = if ($DetailedAnalysis) { 68 } else { 76 }
+        Write-XlsLog "シート作成中: 02_テーブル一覧..." $pctTbl
+        $tblWidths = @(5, 22, 24, 15, 16, 12, 10, 7, 24, 15, 10, 11, 11, 11, 14, 13, 12, 10, 11, 22, 11, 18, 22, 20, 24, 28, 22, 8, 32)
+        Set-ColumnWidths -Sheet $wsTables -Widths $tblWidths
+        Set-SheetTitleBanner -Sheet $wsTables -Title $tblSheetTitle -Subtitle $subInfo -EndCol $tblWidths.Count
 
         $allTables = @($Analysis.Tables)
-        $mTbl = New-Object 'object[,]' ([Math]::Max(1, $allTables.Count)), 17
+        $mTbl = New-Object 'object[,]' ([Math]::Max(1, $allTables.Count)), 29
+        $minRowNonEmpty = [long]::MaxValue
         for ($i = 0; $i -lt $allTables.Count; $i++) {
             $t = $allTables[$i]
+            if ($t.RowCount -gt 0 -and $t.MinRowBytes -lt $minRowNonEmpty) { $minRowNonEmpty = $t.MinRowBytes }
             $mTbl[$i, 0]  = $i + 1
             $mTbl[$i, 1]  = $t.TableName
             $mTbl[$i, 2]  = $t.FileName
@@ -7181,118 +8214,198 @@ function Export-AnalysisToExcelCom {
             $mTbl[$i, 5]  = [double]$t.RowCount
             $mTbl[$i, 6]  = [double]$t.RowShare
             $mTbl[$i, 7]  = [double]$t.ColumnCount
-            $mTbl[$i, 8]  = [Math]::Round($t.FileSizeBytes / 1024.0, 2)
-            $mTbl[$i, 9]  = [double]$t.SizeShare
-            $mTbl[$i, 10] = [Math]::Round($t.AvgRowBytes, 1)
-            $mTbl[$i, 11] = [double]$t.MaxRowBytes
-            $mTbl[$i, 12] = [Math]::Round($t.EstInnoDbBytes / 1024.0, 1)
-            $mTbl[$i, 13] = [double]$t.AvgNullRate
-            $mTbl[$i, 14] = if ([string]::IsNullOrEmpty($t.CandidatePks)) { '-' } else { $t.CandidatePks }
-            $mTbl[$i, 15] = if ([string]::IsNullOrEmpty($t.DateColumns)) { '-' } else { $t.DateColumns }
-            $mTbl[$i, 16] = if ([string]::IsNullOrEmpty($t.WarningSummary)) { '正常' } else { $t.WarningSummary }
+            $mTbl[$i, 8]  = if ([string]::IsNullOrEmpty($t.ColumnTypeBreakdown)) { '-' } else { $t.ColumnTypeBreakdown }
+            $mTbl[$i, 9]  = [Math]::Round($t.FileSizeBytes / 1024.0, 2)
+            $mTbl[$i, 10] = [double]$t.SizeShare
+            $mTbl[$i, 11] = [double]$t.MinRowBytes
+            $mTbl[$i, 12] = [Math]::Round($t.AvgRowBytes, 1)
+            $mTbl[$i, 13] = [double]$t.MaxRowBytes
+            $mTbl[$i, 14] = [Math]::Round($t.EstInnoDbBytes / 1024.0, 1)
+            $mTbl[$i, 15] = [double]$t.EstInnoDbPages
+            $mTbl[$i, 16] = [Math]::Round($t.RowsPerInnoDbPage, 1)
+            $mTbl[$i, 17] = [double]$t.AvgNullRate
+            $mTbl[$i, 18] = [double]$t.AvgCardinalityRate
+            $mTbl[$i, 19] = if ([string]::IsNullOrEmpty($t.QualityRiskBreakdown)) { '問題なし' } else { $t.QualityRiskBreakdown }
+            $mTbl[$i, 20] = [double]$t.RaggedRowCount
+            $mTbl[$i, 21] = if ([string]::IsNullOrEmpty($t.CandidatePks)) { '-' } else { $t.CandidatePks }
+            $mTbl[$i, 22] = if ([string]::IsNullOrEmpty($t.CategoricalColumns)) { '-' } else { $t.CategoricalColumns }
+            $mTbl[$i, 23] = if ([string]::IsNullOrEmpty($t.DateColumns)) { '-' } else { $t.DateColumns }
+            $mTbl[$i, 24] = if ([string]::IsNullOrEmpty($t.PrimaryDateRange)) { '-' } else { $t.PrimaryDateRange }
+            $mTbl[$i, 25] = if ([string]::IsNullOrEmpty($t.RelationSummary)) { '-' } else { $t.RelationSummary }
+            $mTbl[$i, 26] = if ([string]::IsNullOrEmpty($t.JMeterReadiness)) { '対象外' } else { $t.JMeterReadiness }
+            $mTbl[$i, 27] = [double]$t.WarningCount
+            $mTbl[$i, 28] = if ([string]::IsNullOrEmpty($t.WarningSummary)) { '正常' } else { $t.WarningSummary }
         }
+        $tblHeaders = @('No', 'テーブル名', $srcColHeader, '文字コード', '推定役割', 'レコード数', '件数構成比', '列数', 'データ型構成', $sizeColHeader, '容量構成比', '最小行長(B)', '平均行長(B)', '最大行長(B)', '推定InnoDB(KB)', '推定InnoDBページ数', '推定行/ページ', '平均NULL率', '平均ユニーク率', '品質リスク列内訳', '列数不一致行', 'PK/UK候補', 'カテゴリ区分カラム', '日時カラム', '日時データ期間', 'リレーション概要', 'JMeter並列適性', '警告数', '警告・注意点')
         $tblEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsTables -StartRow 4 -StartCol 1 `
-            -Headers @('No', 'テーブル名', $srcColHeader, '文字コード', '推定役割', 'レコード数', '件数構成比', '列数', $sizeColHeader, '容量構成比', '平均行長(B)', '最大行長(B)', '推定InnoDB(KB)', '平均NULL率', 'PK/UK候補', '日時カラム', '警告・注意点') `
-            -DataMatrix $mTbl -RowCount $allTables.Count `
-            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 6 = '#,##0'; 7 = '0.0%'; 8 = '#,##0'; 9 = '#,##0.00'; 10 = '0.0%'; 11 = '#,##0.0'; 12 = '#,##0'; 13 = '#,##0.0'; 14 = '0.0%'; 15 = '@'; 16 = '@'; 17 = '@' } `
-            -CenterCols @(1, 4, 5, 8) -RightCols @(6, 7, 9, 10, 11, 12, 13, 14) -WrapCols @(15, 16, 17) -WarnCheckCols @(17)
+            -Headers $tblHeaders -DataMatrix $mTbl -RowCount $allTables.Count `
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 6 = '#,##0'; 7 = '0.0%'; 8 = '#,##0'; 9 = '@'; 10 = '#,##0.00'; 11 = '0.0%'; 12 = '#,##0'; 13 = '#,##0.0'; 14 = '#,##0'; 15 = '#,##0.0'; 16 = '#,##0'; 17 = '#,##0.0'; 18 = '0.0%'; 19 = '0.0%'; 20 = '@'; 21 = '#,##0'; 22 = '@'; 23 = '@'; 24 = '@'; 25 = '@'; 26 = '@'; 27 = '@'; 28 = '#,##0'; 29 = '@' } `
+            -CenterCols @(1, 4, 5, 8, 25, 27) -RightCols @(6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 28) -WrapCols @(9, 20, 22, 23, 24, 26, 29) -WarnCheckCols @(20, 27, 29)
 
-        Format-ExcelSheetCommon -Sheet $wsTables -FreezeRow 4 -AutoFilterRange "A4:Q$tblEnd" -Landscape $true
-
-        # ======================================================================
-        #  SHEET 3: 03_カラム分析 (All Columns Full Profile + Skew/Null Charts)
-        # ======================================================================
-        Write-XlsLog "シート作成中: 03_カラム分析..." 73
-        Set-ColumnWidths -Sheet $wsCols -Widths @(26, 20, 16, 10, 10, 9, 11, 10, 16, 10, 10, 10, 22, 11, 11, 9, 20, 30)
-        Set-SheetTitleBanner -Sheet $wsCols -Title '全カラム詳細プロファイル (選択性・NULL率・偏り・バイト長分析)' -Subtitle $subInfo -EndCol 18
-
-        $allCols = New-Object System.Collections.Generic.List[object]
-        foreach ($t in $Analysis.Tables) {
-            foreach ($c in $t.Columns) { $allCols.Add($c) }
+        for ($i = 0; $i -lt $allTables.Count; $i++) {
+            $rIdx = 5 + $i
+            if ($allTables[$i].RaggedRowCount -gt 0) {
+                $rc = $wsTables.Cells.Item($rIdx, 21); $rc.Font.Color = $warnOle; $rc.Font.Bold = $true; $rc.Interior.Color = $warnBgOle
+            }
+            if ($allTables[$i].WarningCount -gt 0) {
+                $wc = $wsTables.Cells.Item($rIdx, 28); $wc.Font.Color = $warnOle; $wc.Font.Bold = $true; $wc.Interior.Color = $warnBgOle
+            }
+            if ($allTables[$i].JMeterReadiness -like '最適*') {
+                $jc = $wsTables.Cells.Item($rIdx, 27); $jc.Font.Color = $navyOle; $jc.Font.Bold = $true
+            }
         }
 
-        $mCol = New-Object 'object[,]' ([Math]::Max(1, $allCols.Count)), 18
+        # Overall summary row separated by 1 blank row (keeps AutoFilter & ParseTablesSheet cleanly bounded)
+        $totMinRowB = if ($minRowNonEmpty -eq [long]::MaxValue) { 0L } else { $minRowNonEmpty }
+        $totRowsPerPg = if ($Analysis.TotalEstInnoDbPages -gt 0) { [Math]::Round($Analysis.TotalRows / [double]$Analysis.TotalEstInnoDbPages, 1) } else { 0.0 }
+        $avgTblCard = if ($allTables.Count -gt 0) { ($allTables | Measure-Object -Property AvgCardinalityRate -Average).Average } else { 0.0 }
+        $tblSumRow = $tblEnd + 2
+        Write-AnalysisTotalRow -Sheet $wsTables -Row $tblSumRow -StartCol 1 `
+            -Values @('合計', "全 $($Analysis.TableCount) テーブル集計", '-', '-', "空 $($Analysis.EmptyTableCount) 表", [double]$Analysis.TotalRows, 1.0, [double]$Analysis.TotalColumns, "PK候補 $($Analysis.CandidatePkColumnCount) 列", [Math]::Round($Analysis.TotalFileBytes / 1024.0, 2), 1.0, [double]$totMinRowB, [Math]::Round($Analysis.OverallAvgRowBytes, 1), [double]$Analysis.OverallMaxRowBytes, [Math]::Round($Analysis.TotalEstInnoDbBytes / 1024.0, 1), [double]$Analysis.TotalEstInnoDbPages, $totRowsPerPg, [double]$Analysis.OverallAvgNullRate, [double]$avgTblCard, "全NULL:$($Analysis.AllNullColumnCount) / 偏り:$($Analysis.HighSkewColumnCount) / 大容量:$($Analysis.LargeColumnCount)", [double]$Analysis.RaggedRowTotal, '-', '-', '-', '-', "関連 $($Analysis.Relationships.Count) 件 / 孤立 $($Analysis.TotalOrphanRows)", "候補 $($Analysis.JMeterCandidates.Count) 列", [double]$Analysis.TotalWarningCount, "高 $($Analysis.HighWarningCount) / 中 $($Analysis.MediumWarningCount) / 低 $($Analysis.LowWarningCount)") `
+            -Formats @{ 6 = '#,##0'; 7 = '0.0%'; 8 = '#,##0'; 10 = '#,##0.00'; 11 = '0.0%'; 12 = '#,##0'; 13 = '#,##0.0'; 14 = '#,##0'; 15 = '#,##0.0'; 16 = '#,##0'; 17 = '#,##0.0'; 18 = '0.0%'; 19 = '0.0%'; 21 = '#,##0'; 28 = '#,##0' } `
+            -CenterCols @(1, 4, 5, 8, 25, 27) -RightCols @(6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 28) -WarnPositiveCols @(21, 28)
+
+        $tblLastColL = ConvertTo-ExcelColLetter $tblWidths.Count
+        Format-ExcelSheetCommon -Sheet $wsTables -FreezeRow 4 -AutoFilterRange "A4:${tblLastColL}$tblEnd" -Landscape $true
+
+        # ======================================================================
+        #  SHEET 3: 03_カラム分析 (All Columns Full Detailed Profile - 31 cols + 3 Charts)
+        # ======================================================================
+        $pctCol = if ($DetailedAnalysis) { 73 } else { 88 }
+        Write-XlsLog "シート作成中: 03_カラム分析..." $pctCol
+        $colWidths = @(22, 20, 6, 16, 14, 10, 10, 10, 9, 11, 10, 16, 9, 10, 10, 10, 17, 22, 10, 11, 11, 11, 9, 11, 20, 20, 20, 36, 44, 30, 30)
+        Set-ColumnWidths -Sheet $wsCols -Widths $colWidths
+        Set-SheetTitleBanner -Sheet $wsCols -Title '全カラム詳細プロファイル (選択性・NULL率・偏り・バイト長・型別統計・上位値分布・関連)' -Subtitle $subInfo -EndCol $colWidths.Count
+
+        $mCol = New-Object 'object[,]' ([Math]::Max(1, $allCols.Count)), 31
         for ($i = 0; $i -lt $allCols.Count; $i++) {
             $c = $allCols[$i]
+            $charLenTxt = if ($c.NonNullCount -gt 0) { "{0} / {1:0.0} / {2}" -f $c.MinCharLen, $c.AvgCharLen, $c.MaxCharLen } else { '-' }
             $mCol[$i, 0]  = $c.TableName
             $mCol[$i, 1]  = $c.ColumnName
-            $mCol[$i, 2]  = $c.InferredType
-            $mCol[$i, 3]  = [double]$c.TotalRows
-            $mCol[$i, 4]  = [double]$c.NullCount
-            $mCol[$i, 5]  = [double]$c.NullRate
-            $mCol[$i, 6]  = [double]$c.DistinctCount
-            $mCol[$i, 7]  = [double]$c.CardinalityRate
-            $mCol[$i, 8]  = $c.SelectivityRating
-            $mCol[$i, 9]  = [Math]::Round($c.AvgByteLen, 1)
-            $mCol[$i, 10] = [double]$c.P95ByteLen
-            $mCol[$i, 11] = [double]$c.MaxByteLen
-            $mCol[$i, 12] = if ($c.Top1Value.Length -gt 35) { $c.Top1Value.Substring(0, 32) + '...' } else { $c.Top1Value }
-            $mCol[$i, 13] = [double]$c.Top1Share
-            $mCol[$i, 14] = [double]$c.Top3Share
-            $mCol[$i, 15] = [Math]::Round($c.GiniCoefficient, 3)
-            $mCol[$i, 16] = $c.SkewRisk
-            $mCol[$i, 17] = if ([string]::IsNullOrEmpty($c.AlertNote)) { '正常' } else { $c.AlertNote }
+            $mCol[$i, 2]  = [double]($c.ColumnIndex + 1)
+            $mCol[$i, 3]  = $c.InferredType
+            $mCol[$i, 4]  = if ([string]::IsNullOrEmpty($c.KeyRole)) { '一般' } else { $c.KeyRole }
+            $mCol[$i, 5]  = [double]$c.TotalRows
+            $mCol[$i, 6]  = [double]$c.NonNullCount
+            $mCol[$i, 7]  = [double]$c.NullCount
+            $mCol[$i, 8]  = [double]$c.NullRate
+            $mCol[$i, 9]  = [double]$c.DistinctCount
+            $mCol[$i, 10] = [double]$c.CardinalityRate
+            $mCol[$i, 11] = $c.SelectivityRating
+            $mCol[$i, 12] = [double]$c.MinByteLen
+            $mCol[$i, 13] = [Math]::Round($c.AvgByteLen, 1)
+            $mCol[$i, 14] = [double]$c.P95ByteLen
+            $mCol[$i, 15] = [double]$c.MaxByteLen
+            $mCol[$i, 16] = $charLenTxt
+            $mCol[$i, 17] = if ($c.Top1Value.Length -gt 35) { $c.Top1Value.Substring(0, 32) + '...' } else { $c.Top1Value }
+            $mCol[$i, 18] = [double]$c.Top1Count
+            $mCol[$i, 19] = [double]$c.Top1Share
+            $mCol[$i, 20] = [double]$c.Top3Share
+            $mCol[$i, 21] = [double]$c.Top5Share
+            $mCol[$i, 22] = [Math]::Round($c.GiniCoefficient, 3)
+            $mCol[$i, 23] = [Math]::Round($c.NormalizedEntropy, 3)
+            $mCol[$i, 24] = $c.SkewRisk
+            $mCol[$i, 25] = if ([string]::IsNullOrEmpty($c.MinValueText)) { '-' } else { $c.MinValueText }
+            $mCol[$i, 26] = if ([string]::IsNullOrEmpty($c.MaxValueText)) { '-' } else { $c.MaxValueText }
+            $mCol[$i, 27] = if ([string]::IsNullOrEmpty($c.TopValuesSummary)) { '-' } else { $c.TopValuesSummary }
+            $mCol[$i, 28] = if ([string]::IsNullOrEmpty($c.DetailStatsSummary)) { '-' } else { $c.DetailStatsSummary }
+            $mCol[$i, 29] = if ([string]::IsNullOrEmpty($c.RelationSummary)) { '-' } else { $c.RelationSummary }
+            $mCol[$i, 30] = if ([string]::IsNullOrEmpty($c.AlertNote)) { '正常' } else { $c.AlertNote }
         }
+        $colHeaders = @('テーブル名', 'カラム名', '列順', '推定データ型', 'キー・役割', '総行数', '有効件数', 'NULL件数', 'NULL率', 'ユニーク数', 'ユニーク率', 'INDEX選択性評価', '最小長(B)', '平均長(B)', 'P95長(B)', '最大長(B)', '文字長(最小/平均/最大)', '最頻値(Top1)', 'Top1件数', 'Top1占有率', 'Top3占有率', 'Top5占有率', 'ジニ係数', '正規化エントロピー', '偏りリスク', '最小値 / 最古日時', '最大値 / 最新日時', '上位値分布 (Top5)', '型別詳細統計 (数値・日時・文字特性)', 'リレーション推定', '警告・注意点')
         $colEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsCols -StartRow 4 -StartCol 1 `
-            -Headers @('テーブル名', 'カラム名', '推定データ型', '総行数', 'NULL件数', 'NULL率', 'ユニーク数', 'ユニーク率', 'INDEX選択性評価', '平均長(B)', 'P95長(B)', '最大長(B)', '最頻値(Top1)', 'Top1占有率', 'Top3占有率', 'ジニ係数', '偏りリスク', '警告・注意点') `
-            -DataMatrix $mCol -RowCount $allCols.Count `
-            -ColumnFormats @{ 1 = '@'; 2 = '@'; 4 = '#,##0'; 5 = '#,##0'; 6 = '0.0%'; 7 = '#,##0'; 8 = '0.0%'; 10 = '#,##0.0'; 11 = '#,##0'; 12 = '#,##0'; 13 = '@'; 14 = '0.0%'; 15 = '0.0%'; 16 = '0.000'; 18 = '@' } `
-            -CenterCols @(3, 9, 17) -RightCols @(4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16) -WrapCols @(18) -WarnCheckCols @(17, 18)
+            -Headers $colHeaders -DataMatrix $mCol -RowCount $allCols.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '#,##0'; 4 = '@'; 5 = '@'; 6 = '#,##0'; 7 = '#,##0'; 8 = '#,##0'; 9 = '0.0%'; 10 = '#,##0'; 11 = '0.0%'; 12 = '@'; 13 = '#,##0'; 14 = '#,##0.0'; 15 = '#,##0'; 16 = '#,##0'; 17 = '@'; 18 = '@'; 19 = '#,##0'; 20 = '0.0%'; 21 = '0.0%'; 22 = '0.0%'; 23 = '0.000'; 24 = '0.000'; 25 = '@'; 26 = '@'; 27 = '@'; 28 = '@'; 29 = '@'; 30 = '@'; 31 = '@' } `
+            -CenterCols @(3, 4, 5, 12, 17, 25, 26, 27) -RightCols @(6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24) -WrapCols @(28, 29, 30, 31) -WarnCheckCols @(25, 31)
 
-        # Mini summary data for Null Rate Worst & Skew Worst charts below table
+        # Mini summary tables & charts for Null Rate Worst, Skew Worst & Largest Payload columns
         $worstNull = @($allCols | Where-Object { $_.TotalRows -gt 0 -and $_.NullRate -gt 0 } | Sort-Object NullRate -Descending | Select-Object -First 12)
         $worstSkew = @($allCols | Where-Object { $_.NonNullCount -ge 10 -and $_.DistinctCount -ge 2 -and -not $_.IsCandidatePk } | Sort-Object GiniCoefficient, Top1Share -Descending | Select-Object -First 12)
+        $worstSize = @($allCols | Where-Object { $_.NonNullCount -gt 0 -and $_.MaxByteLen -gt 0 } | Sort-Object MaxByteLen, P95ByteLen -Descending | Select-Object -First 12)
 
         $auxStart = $colEnd + 3
-        if ($worstNull.Count -gt 0 -or $worstSkew.Count -gt 0) {
-            Set-SectionHeader -Sheet $wsCols -Row ($auxStart - 1) -StartCol 1 -EndCol 18 -Text 'NULL率・データ偏り (ホットキー) ワーストランキング'
+        if ($worstNull.Count -gt 0 -or $worstSkew.Count -gt 0 -or $worstSize.Count -gt 0) {
+            Set-SectionHeader -Sheet $wsCols -Row ($auxStart - 1) -StartCol 1 -EndCol $colWidths.Count -Text 'NULL率・データ偏り (ホットキー)・最大バイト長 ワーストランキング'
         }
         $nextAuxRow = $auxStart
         if ($worstNull.Count -gt 0) {
-            $mWn = New-Object 'object[,]' $worstNull.Count, 2
+            $mWn = New-Object 'object[,]' $worstNull.Count, 5
             for ($i = 0; $i -lt $worstNull.Count; $i++) {
                 $mWn[$i, 0] = $worstNull[$i].TableName + '.' + $worstNull[$i].ColumnName
-                $mWn[$i, 1] = [double]$worstNull[$i].NullRate
+                $mWn[$i, 1] = $worstNull[$i].InferredType
+                $mWn[$i, 2] = [double]$worstNull[$i].NullCount
+                $mWn[$i, 3] = [double]$worstNull[$i].TotalRows
+                $mWn[$i, 4] = [double]$worstNull[$i].NullRate
             }
             $wnEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsCols -StartRow $auxStart -StartCol 1 `
-                -Headers @('対象カラム (NULL率ワースト)', 'NULL率') -DataMatrix $mWn -RowCount $worstNull.Count `
-                -ColumnFormats @{ 1 = '@'; 2 = '0.0%' } -RightCols @(2)
+                -Headers @('対象カラム (NULL率ワースト)', '推定データ型', 'NULL件数', '総行数', 'NULL率') -DataMatrix $mWn -RowCount $worstNull.Count `
+                -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '#,##0'; 4 = '#,##0'; 5 = '0.0%' } -CenterCols @(2) -RightCols @(3, 4, 5)
 
             $wnChartTop = $wsCols.Rows.Item($auxStart).Top
-            $wnChartLeft = $wsCols.Columns.Item(5).Left
+            $wnChartLeft = $wsCols.Columns.Item(7).Left
             $wnDataStart = $auxStart + 1
-            [void](Add-StyledExcelChart -Sheet $wsCols -Left $wnChartLeft -Top $wnChartTop -Width 440 -Height 230 `
+            [void](Add-StyledExcelChart -Sheet $wsCols -Left $wnChartLeft -Top $wnChartTop -Width 460 -Height 235 `
                 -ChartType 57 -Title 'NULL率ワースト TOP12 カラム' `
                 -CategoryAddress "A${wnDataStart}:A${wnEnd}" `
-                -ValueAddresses @("B${wnDataStart}:B${wnEnd}") `
+                -ValueAddresses @("E${wnDataStart}:E${wnEnd}") `
                 -SeriesNames @('NULL率') -SeriesColors @($script:THEME.WarnHex) -ReverseCategories $true -ShowDataLabels $true)
-            $nextAuxRow = [Math]::Max(($wnEnd + 3), (Get-RowBelowPoints -Sheet $wsCols -StartRow ($auxStart + 1) -TargetTopPt ($wnChartTop + 245)))
+            $nextAuxRow = [Math]::Max(($wnEnd + 3), (Get-RowBelowPoints -Sheet $wsCols -StartRow ($auxStart + 1) -TargetTopPt ($wnChartTop + 250)))
         }
         if ($worstSkew.Count -gt 0) {
             $skStart = $nextAuxRow
-            $mWs = New-Object 'object[,]' $worstSkew.Count, 3
+            $mWs = New-Object 'object[,]' $worstSkew.Count, 5
             for ($i = 0; $i -lt $worstSkew.Count; $i++) {
                 $mWs[$i, 0] = $worstSkew[$i].TableName + '.' + $worstSkew[$i].ColumnName
-                $mWs[$i, 1] = [double]$worstSkew[$i].Top1Share
-                $mWs[$i, 2] = [double]$worstSkew[$i].GiniCoefficient
+                $mWs[$i, 1] = if ($worstSkew[$i].Top1Value.Length -gt 22) { $worstSkew[$i].Top1Value.Substring(0, 19) + '...' } else { $worstSkew[$i].Top1Value }
+                $mWs[$i, 2] = [double]$worstSkew[$i].Top1Share
+                $mWs[$i, 3] = [double]$worstSkew[$i].GiniCoefficient
+                $mWs[$i, 4] = $worstSkew[$i].SkewRisk
             }
             $wsEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsCols -StartRow $skStart -StartCol 1 `
-                -Headers @('対象カラム (データ偏り上位)', 'Top1占有率', 'ジニ係数') -DataMatrix $mWs -RowCount $worstSkew.Count `
-                -ColumnFormats @{ 1 = '@'; 2 = '0.0%'; 3 = '0.00' } -RightCols @(2, 3)
+                -Headers @('対象カラム (データ偏り上位)', '最頻値(Top1)', 'Top1占有率', 'ジニ係数', '偏りリスク') -DataMatrix $mWs -RowCount $worstSkew.Count `
+                -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '0.0%'; 4 = '0.000'; 5 = '@' } -CenterCols @(5) -RightCols @(3, 4) -WarnCheckCols @(5)
 
             $wsChartTop = $wsCols.Rows.Item($skStart).Top
-            $wsChartLeft = $wsCols.Columns.Item(5).Left
+            $wsChartLeft = $wsCols.Columns.Item(7).Left
             $wsDataStart = $skStart + 1
             [void](Add-StyledExcelChart -Sheet $wsCols -Left $wsChartLeft -Top $wsChartTop -Width 460 -Height 250 `
                 -ChartType 57 -Title 'データ偏り上位 TOP12 (Top1占有率 & ジニ係数)' `
                 -CategoryAddress "A${wsDataStart}:A${wsEnd}" `
-                -ValueAddresses @("B${wsDataStart}:B${wsEnd}", "C${wsDataStart}:C${wsEnd}") `
+                -ValueAddresses @("C${wsDataStart}:C${wsEnd}", "D${wsDataStart}:D${wsEnd}") `
                 -SeriesNames @('Top1占有率', 'ジニ係数') -SeriesColors @($script:THEME.AccentHex, $script:THEME.WarnHex) `
+                -ShowLegend $true -ReverseCategories $true)
+            $nextAuxRow = [Math]::Max(($wsEnd + 3), (Get-RowBelowPoints -Sheet $wsCols -StartRow ($skStart + 1) -TargetTopPt ($wsChartTop + 265)))
+        }
+        if ($worstSize.Count -gt 0) {
+            $szStart = $nextAuxRow
+            $mWz = New-Object 'object[,]' $worstSize.Count, 5
+            for ($i = 0; $i -lt $worstSize.Count; $i++) {
+                $mWz[$i, 0] = $worstSize[$i].TableName + '.' + $worstSize[$i].ColumnName
+                $mWz[$i, 1] = $worstSize[$i].InferredType
+                $mWz[$i, 2] = [Math]::Round($worstSize[$i].AvgByteLen, 1)
+                $mWz[$i, 3] = [double]$worstSize[$i].P95ByteLen
+                $mWz[$i, 4] = [double]$worstSize[$i].MaxByteLen
+            }
+            $wzEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsCols -StartRow $szStart -StartCol 1 `
+                -Headers @('対象カラム (最大バイト長上位)', '推定データ型', '平均長(B)', 'P95長(B)', '最大長(B)') -DataMatrix $mWz -RowCount $worstSize.Count `
+                -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '#,##0.0'; 4 = '#,##0'; 5 = '#,##0' } -CenterCols @(2) -RightCols @(3, 4, 5)
+
+            $wzChartTop = $wsCols.Rows.Item($szStart).Top
+            $wzChartLeft = $wsCols.Columns.Item(7).Left
+            $wzDataStart = $szStart + 1
+            [void](Add-StyledExcelChart -Sheet $wsCols -Left $wzChartLeft -Top $wzChartTop -Width 460 -Height 245 `
+                -ChartType 57 -Title '最大バイト長上位 TOP12 (P95長 & 最大長)' `
+                -CategoryAddress "A${wzDataStart}:A${wzEnd}" `
+                -ValueAddresses @("D${wzDataStart}:D${wzEnd}", "E${wzDataStart}:E${wzEnd}") `
+                -SeriesNames @('P95長(B)', '最大長(B)') -SeriesColors @('#737373', $script:THEME.AccentHex) `
                 -ShowLegend $true -ReverseCategories $true)
         }
 
-        Format-ExcelSheetCommon -Sheet $wsCols -FreezeRow 4 -AutoFilterRange "A4:R$colEnd" -Landscape $true
+        $colLastColL = ConvertTo-ExcelColLetter $colWidths.Count
+        Format-ExcelSheetCommon -Sheet $wsCols -FreezeRow 4 -AutoFilterRange "A4:${colLastColL}$colEnd" -Landscape $true
 
+        if ($DetailedAnalysis) {
         # ======================================================================
         #  SHEET 4: 04_分布・割合分析 (Categorical / Status / Enum Distributions)
         # ======================================================================
@@ -7690,6 +8803,7 @@ function Export-AnalysisToExcelCom {
         }
 
         Format-ExcelSheetCommon -Sheet $wsGuide -FreezeRow 5 -Landscape $true
+        } # end if ($DetailedAnalysis)
 
         # Activate Summary sheet before save
         $wsSummary.Activate()
@@ -7746,6 +8860,7 @@ function Export-AnalysisToOpenXml {
         [Parameter(Mandatory = $true)]$Analysis,
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [string]$DbLabel = '',
+        [switch]$DetailedAnalysis,
         [scriptblock]$LogCallback = $null,
         [AuroraAnalyzer.OperationCancelState]$CancelState = $null,
         [scriptblock]$PumpCallback = $null
@@ -7763,14 +8878,7 @@ function Export-AnalysisToOpenXml {
     }
 
     function ColLetter([int]$colIndex1Based) {
-        $dividend = $colIndex1Based
-        $colName = ''
-        while ($dividend -gt 0) {
-            $modulo = ($dividend - 1) % 26
-            $colName = [char](65 + $modulo) + $colName
-            $dividend = [int][Math]::Floor(($dividend - $modulo) / 26)
-        }
-        return $colName
+        return (ConvertTo-ExcelColLetter $colIndex1Based)
     }
 
     function Build-SheetXml {
@@ -7785,7 +8893,11 @@ function Export-AnalysisToOpenXml {
             [int[]]$WrapCols = @(),
             [int[]]$WarnCols = @(),
             [int[]]$WarnPositiveIntCols = @(),
+            [int[]]$NavyOptimalCols = @(),
             [bool]$HighlightCatOnWarnCol1 = $false,
+            [object[]]$SummaryFooterRow = $null,
+            [hashtable]$SummaryFooterStyles = @{},
+            [int[]]$SummaryFooterWarnCols = @(),
             [bool]$IncludeChartDrawing = $false
         )
         # Style IDs (paired odd/even for clean edge-to-edge monotone zebra striping):
@@ -7906,8 +9018,12 @@ function Export-AnalysisToOpenXml {
                         [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<c r="{0}" s="{1}"><v>{2}</v></c>', $ref, $st, $v)
                     }
                     else {
+                        $sv = [string]$v
                         if ($isWarn) {
                             $st = if ($CenterCols -contains $col1) { 21 } else { 20 }
+                        }
+                        elseif (($NavyOptimalCols -contains $col1) -and $sv -like '最適*') {
+                            $st = if ($isZebra) { 38 } else { 37 }
                         }
                         elseif ($WrapCols -contains $col1) {
                             $st = if ($isZebra) { 19 } else { 18 }
@@ -7918,7 +9034,7 @@ function Export-AnalysisToOpenXml {
                         else {
                             $st = if ($isZebra) { 5 } else { 4 }
                         }
-                        [void]$sb.AppendFormat('<c r="{0}" t="inlineStr" s="{1}"><is><t>{2}</t></is></c>', $ref, $st, (XmlEsc ([string]$v)))
+                        [void]$sb.AppendFormat('<c r="{0}" t="inlineStr" s="{1}"><is><t>{2}</t></is></c>', $ref, $st, (XmlEsc $sv))
                     }
                 }
                 [void]$sb.Append('</row>')
@@ -7926,8 +9042,30 @@ function Export-AnalysisToOpenXml {
             }
         }
 
+        $filterLast = [Math]::Max(4, $rNum - 1)
+        if ($null -ne $SummaryFooterRow -and $Rows.Count -gt 0) {
+            $rNum++
+            [void]$sb.AppendFormat('<row r="{0}" ht="25" customHeight="1">', $rNum)
+            for ($c = 0; $c -lt $Headers.Count; $c++) {
+                $ref = (ColLetter ($c + 1)) + $rNum
+                $v = $SummaryFooterRow[$c]
+                $col1 = $c + 1
+                if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) {
+                    $st = if ($SummaryFooterStyles.ContainsKey($col1)) { [int]$SummaryFooterStyles[$col1] } else { 30 }
+                    if (($SummaryFooterWarnCols -contains $col1) -and [double]$v -gt 0) { $st = 35 }
+                    [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<c r="{0}" s="{1}"><v>{2}</v></c>', $ref, $st, $v)
+                }
+                else {
+                    $st = if ($CenterCols -contains $col1) { 34 } else { 29 }
+                    [void]$sb.AppendFormat('<c r="{0}" t="inlineStr" s="{1}"><is><t>{2}</t></is></c>', $ref, $st, (XmlEsc ([string]$v)))
+                }
+            }
+            [void]$sb.Append('</row>')
+            $rNum++
+        }
+
         [void]$sb.Append('</sheetData>')
-        [void]$sb.AppendFormat('<autoFilter ref="A4:{0}{1}"/>', $endL, [Math]::Max(4, $rNum - 1))
+        [void]$sb.AppendFormat('<autoFilter ref="A4:{0}{1}"/>', $endL, $filterLast)
         [void]$sb.AppendFormat('<mergeCells count="{0}">', $merges.Count)
         foreach ($mg in $merges) { [void]$sb.AppendFormat('<mergeCell ref="{0}"/>', $mg) }
         [void]$sb.Append('</mergeCells>')
@@ -7940,90 +9078,432 @@ function Export-AnalysisToOpenXml {
         return $sb.ToString()
     }
 
+    function Build-SummarySheetXml {
+        param(
+            [string]$Title,
+            [string]$Subtitle,
+            $AnalysisObj,
+            $RoleSummaryItems,
+            $TypeSummaryItems,
+            [string]$SizeKpiLbl,
+            [string]$SizeColHdr,
+            [bool]$IsDetailed,
+            [ref]$OutTopStartRow,
+            [ref]$OutTopEndRow,
+            [ref]$OutLastRow
+        )
+
+        $colW = @(6, 24, 17, 13, 11, 8, 15, 11, 14, 11, 8, 32)
+        $endL = ColLetter 12
+        $sb = New-Object System.Text.StringBuilder 65536
+        $merges = New-Object System.Collections.Generic.List[string]
+        [void]$sb.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+        [void]$sb.Append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">')
+        [void]$sb.Append('<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>')
+        [void]$sb.Append('<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>')
+        [void]$sb.Append('<sheetFormatPr defaultRowHeight="22"/>')
+        [void]$sb.Append('<cols>')
+        for ($i = 0; $i -lt $colW.Count; $i++) {
+            [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<col min="{0}" max="{0}" width="{1}" customWidth="1"/>', ($i + 1), $colW[$i])
+        }
+        [void]$sb.Append('</cols><sheetData>')
+
+        [void]$sb.Append('<row r="1" ht="32" customHeight="1">')
+        [void]$sb.AppendFormat('<c r="A1" t="inlineStr" s="1"><is><t>{0}</t></is></c>', (XmlEsc $Title))
+        for ($c = 1; $c -lt 12; $c++) { [void]$sb.AppendFormat('<c r="{0}1" s="1"/>', (ColLetter ($c + 1))) }
+        [void]$sb.Append('</row>')
+        $merges.Add("A1:${endL}1")
+
+        [void]$sb.Append('<row r="2" ht="22" customHeight="1">')
+        [void]$sb.AppendFormat('<c r="A2" t="inlineStr" s="2"><is><t>{0}</t></is></c>', (XmlEsc $Subtitle))
+        for ($c = 1; $c -lt 12; $c++) { [void]$sb.AppendFormat('<c r="{0}2" s="2"/>', (ColLetter ($c + 1))) }
+        [void]$sb.Append('</row>')
+        $merges.Add("A2:${endL}2")
+        [void]$sb.Append('<row r="3" ht="10" customHeight="1"/>')
+
+        function Add-XmlKpiBand([int]$rLbl, [object[]]$kpis) {
+            [void]$sb.AppendFormat('<row r="{0}" ht="20" customHeight="1">', $rLbl)
+            foreach ($k in $kpis) {
+                $st = if ($k.Warn) { 27 } else { 25 }
+                $c1L = ColLetter $k.Col1; $c2L = ColLetter $k.Col2
+                [void]$sb.AppendFormat('<c r="{0}{1}" t="inlineStr" s="{2}"><is><t>{3}</t></is></c><c r="{4}{1}" s="{2}"/>', $c1L, $rLbl, $st, (XmlEsc $k.Label), $c2L)
+                $merges.Add("${c1L}${rLbl}:${c2L}${rLbl}")
+            }
+            [void]$sb.Append('</row>')
+            $rVal = $rLbl + 1
+            [void]$sb.AppendFormat('<row r="{0}" ht="30" customHeight="1">', $rVal)
+            foreach ($k in $kpis) {
+                $st = if ($k.Warn) { 28 } else { 26 }
+                $c1L = ColLetter $k.Col1; $c2L = ColLetter $k.Col2
+                [void]$sb.AppendFormat('<c r="{0}{1}" t="inlineStr" s="{2}"><is><t>{3}</t></is></c><c r="{4}{1}" s="{2}"/>', $c1L, $rVal, $st, (XmlEsc ([string]$k.Display)), $c2L)
+                $merges.Add("${c1L}${rVal}:${c2L}${rVal}")
+            }
+            [void]$sb.Append('</row>')
+        }
+
+        function Add-XmlSecHdr([int]$r, [string]$txt) {
+            [void]$sb.AppendFormat('<row r="{0}" ht="25" customHeight="1">', $r)
+            [void]$sb.AppendFormat('<c r="A{0}" t="inlineStr" s="24"><is><t>{1}</t></is></c>', $r, (XmlEsc $txt))
+            for ($c = 1; $c -lt 12; $c++) { [void]$sb.AppendFormat('<c r="{0}{1}" s="24"/>', (ColLetter ($c + 1)), $r) }
+            [void]$sb.Append('</row>')
+            $merges.Add("A${r}:${endL}${r}")
+        }
+
+        function Add-XmlTblHdr([int]$r, [string[]]$hdrs) {
+            [void]$sb.AppendFormat('<row r="{0}" ht="26" customHeight="1">', $r)
+            for ($c = 0; $c -lt $hdrs.Count; $c++) {
+                [void]$sb.AppendFormat('<c r="{0}{1}" t="inlineStr" s="3"><is><t>{2}</t></is></c>', (ColLetter ($c + 1)), $r, (XmlEsc $hdrs[$c]))
+            }
+            [void]$sb.Append('</row>')
+        }
+
+        function Add-XmlDataRow([int]$r, [object[]]$vals, [bool]$isZebra, [hashtable]$numSt, [int[]]$cCols, [int[]]$wCols, [int[]]$warnCols, [int[]]$warnPosCols) {
+            $ht = 22.0
+            if ($wCols.Count -gt 0) {
+                $wt = @(); $ww = @()
+                foreach ($wc in $wCols) { $wt += [string]$vals[$wc - 1]; $ww += [double]$colW[$wc - 1] }
+                $ht = Get-EstimatedRowHeight -Texts $wt -ColWidths $ww -MinHeight 22.0 -MaxHeight 90.0
+            }
+            [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<row r="{0}" ht="{1:0.#}" customHeight="1">', $r, $ht)
+            for ($c = 0; $c -lt $vals.Count; $c++) {
+                $col1 = $c + 1; $ref = (ColLetter $col1) + $r; $v = $vals[$c]
+                $isW = (($warnCols -contains $col1) -and (Test-WarningCellText -Text ([string]$v))) -or
+                       (($warnPosCols -contains $col1) -and ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and [double]$v -gt 0)
+                if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) {
+                    $st = if ($isW) { 22 } elseif ($numSt.ContainsKey($col1)) { $b = [int]$numSt[$col1]; if ($isZebra) { $b + 1 } else { $b } } else { if ($isZebra) { 5 } else { 4 } }
+                    [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<c r="{0}" s="{1}"><v>{2}</v></c>', $ref, $st, $v)
+                }
+                else {
+                    $st = if ($isW) { if ($cCols -contains $col1) { 21 } else { 20 } } elseif ($wCols -contains $col1) { if ($isZebra) { 19 } else { 18 } } elseif ($cCols -contains $col1) { if ($isZebra) { 17 } else { 16 } } else { if ($isZebra) { 5 } else { 4 } }
+                    [void]$sb.AppendFormat('<c r="{0}" t="inlineStr" s="{1}"><is><t>{2}</t></is></c>', $ref, $st, (XmlEsc ([string]$v)))
+                }
+            }
+            [void]$sb.Append('</row>')
+        }
+
+        function Add-XmlTotalRow([int]$r, [object[]]$vals, [hashtable]$totSt, [int[]]$cCols, [int[]]$warnPosCols) {
+            [void]$sb.AppendFormat('<row r="{0}" ht="25" customHeight="1">', $r)
+            for ($c = 0; $c -lt $vals.Count; $c++) {
+                $col1 = $c + 1; $ref = (ColLetter $col1) + $r; $v = $vals[$c]
+                if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) {
+                    $st = if (($warnPosCols -contains $col1) -and [double]$v -gt 0) { 35 } elseif ($totSt.ContainsKey($col1)) { [int]$totSt[$col1] } else { 30 }
+                    [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<c r="{0}" s="{1}"><v>{2}</v></c>', $ref, $st, $v)
+                }
+                else {
+                    $st = if ($cCols -contains $col1) { 34 } else { 29 }
+                    [void]$sb.AppendFormat('<c r="{0}" t="inlineStr" s="{1}"><is><t>{2}</t></is></c>', $ref, $st, (XmlEsc ([string]$v)))
+                }
+            }
+            [void]$sb.Append('</row>')
+        }
+
+        function Add-XmlMergedRow([int]$r, [object[]]$spans, [object[]]$vals, [int[]]$styles, [double]$ht) {
+            [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<row r="{0}" ht="{1:0.#}" customHeight="1">', $r, $ht)
+            for ($k = 0; $k -lt $spans.Count; $k++) {
+                $sp = $spans[$k]; $v = $vals[$k]; $st = $styles[$k]
+                $c1L = ColLetter $sp.C1; $c2L = ColLetter $sp.C2
+                if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) {
+                    [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<c r="{0}{1}" s="{2}"><v>{3}</v></c>', $c1L, $r, $st, $v)
+                }
+                else {
+                    [void]$sb.AppendFormat('<c r="{0}{1}" t="inlineStr" s="{2}"><is><t>{3}</t></is></c>', $c1L, $r, $st, (XmlEsc ([string]$v)))
+                }
+                for ($cc = $sp.C1 + 1; $cc -le $sp.C2; $cc++) {
+                    [void]$sb.AppendFormat('<c r="{0}{1}" s="{2}"/>', (ColLetter $cc), $r, $st)
+                }
+                if ($sp.C2 -gt $sp.C1) { $merges.Add("${c1L}${r}:${c2L}${r}") }
+            }
+            [void]$sb.Append('</row>')
+        }
+
+        Add-XmlKpiBand 4 @(
+            @{ Col1 = 1;  Col2 = 2;  Label = '総テーブル数';           Display = ("{0:#,##0} テーブル" -f $AnalysisObj.TableCount); Warn = $false },
+            @{ Col1 = 3;  Col2 = 4;  Label = '総レコード数';           Display = ("{0:#,##0} 件" -f $AnalysisObj.TotalRows); Warn = ($AnalysisObj.TotalRows -eq 0) },
+            @{ Col1 = 5;  Col2 = 6;  Label = $SizeKpiLbl;              Display = ("{0:#,##0.00} MB" -f ($AnalysisObj.TotalFileBytes / 1MB)); Warn = $false },
+            @{ Col1 = 7;  Col2 = 8;  Label = '推定InnoDB容量 (MB)';    Display = ("{0:#,##0.00} MB" -f ($AnalysisObj.TotalEstInnoDbBytes / 1MB)); Warn = $false },
+            @{ Col1 = 9;  Col2 = 10; Label = '総カラム数 / PK候補';    Display = ("{0} 列 / PK {1} 列" -f $AnalysisObj.TotalColumns, $AnalysisObj.CandidatePkColumnCount); Warn = $false },
+            @{ Col1 = 11; Col2 = 12; Label = '検出警告 (高/中/低)';    Display = ("高 {0} / 中 {1} / 低 {2} (計 {3})" -f $AnalysisObj.HighWarningCount, $AnalysisObj.MediumWarningCount, $AnalysisObj.LowWarningCount, $AnalysisObj.TotalWarningCount); Warn = ($AnalysisObj.TotalWarningCount -gt 0) }
+        )
+        [void]$sb.Append('<row r="6" ht="8" customHeight="1"/>')
+        Add-XmlKpiBand 7 @(
+            @{ Col1 = 1;  Col2 = 2;  Label = '全体セルNULL率';            Display = ("{0:0.0%}" -f $AnalysisObj.OverallAvgNullRate); Warn = ($AnalysisObj.OverallAvgNullRate -ge 0.30) },
+            @{ Col1 = 3;  Col2 = 4;  Label = '平均行長 / 最大行長';       Display = ("{0:#,##0.0} B / {1:#,##0} B" -f $AnalysisObj.OverallAvgRowBytes, $AnalysisObj.OverallMaxRowBytes); Warn = $false },
+            @{ Col1 = 5;  Col2 = 6;  Label = '偏り高リスク / 大容量列';   Display = ("偏り {0} 列 / 大容量 {1} 列" -f $AnalysisObj.HighSkewColumnCount, $AnalysisObj.LargeColumnCount); Warn = ($AnalysisObj.HighSkewColumnCount -gt 0 -or $AnalysisObj.LargeColumnCount -gt 0) },
+            @{ Col1 = 7;  Col2 = 8;  Label = '検出リレーション / 孤立行'; Display = ("{0} 件 / 孤立 {1:#,##0} 行" -f $AnalysisObj.Relationships.Count, $AnalysisObj.TotalOrphanRows); Warn = ($AnalysisObj.TotalOrphanRows -gt 0) },
+            @{ Col1 = 9;  Col2 = 10; Label = '空テーブル / 書式異常行';   Display = ("空 {0} 表 / 異常 {1:#,##0} 行" -f $AnalysisObj.EmptyTableCount, $AnalysisObj.RaggedRowTotal); Warn = ($AnalysisObj.EmptyTableCount -gt 0 -or $AnalysisObj.RaggedRowTotal -gt 0) },
+            @{ Col1 = 11; Col2 = 12; Label = '推定ACU目安 (現状 / 10倍)'; Display = ("{0:0.0} ACU / {1:0.0} ACU" -f $AnalysisObj.EstMinAcuCurrent, $AnalysisObj.EstMinAcu10x); Warn = $false }
+        )
+        [void]$sb.Append('<row r="9" ht="10" customHeight="1"/>')
+
+        $r = 10
+        Add-XmlSecHdr $r '1. テーブル別レコード数・容量構成比 TOP15 (性能試験データ規模)'; $r++
+        Add-XmlTblHdr $r @('順位','テーブル名','推定役割','レコード数','件数構成比','列数',$SizeColHdr,'容量構成比','推定InnoDB(KB)','平均NULL率','警告数','健全性・注意点'); $r++
+        $topList = @($AnalysisObj.Tables | Select-Object -First 15)
+        $OutTopStartRow.Value = $r
+        for ($i = 0; $i -lt $topList.Count; $i++) {
+            $t = $topList[$i]
+            Add-XmlDataRow $r @(($i + 1), $t.TableName, $t.InferredRole, [double]$t.RowCount, [double]$t.RowShare, [double]$t.ColumnCount, [Math]::Round($t.FileSizeBytes / 1024.0, 2), [double]$t.SizeShare, [Math]::Round($t.EstInnoDbBytes / 1024.0, 1), [double]$t.AvgNullRate, [double]$t.WarningCount, $(if ($t.WarningSummary) { $t.WarningSummary } else { '正常' })) (($i % 2) -eq 1) @{1=6;4=6;5=10;6=6;7=8;8=10;9=12;10=10;11=6} @(1,3,6,11) @(12) @(12) @(11)
+            $r++
+        }
+        $OutTopEndRow.Value = $r - 1
+        $totRowLabel = if ($AnalysisObj.TableCount -gt 15) { "全$($AnalysisObj.TableCount)テーブル合計" } else { "全体合計 ($($AnalysisObj.TableCount)テーブル)" }
+        Add-XmlTotalRow $r @('計', $totRowLabel, '-', [double]$AnalysisObj.TotalRows, 1.0, [double]$AnalysisObj.TotalColumns, [Math]::Round($AnalysisObj.TotalFileBytes / 1024.0, 2), 1.0, [Math]::Round($AnalysisObj.TotalEstInnoDbBytes / 1024.0, 1), [double]$AnalysisObj.OverallAvgNullRate, [double]$AnalysisObj.TotalWarningCount, ("高 {0} / 中 {1} / 低 {2}" -f $AnalysisObj.HighWarningCount, $AnalysisObj.MediumWarningCount, $AnalysisObj.LowWarningCount)) @{4=30;5=32;6=30;7=31;8=32;9=33;10=32;11=30} @(1,3,6,11) @(11)
+        $r += 2
+
+        Add-XmlSecHdr $r '2. 推定役割別テーブル構成サマリー (データ分類・規模内訳)'; $r++
+        Add-XmlTblHdr $r @('No','推定役割','テーブル数','テーブル比','合計レコード数','件数構成比','合計列数',$SizeColHdr,'容量構成比','推定InnoDB(KB)','警告数','該当テーブル例 (上位)'); $r++
+        for ($i = 0; $i -lt $RoleSummaryItems.Count; $i++) {
+            $rg = $RoleSummaryItems[$i]
+            $tblSh = if ($AnalysisObj.TableCount -gt 0) { [double]$rg.TableCount / $AnalysisObj.TableCount } else { 0.0 }
+            $rowSh = if ($AnalysisObj.TotalRows -gt 0) { [double]$rg.TotalRows / $AnalysisObj.TotalRows } else { 0.0 }
+            $szSh  = if ($AnalysisObj.TotalFileBytes -gt 0) { [double]$rg.TotalFileBytes / $AnalysisObj.TotalFileBytes } else { 0.0 }
+            $exTxt = ($rg.Examples -join ', ') + $(if ($rg.TableCount -gt $rg.Examples.Count) { " 他$($rg.TableCount - $rg.Examples.Count)" } else { '' })
+            Add-XmlDataRow $r @(($i + 1), $rg.Role, [double]$rg.TableCount, $tblSh, [double]$rg.TotalRows, $rowSh, [double]$rg.TotalCols, [Math]::Round($rg.TotalFileBytes / 1024.0, 2), $szSh, [Math]::Round($rg.TotalInnoBytes / 1024.0, 1), [double]$rg.WarningCount, $exTxt) (($i % 2) -eq 1) @{1=6;3=6;4=10;5=6;6=10;7=6;8=8;9=10;10=12;11=6} @(1,3,7,11) @(12) @(2) @(11)
+            $r++
+        }
+        Add-XmlTotalRow $r @('計', '全役割合計', [double]$AnalysisObj.TableCount, 1.0, [double]$AnalysisObj.TotalRows, 1.0, [double]$AnalysisObj.TotalColumns, [Math]::Round($AnalysisObj.TotalFileBytes / 1024.0, 2), 1.0, [Math]::Round($AnalysisObj.TotalEstInnoDbBytes / 1024.0, 1), [double]$AnalysisObj.TotalWarningCount, "空テーブル $($AnalysisObj.EmptyTableCount) 件") @{3=30;4=32;5=30;6=32;7=30;8=31;9=32;10=33;11=30} @(1,3,7,11) @(11)
+        $r += 2
+
+        Add-XmlSecHdr $r '3. データ型別カラム構成 ＆ 品質サマリー (全カラム内訳)'; $r++
+        Add-XmlTblHdr $r @('No','推定データ型','カラム数','構成比','PK候補','区分列','平均NULL率','平均ユニーク率','平均長(B)','最大長(B)','偏り/全NULL','代表カラム例'); $r++
+        $totCD = [Math]::Max(1, $AnalysisObj.TotalColumns)
+        for ($i = 0; $i -lt $TypeSummaryItems.Count; $i++) {
+            $tg = $TypeSummaryItems[$i]
+            $avgN = if ($tg.ColCount -gt 0) { $tg.NullRateSum / $tg.ColCount } else { 0.0 }
+            $avgC = if ($tg.ColCount -gt 0) { $tg.CardRateSum / $tg.ColCount } else { 0.0 }
+            $avgB = if ($tg.NonEmptyCols -gt 0) { [Math]::Round($tg.AvgByteSum / $tg.NonEmptyCols, 1) } else { 0.0 }
+            $rTxt = if ($tg.HighSkewCnt -gt 0 -or $tg.AllNullCnt -gt 0) { "偏り:$($tg.HighSkewCnt) / 全NULL:$($tg.AllNullCnt)" } else { '正常' }
+            $exTxt = ($tg.Examples -join ', ') + $(if ($tg.ColCount -gt $tg.Examples.Count) { " 他$($tg.ColCount - $tg.Examples.Count)" } else { '' })
+            Add-XmlDataRow $r @(($i + 1), $tg.DataType, [double]$tg.ColCount, [double]($tg.ColCount / $totCD), [double]$tg.PkCount, [double]$tg.CatCount, $avgN, $avgC, $avgB, [double]$tg.MaxByteLen, $rTxt, $exTxt) (($i % 2) -eq 1) @{1=6;3=6;4=10;5=6;6=6;7=10;8=10;9=12;10=6} @(1,3,5,6,11) @(11,12) @(11) @()
+            $r++
+        }
+        $r++
+
+        $topW = @($AnalysisObj.Warnings | Select-Object -First 20)
+        $wSpans = @(@{C1=1;C2=1}, @{C1=2;C2=2}, @{C1=3;C2=3}, @{C1=4;C2=4}, @{C1=5;C2=7}, @{C1=8;C2=12})
+        Add-XmlSecHdr $r ("4. 検出された主要警告・リスクサマリー (上位{0}件 / 全{1}件)" -f $topW.Count, $AnalysisObj.Warnings.Count); $r++
+        Add-XmlMergedRow $r $wSpans @('重要度','カテゴリ','テーブル名','カラム名','検出値・指標','Aurora / 性能試験への影響 ＆ 推奨アクション') @(3,3,3,3,3,3) 26; $r++
+        if ($topW.Count -eq 0) {
+            Add-XmlMergedRow $r @(@{C1=1;C2=12}) @('警告・注意項目は検出されませんでした (良好)') @(23) 24; $r++
+        }
+        else {
+            for ($i = 0; $i -lt $topW.Count; $i++) {
+                $w = $topW[$i]; $z = (($i % 2) -eq 1)
+                $actTxt = "【影響】$($w.PerfImpact)  【対策】$($w.Recommendation)"
+                $isHM = ($w.Severity -eq '高' -or $w.Severity -eq '中')
+                $s0 = if ($isHM) { 21 } else { if ($z) { 17 } else { 16 } }
+                $s2 = if ($z) { 5 } else { 4 }
+                $sW = if ($z) { 19 } else { 18 }
+                $ht = Get-EstimatedRowHeight -Texts @($w.MetricValue, $actTxt) -ColWidths @(34.0, 76.0) -MinHeight 24.0 -MaxHeight 85.0
+                Add-XmlMergedRow $r $wSpans @($w.Severity, $w.Category, $w.TableName, $w.ColumnName, $w.MetricValue, $actTxt) @($s0, $s0, $s2, $s2, $sW, $sW) $ht; $r++
+            }
+        }
+        $r++
+
+        Add-XmlSecHdr $r '5. テーブル間リレーション概要 ＆ JMeterパラメータ化適性ハイライト'; $r++
+        $rSpans = @(@{C1=1;C2=1}, @{C1=2;C2=3}, @{C1=4;C2=4}, @{C1=5;C2=5}, @{C1=6;C2=7}, @{C1=8;C2=8}, @{C1=9;C2=10}, @{C1=11;C2=12})
+        Add-XmlMergedRow $r $rSpans @('No','親テーブル.PK → 子テーブル.FK','参照一致率','孤立行数','平均 / P95 (子/親)','最大(子/親)','リスク評価','所見・スーパーユーザー情報') @(3,3,3,3,3,3,3,3) 25; $r++
+        $topR = @($AnalysisObj.Relationships | Select-Object -First 10)
+        if ($topR.Count -eq 0) {
+            Add-XmlMergedRow $r @(@{C1=1;C2=12}) @('自動推定されたテーブル間FKリレーションはありません') @(23) 24; $r++
+        }
+        else {
+            for ($i = 0; $i -lt $topR.Count; $i++) {
+                $rl = $topR[$i]; $z = (($i % 2) -eq 1)
+                $sT = if ($z) { 5 } else { 4 }; $sI = if ($z) { 7 } else { 6 }; $sP = if ($z) { 11 } else { 10 }; $sC = if ($z) { 17 } else { 16 }; $sW = if ($z) { 19 } else { 18 }
+                $sOrp = if ($rl.OrphanRows -gt 0) { 22 } else { $sI }
+                $sRsk = if (Test-WarningCellText -Text $rl.RiskLevel) { 21 } else { $sC }
+                $sNt  = if (Test-WarningCellText -Text $rl.Note) { 20 } else { $sW }
+                $ht = Get-EstimatedRowHeight -Texts @($rl.Note) -ColWidths @(40.0) -MinHeight 22.0 -MaxHeight 65.0
+                Add-XmlMergedRow $r $rSpans @([double]($i + 1), "$($rl.ParentTable).$($rl.ParentColumn) → $($rl.ChildTable).$($rl.ChildColumn)", [double]$rl.MatchRate, [double]$rl.OrphanRows, ("平均 {0:0.00} / P95 {1:0.0}" -f $rl.FanOutAvg, $rl.FanOutP95), [double]$rl.FanOutMax, $rl.RiskLevel, $rl.Note) @($sI, $sT, $sP, $sOrp, $sC, $sI, $sRsk, $sNt) $ht; $r++
+            }
+        }
+        $r++
+
+        $jSpans = @(@{C1=1;C2=1}, @{C1=2;C2=2}, @{C1=3;C2=3}, @{C1=4;C2=4}, @{C1=5;C2=5}, @{C1=6;C2=7}, @{C1=8;C2=12})
+        Add-XmlMergedRow $r $jSpans @('No','テーブル名','キーカラム','データ型','一意キー数','JMeter並列適性','推奨設定・活用指針') @(3,3,3,3,3,3,3) 25; $r++
+        $topJ = @($AnalysisObj.JMeterCandidates | Select-Object -First 8)
+        if ($topJ.Count -eq 0) {
+            Add-XmlMergedRow $r @(@{C1=1;C2=12}) @('該当するJMeter一意キー候補 (10件以上) はありません') @(23) 24; $r++
+        }
+        else {
+            for ($i = 0; $i -lt $topJ.Count; $i++) {
+                $jc = $topJ[$i]; $z = (($i % 2) -eq 1)
+                $sT = if ($z) { 5 } else { 4 }; $sI = if ($z) { 7 } else { 6 }; $sC = if ($z) { 17 } else { 16 }; $sW = if ($z) { 19 } else { 18 }
+                $sSuit = if ($jc.Suitability -like '最適*') { if ($z) { 38 } else { 37 } } elseif (Test-WarningCellText -Text $jc.Suitability) { 21 } else { $sC }
+                $ht = Get-EstimatedRowHeight -Texts @($jc.RecommendedUsage) -ColWidths @(76.0) -MinHeight 22.0 -MaxHeight 65.0
+                Add-XmlMergedRow $r $jSpans @([double]($i + 1), $jc.TableName, $jc.KeyColumn, $jc.DataType, [double]$jc.UniqueCount, $jc.Suitability, $jc.RecommendedUsage) @($sI, $sT, $sT, $sC, $sI, $sSuit, $sW) $ht; $r++
+            }
+        }
+        $r++
+
+        Add-XmlSecHdr $r '6. Aurora Serverless v2 (MySQL 8.4.7) 性能試験向け総合所見'; $r++
+        foreach ($ins in $AnalysisObj.AuroraInsights) {
+            $ht = Get-EstimatedRowHeight -Texts @($ins) -ColWidths @(165.0) -MinHeight 26.0 -MaxHeight 85.0
+            Add-XmlMergedRow $r @(@{C1=1;C2=12}) @($ins) @(36) $ht; $r++
+        }
+        if (-not $IsDetailed) {
+            Add-XmlMergedRow $r @(@{C1=1;C2=12}) @('※ カテゴリ分布・数値統計ヒストグラム・時系列分析・リレーション詳細・性能試験ガイド全件シートを出力するには、ダイアログの「詳細分析」にチェックを入れて実行してください。') @(23) 22; $r++
+        }
+
+        $OutLastRow.Value = $r - 1
+        [void]$sb.Append('</sheetData>')
+        [void]$sb.AppendFormat('<mergeCells count="{0}">', $merges.Count)
+        foreach ($mg in $merges) { [void]$sb.AppendFormat('<mergeCell ref="{0}"/>', $mg) }
+        [void]$sb.Append('</mergeCells>')
+        [void]$sb.Append('<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/>')
+        [void]$sb.Append('<pageSetup orientation="landscape" fitToWidth="1" fitToHeight="0"/>')
+        if ($topList.Count -gt 0) { [void]$sb.Append('<drawing r:id="rId1"/>') }
+        [void]$sb.Append('</worksheet>')
+        return $sb.ToString()
+    }
+
     $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
     $stagingPath = New-AnalysisStagingPath $OutputPath
-    if ($null -ne $LogCallback) { & $LogCallback 'Excelレポート生成中 (OpenXML)' 60 }
+    $modeSheetText = if ($DetailedAnalysis) { '詳細分析8シート' } else { '標準3シート' }
+    if ($null -ne $LogCallback) { & $LogCallback "Excelレポート生成中 (OpenXML / $modeSheetText)" 60 }
 
     $isDirectDb = [bool]$Analysis.IsDirectDb
     $dbLabelPart = if ([string]::IsNullOrWhiteSpace($DbLabel)) { '' } else { " | A5M2登録DB: $DbLabel" }
     $subInfo = if ($isDirectDb) {
-        "分析日時: {0} | 接続先DB: {1}{2} | 取得方式: DB直接分析(CSV未出力) | Aurora Serverless v2 (MySQL 8.4.7)" -f $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart
+        "分析日時: {0} | 接続先DB: {1}{2} | 取得方式: DB直接分析(CSV未出力) | 出力構成: {3} | Aurora Serverless v2 (MySQL 8.4.7)" -f $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart, $modeSheetText
     }
     else {
-        "分析日時: {0} | 対象フォルダ: {1}{2} | Aurora Serverless v2 (MySQL 8.4.7)" -f $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart
+        "分析日時: {0} | 対象フォルダ: {1}{2} | 出力構成: {3} | Aurora Serverless v2 (MySQL 8.4.7)" -f $Analysis.AnalyzedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Analysis.InputFolder, $dbLabelPart, $modeSheetText
     }
+    $sizeKpiLabel = if ($isDirectDb) { 'CSV換算サイズ (MB)' } else { '総CSVサイズ (MB)' }
     $sizeColHeader = if ($isDirectDb) { 'CSV換算サイズ(KB)' } else { 'CSVサイズ(KB)' }
     $srcColHeader = if ($isDirectDb) { '取得元 (DB.テーブル)' } else { 'CSVファイル名' }
-    $tblSheetTitle = if ($isDirectDb) { 'テーブル別詳細一覧 (DB直接分析・CSV未出力)' } else { 'テーブル別詳細一覧' }
+    $tblSheetTitle = if ($isDirectDb) { 'テーブル別詳細一覧 (DB直接分析・CSV未出力)' } else { 'テーブル別詳細一覧 (全CSVファイルプロファイル)' }
 
-    # Prepare rows for all 8 sheets (matching Excel COM column order & sorting)
-    $s1Rows = @()
-    $rk = 0
-    foreach ($t in ($Analysis.Tables | Select-Object -First 15)) {
-        $rk++
-        $s1Rows += , @($rk, $t.TableName, $t.InferredRole, [double]$t.RowCount, [double]$t.RowShare, [double]$t.ColumnCount, [Math]::Round($t.FileSizeBytes / 1024.0, 2), [double]$t.SizeShare, [Math]::Round($t.EstInnoDbBytes / 1024.0, 1), [double]$t.AvgNullRate, [double]$t.WarningCount, $(if ($t.WarningSummary) { $t.WarningSummary } else { '正常' }))
-    }
+    $allCols = @($Analysis.Tables | ForEach-Object { $_.Columns })
+    $roleSummary = @(Get-RoleSummaryItems -Analysis $Analysis)
+    $typeSummary = @(Get-TypeSummaryItems -AllCols $allCols)
 
     $s2Rows = @()
     $rk = 0
+    $minRowNonEmpty = [long]::MaxValue
     foreach ($t in $Analysis.Tables) {
         $rk++
-        $s2Rows += , @($rk, $t.TableName, $t.FileName, $t.EncodingName, $t.InferredRole, [double]$t.RowCount, [double]$t.RowShare, [double]$t.ColumnCount, [Math]::Round($t.FileSizeBytes / 1024.0, 2), [double]$t.SizeShare, [Math]::Round($t.AvgRowBytes, 1), [double]$t.MaxRowBytes, [Math]::Round($t.EstInnoDbBytes / 1024.0, 1), [double]$t.AvgNullRate, $(if ($t.CandidatePks) { $t.CandidatePks } else { '-' }), $(if ($t.DateColumns) { $t.DateColumns } else { '-' }), $(if ($t.WarningSummary) { $t.WarningSummary } else { '正常' }))
+        if ($t.RowCount -gt 0 -and $t.MinRowBytes -lt $minRowNonEmpty) { $minRowNonEmpty = $t.MinRowBytes }
+        $s2Rows += , @(
+            $rk, $t.TableName, $t.FileName, $t.EncodingName, $t.InferredRole,
+            [double]$t.RowCount, [double]$t.RowShare, [double]$t.ColumnCount,
+            $(if ($t.ColumnTypeBreakdown) { $t.ColumnTypeBreakdown } else { '-' }),
+            [Math]::Round($t.FileSizeBytes / 1024.0, 2), [double]$t.SizeShare,
+            [double]$t.MinRowBytes, [Math]::Round($t.AvgRowBytes, 1), [double]$t.MaxRowBytes,
+            [Math]::Round($t.EstInnoDbBytes / 1024.0, 1), [double]$t.EstInnoDbPages, [Math]::Round($t.RowsPerInnoDbPage, 1),
+            [double]$t.AvgNullRate, [double]$t.AvgCardinalityRate,
+            $(if ($t.QualityRiskBreakdown) { $t.QualityRiskBreakdown } else { '問題なし' }),
+            [double]$t.RaggedRowCount,
+            $(if ($t.CandidatePks) { $t.CandidatePks } else { '-' }),
+            $(if ($t.CategoricalColumns) { $t.CategoricalColumns } else { '-' }),
+            $(if ($t.DateColumns) { $t.DateColumns } else { '-' }),
+            $(if ($t.PrimaryDateRange) { $t.PrimaryDateRange } else { '-' }),
+            $(if ($t.RelationSummary) { $t.RelationSummary } else { '-' }),
+            $(if ($t.JMeterReadiness) { $t.JMeterReadiness } else { '対象外' }),
+            [double]$t.WarningCount,
+            $(if ($t.WarningSummary) { $t.WarningSummary } else { '正常' })
+        )
     }
+    $totMinRowB = if ($minRowNonEmpty -eq [long]::MaxValue) { 0L } else { $minRowNonEmpty }
+    $totRowsPerPg = if ($Analysis.TotalEstInnoDbPages -gt 0) { [Math]::Round($Analysis.TotalRows / [double]$Analysis.TotalEstInnoDbPages, 1) } else { 0.0 }
+    $avgTblCard = if ($Analysis.Tables.Count -gt 0) { ($Analysis.Tables | Measure-Object -Property AvgCardinalityRate -Average).Average } else { 0.0 }
+    $s2Footer = @('合計', "全 $($Analysis.TableCount) テーブル集計", '-', '-', "空 $($Analysis.EmptyTableCount) 表", [double]$Analysis.TotalRows, 1.0, [double]$Analysis.TotalColumns, "PK候補 $($Analysis.CandidatePkColumnCount) 列", [Math]::Round($Analysis.TotalFileBytes / 1024.0, 2), 1.0, [double]$totMinRowB, [Math]::Round($Analysis.OverallAvgRowBytes, 1), [double]$Analysis.OverallMaxRowBytes, [Math]::Round($Analysis.TotalEstInnoDbBytes / 1024.0, 1), [double]$Analysis.TotalEstInnoDbPages, $totRowsPerPg, [double]$Analysis.OverallAvgNullRate, [double]$avgTblCard, "全NULL:$($Analysis.AllNullColumnCount) / 偏り:$($Analysis.HighSkewColumnCount) / 大容量:$($Analysis.LargeColumnCount)", [double]$Analysis.RaggedRowTotal, '-', '-', '-', '-', "関連 $($Analysis.Relationships.Count) 件 / 孤立 $($Analysis.TotalOrphanRows)", "候補 $($Analysis.JMeterCandidates.Count) 列", [double]$Analysis.TotalWarningCount, "高 $($Analysis.HighWarningCount) / 中 $($Analysis.MediumWarningCount) / 低 $($Analysis.LowWarningCount)")
 
-    $allCols = @($Analysis.Tables | ForEach-Object { $_.Columns })
     $s3Rows = @()
     foreach ($c in $allCols) {
         $topVal = if ($c.Top1Value.Length -gt 35) { $c.Top1Value.Substring(0, 32) + '...' } else { $c.Top1Value }
-        $s3Rows += , @($c.TableName, $c.ColumnName, $c.InferredType, [double]$c.TotalRows, [double]$c.NullCount, [double]$c.NullRate, [double]$c.DistinctCount, [double]$c.CardinalityRate, $c.SelectivityRating, [Math]::Round($c.AvgByteLen, 1), [double]$c.P95ByteLen, [double]$c.MaxByteLen, $topVal, [double]$c.Top1Share, [double]$c.Top3Share, [Math]::Round($c.GiniCoefficient, 3), $c.SkewRisk, $(if ($c.AlertNote) { $c.AlertNote } else { '正常' }))
+        $charLenTxt = if ($c.NonNullCount -gt 0) { "{0} / {1:0.0} / {2}" -f $c.MinCharLen, $c.AvgCharLen, $c.MaxCharLen } else { '-' }
+        $s3Rows += , @(
+            $c.TableName, $c.ColumnName, [double]($c.ColumnIndex + 1), $c.InferredType,
+            $(if ($c.KeyRole) { $c.KeyRole } else { '一般' }),
+            [double]$c.TotalRows, [double]$c.NonNullCount, [double]$c.NullCount, [double]$c.NullRate,
+            [double]$c.DistinctCount, [double]$c.CardinalityRate, $c.SelectivityRating,
+            [double]$c.MinByteLen, [Math]::Round($c.AvgByteLen, 1), [double]$c.P95ByteLen, [double]$c.MaxByteLen, $charLenTxt,
+            $topVal, [double]$c.Top1Count, [double]$c.Top1Share, [double]$c.Top3Share, [double]$c.Top5Share,
+            [Math]::Round($c.GiniCoefficient, 3), [Math]::Round($c.NormalizedEntropy, 3), $c.SkewRisk,
+            $(if ($c.MinValueText) { $c.MinValueText } else { '-' }),
+            $(if ($c.MaxValueText) { $c.MaxValueText } else { '-' }),
+            $(if ($c.TopValuesSummary) { $c.TopValuesSummary } else { '-' }),
+            $(if ($c.DetailStatsSummary) { $c.DetailStatsSummary } else { '-' }),
+            $(if ($c.RelationSummary) { $c.RelationSummary } else { '-' }),
+            $(if ($c.AlertNote) { $c.AlertNote } else { '正常' })
+        )
     }
 
-    $s4Rows = @()
-    foreach ($cc in ($allCols | Where-Object { $_.IsCategorical } | Sort-Object NonNullCount -Descending)) {
-        $r = 0
-        foreach ($tv in $cc.TopValues) {
-            $r++
-            $weightHint = if ($tv.Share -ge 0.50) { '主要パス (高頻度)' } elseif ($tv.Share -ge 0.15) { '標準パス' } elseif ($tv.Share -ge 0.03) { '副次パス' } else { '低頻度・エッジケース' }
-            $s4Rows += , @($cc.TableName, $cc.ColumnName, [double]$cc.DistinctCount, [double]$r, $tv.Value, [double]$tv.Count, [double]$tv.Share, [double]$tv.CumulativeShare, $weightHint)
+    $topStartRow1 = 12
+    $topEndRow1 = 12
+    $summaryLastRow1 = 20
+    $s1Xml = Build-SummarySheetXml `
+        -Title 'Aurora Serverless v2 (MySQL 8.4.7) 性能試験用データ分析レポート — サマリー' `
+        -Subtitle $subInfo -AnalysisObj $Analysis -RoleSummaryItems $roleSummary -TypeSummaryItems $typeSummary `
+        -SizeKpiLbl $sizeKpiLabel -SizeColHdr $sizeColHeader -IsDetailed ([bool]$DetailedAnalysis) `
+        -OutTopStartRow ([ref]$topStartRow1) -OutTopEndRow ([ref]$topEndRow1) -OutLastRow ([ref]$summaryLastRow1)
+
+    $s2Headers = @('No','テーブル名',$srcColHeader,'文字コード','推定役割','レコード数','件数構成比','列数','データ型構成',$sizeColHeader,'容量構成比','最小行長(B)','平均行長(B)','最大行長(B)','推定InnoDB(KB)','推定InnoDBページ数','推定行/ページ','平均NULL率','平均ユニーク率','品質リスク列内訳','列数不一致行','PK/UK候補','カテゴリ区分カラム','日時カラム','日時データ期間','リレーション概要','JMeter並列適性','警告数','警告・注意点')
+    $s2Widths  = @(5,22,24,15,16,12,10,7,24,15,10,11,11,11,14,13,12,10,11,22,11,18,22,20,24,28,22,8,32)
+    $s2Xml = Build-SheetXml -Title $tblSheetTitle -Subtitle $subInfo -Headers $s2Headers -Rows $s2Rows -ColWidths $s2Widths `
+        -NumColStyles @{1=6;6=6;7=10;8=6;10=8;11=10;12=6;13=12;14=6;15=12;16=6;17=12;18=10;19=10;21=6;28=6} `
+        -CenterCols @(1,4,5,8,25,27) -WrapCols @(9,20,22,23,24,26,29) -WarnCols @(20,27,29) -WarnPositiveIntCols @(21,28) -NavyOptimalCols @(27) `
+        -SummaryFooterRow $s2Footer -SummaryFooterStyles @{6=30;7=32;8=30;10=31;11=32;12=30;13=33;14=30;15=33;16=30;17=33;18=32;19=32;21=30;28=30} -SummaryFooterWarnCols @(21,28)
+
+    $s3Headers = @('テーブル名','カラム名','列順','推定データ型','キー・役割','総行数','有効件数','NULL件数','NULL率','ユニーク数','ユニーク率','INDEX選択性評価','最小長(B)','平均長(B)','P95長(B)','最大長(B)','文字長(最小/平均/最大)','最頻値(Top1)','Top1件数','Top1占有率','Top3占有率','Top5占有率','ジニ係数','正規化エントロピー','偏りリスク','最小値 / 最古日時','最大値 / 最新日時','上位値分布 (Top5)','型別詳細統計 (数値・日時・文字特性)','リレーション推定','警告・注意点')
+    $s3Widths  = @(22,20,6,16,14,10,10,10,9,11,10,16,9,10,10,10,17,22,10,11,11,11,9,11,20,20,20,36,44,30,30)
+    $s3Xml = Build-SheetXml -Title '全カラム詳細プロファイル (選択性・NULL率・偏り・バイト長・型別統計・上位値分布・関連)' -Subtitle $subInfo -Headers $s3Headers -Rows $s3Rows -ColWidths $s3Widths `
+        -NumColStyles @{3=6;6=6;7=6;8=6;9=10;10=6;11=10;13=6;14=12;15=6;16=6;19=6;20=10;21=10;22=10;23=14;24=14} `
+        -CenterCols @(3,4,5,12,17,25,26,27) -WrapCols @(28,29,30,31) -WarnCols @(25,31)
+
+    $sheetNames = New-Object System.Collections.Generic.List[string]
+    $sheetXmls  = New-Object System.Collections.Generic.List[string]
+    $sheetNames.Add('01_サマリー');     $sheetXmls.Add($s1Xml)
+    $sheetNames.Add('02_テーブル一覧'); $sheetXmls.Add($s2Xml)
+    $sheetNames.Add('03_カラム分析');   $sheetXmls.Add($s3Xml)
+
+    if ($DetailedAnalysis) {
+        $s4Rows = @()
+        foreach ($cc in ($allCols | Where-Object { $_.IsCategorical } | Sort-Object NonNullCount -Descending)) {
+            $r = 0
+            foreach ($tv in $cc.TopValues) {
+                $r++
+                $weightHint = if ($tv.Share -ge 0.50) { '主要パス (高頻度)' } elseif ($tv.Share -ge 0.15) { '標準パス' } elseif ($tv.Share -ge 0.03) { '副次パス' } else { '低頻度・エッジケース' }
+                $s4Rows += , @($cc.TableName, $cc.ColumnName, [double]$cc.DistinctCount, [double]$r, $tv.Value, [double]$tv.Count, [double]$tv.Share, [double]$tv.CumulativeShare, $weightHint)
+            }
         }
+
+        $s5Rows = @()
+        foreach ($nc in ($allCols | Where-Object { $_.IsNumeric -and $_.NonNullCount -gt 0 } | Sort-Object NonNullCount -Descending)) {
+            $s5Rows += , @($nc.TableName, $nc.ColumnName, [double]$nc.NonNullCount, [Math]::Round($nc.NumMin, 2), [Math]::Round($nc.NumP25, 2), [Math]::Round($nc.NumMedian, 2), [Math]::Round($nc.NumMean, 2), [Math]::Round($nc.NumP75, 2), [Math]::Round($nc.NumP90, 2), [Math]::Round($nc.NumP95, 2), [Math]::Round($nc.NumP99, 2), [Math]::Round($nc.NumMax, 2), [Math]::Round($nc.NumStdDev, 2), [double]$nc.ZeroRate, [double]$nc.NegativeRate, [double]$nc.OutlierRate)
+        }
+
+        $s6Rows = @()
+        foreach ($dc in ($allCols | Where-Object { $_.IsDateTime -and $_.NonNullCount -gt 0 } | Sort-Object NonNullCount -Descending)) {
+            $s6Rows += , @($dc.TableName, $dc.ColumnName, [double]$dc.NonNullCount, $(if ($dc.MinDate) { $dc.MinDate.ToString('yyyy/MM/dd HH:mm:ss') } else { '-' }), $(if ($dc.MaxDate) { $dc.MaxDate.ToString('yyyy/MM/dd HH:mm:ss') } else { '-' }), [Math]::Round($dc.DateSpanDays, 1), [Math]::Round($dc.AvgPerDay, 1), $dc.PeakDay, [double]$dc.PeakDayCount, [Math]::Round($dc.PeakBurstRatio, 2))
+        }
+
+        $s7Rows = @()
+        foreach ($rl in $Analysis.Relationships) {
+            $s7Rows += , @("$($rl.ParentTable).$($rl.ParentColumn)", "$($rl.ChildTable).$($rl.ChildColumn)", [double]$rl.ParentDistinctCount, [double]$rl.ChildNonNullRows, [double]$rl.MatchRate, [double]$rl.OrphanRows, [double]$rl.FanOutMin, [Math]::Round($rl.FanOutAvg, 2), [Math]::Round($rl.FanOutP50, 1), [Math]::Round($rl.FanOutP95, 1), [Math]::Round($rl.FanOutP99, 1), [double]$rl.FanOutMax, $rl.RiskLevel, $rl.Note)
+        }
+
+        $s8Rows = @()
+        foreach ($w in $Analysis.Warnings) {
+            $s8Rows += , @($w.Severity, $w.Category, $w.TableName, $w.ColumnName, $w.MetricValue, $w.PerfImpact, $w.Recommendation)
+        }
+
+        $sheetNames.Add('04_分布・割合分析')
+        $sheetXmls.Add((Build-SheetXml -Title 'カテゴリ・区分値 分布と割合' -Subtitle $subInfo -Headers @('テーブル名','カラム名','区分数','順位','カテゴリ値','件数','割合(%)','累積割合(%)','性能試験シナリオ区分') -Rows $s4Rows -ColWidths @(20,20,8,6,26,12,11,11,20) -NumColStyles @{3=6;4=6;6=6;7=10;8=10} -CenterCols @(9) -WrapCols @(5)))
+        $sheetNames.Add('05_数値統計・ヒストグラム')
+        $sheetXmls.Add((Build-SheetXml -Title '数値カラム統計量' -Subtitle $subInfo -Headers @('テーブル名','カラム名','有効件数','最小値','P25(Q1)','中央値(P50)','平均値','P75(Q3)','P90','P95','P99','最大値','標準偏差','ゼロ率','負値率','外れ値率') -Rows $s5Rows -ColWidths @(20,22,11,12,12,12,12,12,12,12,12,12,12,9,9,9) -NumColStyles @{3=6;4=8;5=8;6=8;7=8;8=8;9=8;10=8;11=8;12=8;13=8;14=10;15=10;16=10}))
+        $sheetNames.Add('06_時系列分析')
+        $sheetXmls.Add((Build-SheetXml -Title '時系列・日時分布分析' -Subtitle $subInfo -Headers @('テーブル名','日時カラム','有効件数','最古日時','最新日時','期間(日)','日平均件数','ピーク日','ピーク日件数','ピーク倍率') -Rows $s6Rows -ColWidths @(20,20,12,22,22,11,12,14,13,13) -NumColStyles @{3=6;6=12;7=12;9=6;10=8} -CenterCols @(4,5,8)))
+        $sheetNames.Add('07_リレーション・ファンアウト')
+        $sheetXmls.Add((Build-SheetXml -Title 'テーブル間リレーション・1:Nファンアウト' -Subtitle $subInfo -Headers @('親テーブル.PK','子テーブル.FK','親キー数','子有効行数','参照一致率','孤立行数','最小(子/親)','平均(子/親)','P50(子/親)','P95(子/親)','P99(子/親)','最大(子/親)','リスク評価','所見・スーパーユーザー情報') -Rows $s7Rows -ColWidths @(24,24,11,11,11,10,10,11,10,10,10,11,24,38) -NumColStyles @{3=6;4=6;5=10;6=6;7=6;8=8;9=12;10=12;11=12;12=6} -CenterCols @(13) -WrapCols @(14) -WarnCols @(13,14) -WarnPositiveIntCols @(6)))
+        $sheetNames.Add('08_性能試験ガイド・警告')
+        $sheetXmls.Add((Build-SheetXml -Title '性能試験設計ガイド・検出警告一覧' -Subtitle $subInfo -Headers @('重要度','カテゴリ','テーブル名','カラム名','検出値・指標','Aurora / 性能試験への影響','推奨アクション') -Rows $s8Rows -ColWidths @(10,18,22,18,28,42,46) -CenterCols @(1,2) -WrapCols @(5,6,7) -WarnCols @(1) -HighlightCatOnWarnCol1 $true))
     }
 
-    $s5Rows = @()
-    foreach ($nc in ($allCols | Where-Object { $_.IsNumeric -and $_.NonNullCount -gt 0 } | Sort-Object NonNullCount -Descending)) {
-        $s5Rows += , @($nc.TableName, $nc.ColumnName, [double]$nc.NonNullCount, [Math]::Round($nc.NumMin, 2), [Math]::Round($nc.NumP25, 2), [Math]::Round($nc.NumMedian, 2), [Math]::Round($nc.NumMean, 2), [Math]::Round($nc.NumP75, 2), [Math]::Round($nc.NumP90, 2), [Math]::Round($nc.NumP95, 2), [Math]::Round($nc.NumP99, 2), [Math]::Round($nc.NumMax, 2), [Math]::Round($nc.NumStdDev, 2), [double]$nc.ZeroRate, [double]$nc.NegativeRate, [double]$nc.OutlierRate)
-    }
-
-    $s6Rows = @()
-    foreach ($dc in ($allCols | Where-Object { $_.IsDateTime -and $_.NonNullCount -gt 0 } | Sort-Object NonNullCount -Descending)) {
-        $s6Rows += , @($dc.TableName, $dc.ColumnName, [double]$dc.NonNullCount, $(if ($dc.MinDate) { $dc.MinDate.ToString('yyyy/MM/dd HH:mm:ss') } else { '-' }), $(if ($dc.MaxDate) { $dc.MaxDate.ToString('yyyy/MM/dd HH:mm:ss') } else { '-' }), [Math]::Round($dc.DateSpanDays, 1), [Math]::Round($dc.AvgPerDay, 1), $dc.PeakDay, [double]$dc.PeakDayCount, [Math]::Round($dc.PeakBurstRatio, 2))
-    }
-
-    $s7Rows = @()
-    foreach ($rl in $Analysis.Relationships) {
-        $s7Rows += , @("$($rl.ParentTable).$($rl.ParentColumn)", "$($rl.ChildTable).$($rl.ChildColumn)", [double]$rl.ParentDistinctCount, [double]$rl.ChildNonNullRows, [double]$rl.MatchRate, [double]$rl.OrphanRows, [double]$rl.FanOutMin, [Math]::Round($rl.FanOutAvg, 2), [Math]::Round($rl.FanOutP50, 1), [Math]::Round($rl.FanOutP95, 1), [Math]::Round($rl.FanOutP99, 1), [double]$rl.FanOutMax, $rl.RiskLevel, $rl.Note)
-    }
-
-    $s8Rows = @()
-    foreach ($w in $Analysis.Warnings) {
-        $s8Rows += , @($w.Severity, $w.Category, $w.TableName, $w.ColumnName, $w.MetricValue, $w.PerfImpact, $w.Recommendation)
-    }
-
-    $sheetNames = @(
-        '01_サマリー', '02_テーブル一覧', '03_カラム分析', '04_分布・割合分析',
-        '05_数値統計・ヒストグラム', '06_時系列分析', '07_リレーション・ファンアウト', '08_性能試験ガイド・警告'
-    )
-
-    $hasChart1 = ($s1Rows.Count -gt 0)
-    $sheetXmls = @(
-        (Build-SheetXml -Title 'Aurora Serverless v2 (MySQL 8.4.7) 性能試験データ分析 — サマリー' -Subtitle $subInfo -Headers @('順位','テーブル名','推定役割','レコード数','件数構成比','列数',$sizeColHeader,'容量構成比','推定InnoDB(KB)','平均NULL率','警告数','健全性・注意点') -Rows $s1Rows -ColWidths @(6,24,16,13,11,7,15,11,14,11,8,30) -NumColStyles @{1=6;4=6;5=10;6=6;7=8;8=10;9=12;10=10;11=6} -CenterCols @(3) -WrapCols @(12) -WarnCols @(12) -IncludeChartDrawing $hasChart1),
-        (Build-SheetXml -Title $tblSheetTitle -Subtitle $subInfo -Headers @('No','テーブル名',$srcColHeader,'文字コード','推定役割','レコード数','件数構成比','列数',$sizeColHeader,'容量構成比','平均行長(B)','最大行長(B)','推定InnoDB(KB)','平均NULL率','PK/UK候補','日時カラム','警告・注意点') -Rows $s2Rows -ColWidths @(5,22,24,15,16,12,10,7,15,10,11,11,14,10,18,20,30) -NumColStyles @{1=6;6=6;7=10;8=6;9=8;10=10;11=12;12=6;13=12;14=10} -CenterCols @(4,5) -WrapCols @(15,16,17) -WarnCols @(17)),
-        (Build-SheetXml -Title '全カラム詳細プロファイル' -Subtitle $subInfo -Headers @('テーブル名','カラム名','推定データ型','総行数','NULL件数','NULL率','ユニーク数','ユニーク率','INDEX選択性評価','平均長(B)','P95長(B)','最大長(B)','最頻値(Top1)','Top1占有率','Top3占有率','ジニ係数','偏りリスク','警告・注意点') -Rows $s3Rows -ColWidths @(24,20,16,10,10,9,11,10,16,10,10,10,22,11,11,9,20,30) -NumColStyles @{4=6;5=6;6=10;7=6;8=10;10=12;11=6;12=6;14=10;15=10;16=14} -CenterCols @(3,9,17) -WrapCols @(18) -WarnCols @(17,18)),
-        (Build-SheetXml -Title 'カテゴリ・区分値 分布と割合' -Subtitle $subInfo -Headers @('テーブル名','カラム名','区分数','順位','カテゴリ値','件数','割合(%)','累積割合(%)','性能試験シナリオ区分') -Rows $s4Rows -ColWidths @(20,20,8,6,26,12,11,11,20) -NumColStyles @{3=6;4=6;6=6;7=10;8=10} -CenterCols @(9) -WrapCols @(5)),
-        (Build-SheetXml -Title '数値カラム統計量' -Subtitle $subInfo -Headers @('テーブル名','カラム名','有効件数','最小値','P25(Q1)','中央値(P50)','平均値','P75(Q3)','P90','P95','P99','最大値','標準偏差','ゼロ率','負値率','外れ値率') -Rows $s5Rows -ColWidths @(20,22,11,12,12,12,12,12,12,12,12,12,12,9,9,9) -NumColStyles @{3=6;4=8;5=8;6=8;7=8;8=8;9=8;10=8;11=8;12=8;13=8;14=10;15=10;16=10}),
-        (Build-SheetXml -Title '時系列・日時分布分析' -Subtitle $subInfo -Headers @('テーブル名','日時カラム','有効件数','最古日時','最新日時','期間(日)','日平均件数','ピーク日','ピーク日件数','ピーク倍率') -Rows $s6Rows -ColWidths @(20,20,12,22,22,11,12,14,13,13) -NumColStyles @{3=6;6=12;7=12;9=6;10=8} -CenterCols @(4,5,8)),
-        (Build-SheetXml -Title 'テーブル間リレーション・1:Nファンアウト' -Subtitle $subInfo -Headers @('親テーブル.PK','子テーブル.FK','親キー数','子有効行数','参照一致率','孤立行数','最小(子/親)','平均(子/親)','P50(子/親)','P95(子/親)','P99(子/親)','最大(子/親)','リスク評価','所見・スーパーユーザー情報') -Rows $s7Rows -ColWidths @(24,24,11,11,11,10,10,11,10,10,10,11,24,38) -NumColStyles @{3=6;4=6;5=10;6=6;7=6;8=8;9=12;10=12;11=12;12=6} -CenterCols @(13) -WrapCols @(14) -WarnCols @(13,14) -WarnPositiveIntCols @(6)),
-        (Build-SheetXml -Title '性能試験設計ガイド・検出警告一覧' -Subtitle $subInfo -Headers @('重要度','カテゴリ','テーブル名','カラム名','検出値・指標','Aurora / 性能試験への影響','推奨アクション') -Rows $s8Rows -ColWidths @(10,18,22,18,28,42,46) -CenterCols @(1,2) -WrapCols @(5,6,7) -WarnCols @(1) -HighlightCatOnWarnCol1 $true)
-    )
+    $hasChart1 = ($Analysis.Tables.Count -gt 0)
 
     # styles.xml: strictly Meiryo UI + #333333 + #1A2B4C + #800020 on pure neutral monotone backgrounds
     $stylesXml = @'
@@ -8036,15 +9516,21 @@ function Export-AnalysisToOpenXml {
     <numFmt numFmtId="167" formatCode="#,##0.0"/>
     <numFmt numFmtId="168" formatCode="0.000"/>
   </numFmts>
-  <fonts count="6">
+  <fonts count="12">
     <font><sz val="9.5"/><color rgb="FF333333"/><name val="Meiryo UI"/></font>
     <font><b/><sz val="13.5"/><color rgb="FFFFFFFF"/><name val="Meiryo UI"/></font>
     <font><sz val="9"/><color rgb="FF333333"/><name val="Meiryo UI"/></font>
     <font><b/><sz val="9.5"/><color rgb="FFFFFFFF"/><name val="Meiryo UI"/></font>
     <font><b/><sz val="9.5"/><color rgb="FF800020"/><name val="Meiryo UI"/></font>
     <font><sz val="9.5"/><color rgb="FF595959"/><name val="Meiryo UI"/></font>
+    <font><b/><sz val="10.5"/><color rgb="FF1A2B4C"/><name val="Meiryo UI"/></font>
+    <font><b/><sz val="8.5"/><color rgb="FF595959"/><name val="Meiryo UI"/></font>
+    <font><b/><sz val="12.5"/><color rgb="FF1A2B4C"/><name val="Meiryo UI"/></font>
+    <font><b/><sz val="8.5"/><color rgb="FF800020"/><name val="Meiryo UI"/></font>
+    <font><b/><sz val="12.5"/><color rgb="FF800020"/><name val="Meiryo UI"/></font>
+    <font><b/><sz val="9.5"/><color rgb="FF1A2B4C"/><name val="Meiryo UI"/></font>
   </fonts>
-  <fills count="7">
+  <fills count="8">
     <fill><patternFill patternType="none"/></fill>
     <fill><patternFill patternType="gray125"/></fill>
     <fill><patternFill patternType="solid"><fgColor rgb="FF1A2B4C"/></patternFill></fill>
@@ -8052,8 +9538,9 @@ function Export-AnalysisToOpenXml {
     <fill><patternFill patternType="solid"><fgColor rgb="FFF7F7F7"/></patternFill></fill>
     <fill><patternFill patternType="solid"><fgColor rgb="FFF5F5F5"/></patternFill></fill>
     <fill><patternFill patternType="solid"><fgColor rgb="FFFFFFFF"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFEAEAEA"/></patternFill></fill>
   </fills>
-  <borders count="4">
+  <borders count="10">
     <border><left/><right/><top/><bottom/><diagonal/></border>
     <border>
       <left style="thin"><color rgb="FFD9D9D9"/></left>
@@ -8074,9 +9561,48 @@ function Export-AnalysisToOpenXml {
       <bottom style="thin"><color rgb="FF1A2B4C"/></bottom>
       <diagonal/>
     </border>
+    <border>
+      <left style="medium"><color rgb="FF1A2B4C"/></left>
+      <right/><top/>
+      <bottom style="thin"><color rgb="FF1A2B4C"/></bottom>
+      <diagonal/>
+    </border>
+    <border>
+      <left style="thin"><color rgb="FFD9D9D9"/></left>
+      <right style="thin"><color rgb="FFD9D9D9"/></right>
+      <top style="medium"><color rgb="FF1A2B4C"/></top>
+      <bottom/><diagonal/>
+    </border>
+    <border>
+      <left style="thin"><color rgb="FFD9D9D9"/></left>
+      <right style="thin"><color rgb="FFD9D9D9"/></right>
+      <top style="medium"><color rgb="FF800020"/></top>
+      <bottom/><diagonal/>
+    </border>
+    <border>
+      <left style="thin"><color rgb="FFD9D9D9"/></left>
+      <right style="thin"><color rgb="FFD9D9D9"/></right>
+      <top/>
+      <bottom style="thin"><color rgb="FFD9D9D9"/></bottom>
+      <diagonal/>
+    </border>
+    <border>
+      <left style="thin"><color rgb="FFD9D9D9"/></left>
+      <right style="thin"><color rgb="FFD9D9D9"/></right>
+      <top style="thin"><color rgb="FF1A2B4C"/></top>
+      <bottom style="thin"><color rgb="FF1A2B4C"/></bottom>
+      <diagonal/>
+    </border>
+    <border>
+      <left style="medium"><color rgb="FF1A2B4C"/></left>
+      <right style="thin"><color rgb="FFD9D9D9"/></right>
+      <top style="thin"><color rgb="FFD9D9D9"/></top>
+      <bottom style="thin"><color rgb="FFD9D9D9"/></bottom>
+      <diagonal/>
+    </border>
   </borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="24">
+  <cellXfs count="39">
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
     <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf>
     <xf numFmtId="0" fontId="2" fillId="3" borderId="2" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf>
@@ -8101,6 +9627,21 @@ function Export-AnalysisToOpenXml {
     <xf numFmtId="0" fontId="4" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
     <xf numFmtId="164" fontId="4" fillId="5" borderId="1" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
     <xf numFmtId="0" fontId="5" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="6" fillId="3" borderId="4" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf>
+    <xf numFmtId="0" fontId="7" fillId="6" borderId="5" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="8" fillId="6" borderId="7" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="9" fillId="6" borderId="6" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="10" fillId="6" borderId="7" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="11" fillId="7" borderId="8" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
+    <xf numFmtId="164" fontId="11" fillId="7" borderId="8" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+    <xf numFmtId="165" fontId="11" fillId="7" borderId="8" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+    <xf numFmtId="166" fontId="11" fillId="7" borderId="8" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+    <xf numFmtId="167" fontId="11" fillId="7" borderId="8" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="11" fillId="7" borderId="8" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="164" fontId="4" fillId="7" borderId="8" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="0" fillId="4" borderId="9" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1" indent="1"/></xf>
+    <xf numFmtId="0" fontId="11" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="11" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
   </cellXfs>
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>
@@ -8136,11 +9677,11 @@ function Export-AnalysisToOpenXml {
         Add-ZipText 'xl/styles.xml' $stylesXml
 
         if ($hasChart1) {
-            $lastRow1 = 4 + $s1Rows.Count
+            $lastRow1 = $summaryLastRow1
             Add-ZipText 'xl/worksheets/_rels/sheet1.xml.rels' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>'
             Add-ZipText 'xl/drawings/_rels/drawing1.xml.rels' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>'
             Add-ZipText 'xl/drawings/drawing1.xml' ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>' + ($lastRow1 + 2) + '</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>10</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>' + ($lastRow1 + 17) + '</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>')
-            Add-ZipText 'xl/charts/chart1.xml' ("<?xml version=`"1.0`" encoding=`"UTF-8`" standalone=`"yes`"?><c:chartSpace xmlns:c=`"http://schemas.openxmlformats.org/drawingml/2006/chart`" xmlns:a=`"http://schemas.openxmlformats.org/drawingml/2006/main`"><c:spPr><a:solidFill><a:srgbClr val=`"FFFFFF`"/></a:solidFill><a:ln w=`"9525`"><a:solidFill><a:srgbClr val=`"D9D9D9`"/></a:solidFill></a:ln></c:spPr><c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr b=`"1`" sz=`"1050`"><a:solidFill><a:srgbClr val=`"1A2B4C`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:r><a:rPr lang=`"ja-JP`" b=`"1`" sz=`"1050`"><a:solidFill><a:srgbClr val=`"1A2B4C`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:rPr><a:t>テーブル別レコード数 TOP15</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=`"0`"/></c:title><c:plotArea><c:spPr><a:solidFill><a:srgbClr val=`"FFFFFF`"/></a:solidFill><a:ln><a:noFill/></a:ln></c:spPr><c:barChart><c:barDir val=`"bar`"/><c:grouping val=`"clustered`"/><c:gapWidth val=`"70`"/><c:ser><c:idx val=`"0`"/><c:order val=`"0`"/><c:spPr><a:solidFill><a:srgbClr val=`"1A2B4C`"/></a:solidFill><a:ln><a:noFill/></a:ln></c:spPr><c:dLbls><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz=`"800`"><a:solidFill><a:srgbClr val=`"333333`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:endParaRPr lang=`"ja-JP`"/></a:p></c:txPr><c:dLblPos val=`"outEnd`"/><c:showLegendKey val=`"0`"/><c:showVal val=`"1`"/><c:showCatName val=`"0`"/><c:showSerName val=`"0`"/><c:showPercent val=`"0`"/><c:showBubbleSize val=`"0`"/></c:dLbls><c:cat><c:strRef><c:f>'01_サマリー'!`$B`$5:`$B`$$lastRow1</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>'01_サマリー'!`$D`$5:`$D`$$lastRow1</c:f></c:numRef></c:val></c:ser><c:axId val=`"1`"/><c:axId val=`"2`"/></c:barChart><c:catAx><c:axId val=`"1`"/><c:scaling><c:orientation val=`"maxMin`"/></c:scaling><c:delete val=`"0`"/><c:axPos val=`"l`"/><c:tickLblPos val=`"low`"/><c:spPr><a:ln w=`"9525`"><a:solidFill><a:srgbClr val=`"D9D9D9`"/></a:solidFill></a:ln></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz=`"850`"><a:solidFill><a:srgbClr val=`"333333`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:endParaRPr lang=`"ja-JP`"/></a:p></c:txPr><c:crossAx val=`"2`"/></c:catAx><c:valAx><c:axId val=`"2`"/><c:scaling><c:orientation val=`"minMax`"/></c:scaling><c:delete val=`"0`"/><c:axPos val=`"b`"/><c:majorGridlines><c:spPr><a:ln w=`"9525`"><a:solidFill><a:srgbClr val=`"E6E6E6`"/></a:solidFill></a:ln></c:spPr></c:majorGridlines><c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz=`"850`"><a:solidFill><a:srgbClr val=`"333333`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:endParaRPr lang=`"ja-JP`"/></a:p></c:txPr><c:crossAx val=`"1`"/></c:valAx></c:plotArea></c:chart></c:chartSpace>")
+            Add-ZipText 'xl/charts/chart1.xml' ("<?xml version=`"1.0`" encoding=`"UTF-8`" standalone=`"yes`"?><c:chartSpace xmlns:c=`"http://schemas.openxmlformats.org/drawingml/2006/chart`" xmlns:a=`"http://schemas.openxmlformats.org/drawingml/2006/main`"><c:spPr><a:solidFill><a:srgbClr val=`"FFFFFF`"/></a:solidFill><a:ln w=`"9525`"><a:solidFill><a:srgbClr val=`"D9D9D9`"/></a:solidFill></a:ln></c:spPr><c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr b=`"1`" sz=`"1050`"><a:solidFill><a:srgbClr val=`"1A2B4C`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:r><a:rPr lang=`"ja-JP`" b=`"1`" sz=`"1050`"><a:solidFill><a:srgbClr val=`"1A2B4C`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:rPr><a:t>テーブル別レコード数 TOP15</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=`"0`"/></c:title><c:plotArea><c:spPr><a:solidFill><a:srgbClr val=`"FFFFFF`"/></a:solidFill><a:ln><a:noFill/></a:ln></c:spPr><c:barChart><c:barDir val=`"bar`"/><c:grouping val=`"clustered`"/><c:gapWidth val=`"70`"/><c:ser><c:idx val=`"0`"/><c:order val=`"0`"/><c:spPr><a:solidFill><a:srgbClr val=`"1A2B4C`"/></a:solidFill><a:ln><a:noFill/></a:ln></c:spPr><c:dLbls><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz=`"800`"><a:solidFill><a:srgbClr val=`"333333`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:endParaRPr lang=`"ja-JP`"/></a:p></c:txPr><c:dLblPos val=`"outEnd`"/><c:showLegendKey val=`"0`"/><c:showVal val=`"1`"/><c:showCatName val=`"0`"/><c:showSerName val=`"0`"/><c:showPercent val=`"0`"/><c:showBubbleSize val=`"0`"/></c:dLbls><c:cat><c:strRef><c:f>'01_サマリー'!`$B`$${topStartRow1}:`$B`$${topEndRow1}</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>'01_サマリー'!`$D`$${topStartRow1}:`$D`$${topEndRow1}</c:f></c:numRef></c:val></c:ser><c:axId val=`"1`"/><c:axId val=`"2`"/></c:barChart><c:catAx><c:axId val=`"1`"/><c:scaling><c:orientation val=`"maxMin`"/></c:scaling><c:delete val=`"0`"/><c:axPos val=`"l`"/><c:tickLblPos val=`"low`"/><c:spPr><a:ln w=`"9525`"><a:solidFill><a:srgbClr val=`"D9D9D9`"/></a:solidFill></a:ln></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz=`"850`"><a:solidFill><a:srgbClr val=`"333333`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:endParaRPr lang=`"ja-JP`"/></a:p></c:txPr><c:crossAx val=`"2`"/></c:catAx><c:valAx><c:axId val=`"2`"/><c:scaling><c:orientation val=`"minMax`"/></c:scaling><c:delete val=`"0`"/><c:axPos val=`"b`"/><c:majorGridlines><c:spPr><a:ln w=`"9525`"><a:solidFill><a:srgbClr val=`"E6E6E6`"/></a:solidFill></a:ln></c:spPr></c:majorGridlines><c:spPr><a:ln><a:noFill/></a:ln></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz=`"850`"><a:solidFill><a:srgbClr val=`"333333`"/></a:solidFill><a:latin typeface=`"Meiryo UI`"/><a:ea typeface=`"Meiryo UI`"/></a:defRPr></a:pPr><a:endParaRPr lang=`"ja-JP`"/></a:p></c:txPr><c:crossAx val=`"1`"/></c:valAx></c:plotArea></c:chart></c:chartSpace>")
         }
         $zip.Dispose()
         $zip = $null
@@ -8167,6 +9708,7 @@ function Export-AnalysisReport {
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [string]$DbLabel = '',
         [string]$Engine = 'Auto',
+        [switch]$DetailedAnalysis,
         [scriptblock]$LogCallback = $null,
         [AuroraAnalyzer.OperationCancelState]$CancelState = $null,
         [scriptblock]$PumpCallback = $null
@@ -8175,7 +9717,7 @@ function Export-AnalysisReport {
     if ($null -ne $CancelState) { $CancelState.ThrowIfCancelled() }
 
     if ($Engine -eq 'OpenXml') {
-        Export-AnalysisToOpenXml -Analysis $Analysis -OutputPath $OutputPath -DbLabel $DbLabel -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
+        Export-AnalysisToOpenXml -Analysis $Analysis -OutputPath $OutputPath -DbLabel $DbLabel -DetailedAnalysis:$DetailedAnalysis -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
         return 'OpenXml'
     }
 
@@ -8190,7 +9732,7 @@ function Export-AnalysisReport {
 
     if ($comAvailable) {
         try {
-            Export-AnalysisToExcelCom -Analysis $Analysis -OutputPath $OutputPath -DbLabel $DbLabel -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
+            Export-AnalysisToExcelCom -Analysis $Analysis -OutputPath $OutputPath -DbLabel $DbLabel -DetailedAnalysis:$DetailedAnalysis -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
             return 'Com'
         }
         catch [AuroraAnalyzer.ExcelActivationException] {
@@ -8202,7 +9744,7 @@ function Export-AnalysisReport {
     }
     if ($null -ne $CancelState) { $CancelState.ThrowIfCancelled() }
     if ($null -ne $LogCallback) { & $LogCallback 'Excel COM を利用できないため OpenXML でレポートを生成します。' 60 }
-    Export-AnalysisToOpenXml -Analysis $Analysis -OutputPath $OutputPath -DbLabel $DbLabel -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
+    Export-AnalysisToOpenXml -Analysis $Analysis -OutputPath $OutputPath -DbLabel $DbLabel -DetailedAnalysis:$DetailedAnalysis -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
     return 'OpenXml'
 }
 
@@ -9494,6 +11036,7 @@ function Invoke-AnalyzerPipeline {
         [string]$BeforeAnalysisPath = '',
         [string]$AfterAnalysisPath = '',
         [switch]$Resume,
+        [switch]$DetailedAnalysis,
         [AuroraAnalyzer.OperationCancelState]$CancelState = $null,
         [scriptblock]$PumpCallback = $null
     )
@@ -9556,7 +11099,7 @@ function Invoke-AnalyzerPipeline {
             -PumpCallback $PumpCallback
 
         if ($null -ne $CancelState) { $CancelState.ThrowIfCancelled() }
-        $usedEngine = Export-AnalysisReport -Analysis $analysis -OutputPath $ExcelOutputPath -DbLabel $DbLabel -Engine $Engine -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
+        $usedEngine = Export-AnalysisReport -Analysis $analysis -OutputPath $ExcelOutputPath -DbLabel $DbLabel -Engine $Engine -DetailedAnalysis:$DetailedAnalysis -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
         Log ("完了 (DB直接分析 / Engine=$usedEngine): $ExcelOutputPath") 100
 
         return [PSCustomObject]@{
@@ -9602,7 +11145,7 @@ function Invoke-AnalyzerPipeline {
             Log ("CSV解析完了: {0} テーブル / 総レコード {1:N0} 件 / 検出警告 {2} 件 (高リスク {3} 件)" -f $analysis.TableCount, $analysis.TotalRows, $analysis.TotalWarningCount, $analysis.HighWarningCount) 58
 
             if ($null -ne $CancelState) { $CancelState.ThrowIfCancelled() }
-            $usedEngine = Export-AnalysisReport -Analysis $analysis -OutputPath $ExcelOutputPath -DbLabel $DbLabel -Engine $Engine -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
+            $usedEngine = Export-AnalysisReport -Analysis $analysis -OutputPath $ExcelOutputPath -DbLabel $DbLabel -Engine $Engine -DetailedAnalysis:$DetailedAnalysis -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
             if ($RunMode -eq 'ExportAndAnalyze') {
                 $checkpoint = Read-ExportProgress $CsvFolder
                 $checkpoint.Status = 'Completed'
@@ -9640,6 +11183,7 @@ function New-AnalyzerGuiForm {
         [string]$InitialAfterAnalysisPath = '',
         [string]$InitialMode = '',
         [switch]$InitialResume,
+        [switch]$InitialDetailedAnalysis,
         [ValidateSet('Auto','Com','OpenXml')][string]$InitialExcelEngine = 'Auto'
     )
 
@@ -9663,7 +11207,7 @@ function New-AnalyzerGuiForm {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Aurora Serverless v2 (MySQL 8.4.7) A5:SQL Mk-2 CSV一括出力・性能試験データ分析ツール'
     $form.AutoScaleMode = 'Dpi'
-    $form.Size = New-Object System.Drawing.Size(820, 764)
+    $form.Size = New-Object System.Drawing.Size(820, 788)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
@@ -10025,10 +11569,19 @@ function New-AnalyzerGuiForm {
     $form.Controls.Add($txtLog)
 
     # Bottom Controls
+    $chkDetailedAnalysis = New-Object System.Windows.Forms.CheckBox
+    $chkDetailedAnalysis.Name = 'DetailedAnalysis'
+    $chkDetailedAnalysis.Text = '詳細分析を出力する (分布・数値統計・時系列・関連・警告シートを追加)'
+    $chkDetailedAnalysis.Font = $fontMain; $chkDetailedAnalysis.ForeColor = $cText
+    $chkDetailedAnalysis.Location = New-Object System.Drawing.Point(16, 666)
+    $chkDetailedAnalysis.AutoSize = $true
+    $chkDetailedAnalysis.Checked = [bool]$InitialDetailedAnalysis
+    $form.Controls.Add($chkDetailedAnalysis)
+
     $chkOpenExcel = New-Object System.Windows.Forms.CheckBox
     $chkOpenExcel.Text = '完了後にExcelレポートを自動で開く'
     $chkOpenExcel.Font = $fontMain; $chkOpenExcel.ForeColor = $cText
-    $chkOpenExcel.Location = New-Object System.Drawing.Point(16, 666)
+    $chkOpenExcel.Location = New-Object System.Drawing.Point(16, 688)
     $chkOpenExcel.AutoSize = $true
     $chkOpenExcel.Checked = $true
     $form.Controls.Add($chkOpenExcel)
@@ -10037,7 +11590,7 @@ function New-AnalyzerGuiForm {
     $chkResume.Name = 'ResumeExport'
     $chkResume.Text = '出力済みCSVから続行 (中断後の再開・出力済みスキップ)'
     $chkResume.Font = $fontMain; $chkResume.ForeColor = $cText
-    $chkResume.Location = New-Object System.Drawing.Point(16, 688)
+    $chkResume.Location = New-Object System.Drawing.Point(16, 710)
     $chkResume.AutoSize = $true
     $chkResume.Checked = [bool]$InitialResume
     $form.Controls.Add($chkResume)
@@ -10048,7 +11601,7 @@ function New-AnalyzerGuiForm {
     $btnRun.BackColor = $cNavy
     $btnRun.ForeColor = $cWhite
     $btnRun.FlatStyle = 'Flat'
-    $btnRun.Location = New-Object System.Drawing.Point(466, 670)
+    $btnRun.Location = New-Object System.Drawing.Point(466, 686)
     $btnRun.Size = New-Object System.Drawing.Size(112, 36)
     $form.Controls.Add($btnRun)
 
@@ -10059,7 +11612,7 @@ function New-AnalyzerGuiForm {
     $btnCancel.BackColor = $cLight
     $btnCancel.ForeColor = $cMuted
     $btnCancel.FlatStyle = 'Flat'
-    $btnCancel.Location = New-Object System.Drawing.Point(586, 670)
+    $btnCancel.Location = New-Object System.Drawing.Point(586, 686)
     $btnCancel.Size = New-Object System.Drawing.Size(102, 36)
     $btnCancel.Enabled = $false
     $btnCancel.Cursor = [System.Windows.Forms.Cursors]::Default
@@ -10071,7 +11624,7 @@ function New-AnalyzerGuiForm {
     $btnClose.BackColor = $cLight
     $btnClose.ForeColor = $cText
     $btnClose.FlatStyle = 'Flat'
-    $btnClose.Location = New-Object System.Drawing.Point(696, 670)
+    $btnClose.Location = New-Object System.Drawing.Point(696, 686)
     $btnClose.Size = New-Object System.Drawing.Size(94, 36)
     $btnClose.Cursor = [System.Windows.Forms.Cursors]::Default
     $btnClose.Add_Click({ $form.Close() }.GetNewClosure())
@@ -10232,6 +11785,7 @@ function New-AnalyzerGuiForm {
         $needOut = $rbFull.Checked -or $rbAnalyze.Checked -or $isCompare -or $isDirect
         $needInFolder = $rbFull.Checked -or $rbAnalyze.Checked -or $rbExportOnly.Checked
         $needResume = $rbFull.Checked -or $rbExportOnly.Checked
+        $needAnalysisOut = $rbFull.Checked -or $rbAnalyze.Checked -or $isDirect
 
         $gbA5.Visible = -not $isCompare
         $gbA5.Enabled = $needDb -and (-not $guiRunState.IsRunning)
@@ -10242,6 +11796,7 @@ function New-AnalyzerGuiForm {
         $btnBrowseIn.Enabled = $needInFolder
         $txtOutFile.Enabled = $needOut
         $btnBrowseOut.Enabled = $needOut
+        $chkDetailedAnalysis.Enabled = $needAnalysisOut -and (-not $guiRunState.IsRunning)
         $chkOpenExcel.Enabled = $needOut -and (-not $guiRunState.IsRunning)
         $chkResume.Enabled = $needResume -and (-not $guiRunState.IsRunning)
         if ($needResume -and -not [string]::IsNullOrWhiteSpace($txtInFolder.Text)) { & $inspectResumeFolder }
@@ -10485,6 +12040,7 @@ function New-AnalyzerGuiForm {
 
         $maxR = 0; [void][int]::TryParse($txtMaxRows.Text, [ref]$maxR)
         $useResume = $chkResume.Checked -and ($runMode -eq 'ExportAndAnalyze' -or $runMode -eq 'ExportOnly')
+        $useDetailed = $chkDetailedAnalysis.Checked -and ($runMode -eq 'AnalyzeOnly' -or $runMode -eq 'ExportAndAnalyze' -or $runMode -eq 'DirectAnalyze')
 
         $cancelState = New-Object AuroraAnalyzer.OperationCancelState
         $guiRunState.IsRunning = $true
@@ -10495,6 +12051,7 @@ function New-AnalyzerGuiForm {
         $gbPath.Enabled = $false
         $gbA5.Enabled = $false
         $gbCompare.Enabled = $false
+        $chkDetailedAnalysis.Enabled = $false
         $chkOpenExcel.Enabled = $false
         $chkResume.Enabled = $false
         $btnRun.Enabled = $false
@@ -10519,9 +12076,11 @@ function New-AnalyzerGuiForm {
                 -BeforeAnalysisPath $beforeFile `
                 -AfterAnalysisPath $afterFile `
                 -Resume:$useResume `
+                -DetailedAnalysis:$useDetailed `
                 -CancelState $cancelState `
                 -PumpCallback $pumpUi
 
+            $sheetModeLabel = if ($useDetailed) { '詳細分析 (8シート)' } else { '標準出力 (3シート)' }
             $msgDone = if ($runMode -eq 'ExportOnly') {
                 $skipCnt = @($res.ExportedTables | Where-Object { $_.Skipped }).Count
                 $newCnt = $res.ExportedTables.Count - $skipCnt
@@ -10537,10 +12096,10 @@ function New-AnalyzerGuiForm {
                 "テスト前後の分析ファイル比較レポートの出力が完了しました。`n`n出力ファイル: $($res.OutputPath)`n比較対象テーブル数: $($cmp.TotalUniqueTableCount) 件`n更新のあったテーブル: $($cmp.UpdatedSheetCount) 件 / 追加のあったテーブル: $($cmp.AddedSheetCount) 件 / 変更なし: $($cmp.UnchangedTableCount) 件`n削除・消失テーブル: $($cmp.DeletedTableCount) 件 / 総レコード増減: $(if ($cmp.TotalRowDelta -gt 0) { '+' } else { '' })$($cmp.TotalRowDelta.ToString('N0')) 件"
             }
             elseif ($runMode -eq 'DirectAnalyze') {
-                "DB直接接続による性能試験用データ分析レポートの出力が完了しました（CSV未出力）。`n`n出力ファイル: $($res.OutputPath)`n対象テーブル数: $($res.Analysis.TableCount) / 総レコード数: $($res.Analysis.TotalRows.ToString('N0')) 件`n検出警告: 高 $($res.Analysis.HighWarningCount) 件 / 合計 $($res.Analysis.TotalWarningCount) 件"
+                "DB直接接続による性能試験用データ分析レポートの出力が完了しました（CSV未出力）。`n`n出力ファイル: $($res.OutputPath)`n出力シート構成: $sheetModeLabel`n対象テーブル数: $($res.Analysis.TableCount) / 総レコード数: $($res.Analysis.TotalRows.ToString('N0')) 件`n検出警告: 高 $($res.Analysis.HighWarningCount) 件 / 合計 $($res.Analysis.TotalWarningCount) 件"
             }
             else {
-                "性能試験用データ分析レポートの出力が完了しました。`n`n出力ファイル: $($res.OutputPath)`n対象テーブル数: $($res.Analysis.TableCount) / 総レコード数: $($res.Analysis.TotalRows.ToString('N0')) 件`n検出警告: 高 $($res.Analysis.HighWarningCount) 件 / 合計 $($res.Analysis.TotalWarningCount) 件"
+                "性能試験用データ分析レポートの出力が完了しました。`n`n出力ファイル: $($res.OutputPath)`n出力シート構成: $sheetModeLabel`n対象テーブル数: $($res.Analysis.TableCount) / 総レコード数: $($res.Analysis.TotalRows.ToString('N0')) 件`n検出警告: 高 $($res.Analysis.HighWarningCount) 件 / 合計 $($res.Analysis.TotalWarningCount) 件"
             }
             & $ShowMessage $form $msgDone '完了' 'Information'
 
@@ -10640,7 +12199,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             -InitialA5DbName $A5DbName `
             -InitialBeforeAnalysisPath $BeforeAnalysisPath `
             -InitialAfterAnalysisPath $AfterAnalysisPath `
-            -InitialResume:$Resume -InitialExcelEngine $ExcelEngine
+            -InitialResume:$Resume -InitialDetailedAnalysis:$DetailedAnalysis -InitialExcelEngine $ExcelEngine
         [void]$frm.ShowDialog()
         $frm.Dispose()
         exit 0
@@ -10769,6 +12328,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             -ExcTables $ExcludeTables `
             -Engine $ExcelEngine `
             -Resume:$Resume `
+            -DetailedAnalysis:$DetailedAnalysis `
             -CancelState $cliCancelState -PumpCallback $consolePump
 
         if ($OpenAfterCreate -and $resolvedMode -ne 'ExportOnly' -and (Test-Path -LiteralPath $res.OutputPath)) {
