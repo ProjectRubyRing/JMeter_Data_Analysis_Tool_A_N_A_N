@@ -1328,9 +1328,13 @@ namespace AuroraTestMock
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $diffXmlOut)) "Two-stage .bat CompareAnalysis (OpenXML fallback) exited 0 and created comparison report"
     if ($LASTEXITCODE -ne 0) { Write-Host ($batCmpXml -join "`n") -ForegroundColor Red }
 
-    # 8.11 Deep OOXML verification of Comparison Excel reports (Sheets, Meiryo UI, #333333 / #1A2B4C / #800020, Charts, Cell Contents)
-    $expectedCmpSheets = @('01_比較サマリー', '02_全テーブル比較一覧', '03_更新のあったテーブル', '04_追加のあったテーブル', '05_変更のなかったテーブル', '06_カラム・統計差分詳細')
-    foreach ($pair in @(@{ Name = 'Compare COM'; Path = $diffComOut; MinCharts = 4 }, @{ Name = 'Compare OpenXML'; Path = $diffXmlOut; MinCharts = 1 })) {
+    # 8.11 Deep OOXML verification of Comparison Excel reports (8 Sheets, Meiryo UI, #333333 / #1A2B4C / #800020, Charts, Cell Contents)
+    $expectedCmpSheets = @(
+        '01_比較サマリー', '02_全テーブル比較一覧', '03_更新のあったテーブル',
+        '04_追加のあったテーブル', '05_変更のなかったテーブル', '06_カラム・統計差分詳細',
+        '07_全カラム比較一覧', '08_性能・DB・時系列・品質変化'
+    )
+    foreach ($pair in @(@{ Name = 'Compare COM'; Path = $diffComOut; MinCharts = 5 }, @{ Name = 'Compare OpenXML'; Path = $diffXmlOut; MinCharts = 1 })) {
         $z = [System.IO.Compression.ZipFile]::OpenRead($pair.Path)
         try {
             $wbSr = New-Object System.IO.StreamReader($z.GetEntry('xl/workbook.xml').Open()); $wbText = $wbSr.ReadToEnd(); $wbSr.Dispose()
@@ -1338,7 +1342,7 @@ namespace AuroraTestMock
 
             $allCmpSheets = $true
             foreach ($sn in $expectedCmpSheets) { if ($wbText -notmatch [regex]::Escape($sn)) { $allCmpSheets = $false } }
-            Assert-True $allCmpSheets "[$($pair.Name)] All 6 Japanese comparison worksheets exist in xl/workbook.xml"
+            Assert-True $allCmpSheets "[$($pair.Name)] All 8 Japanese comparison worksheets exist in xl/workbook.xml"
             Assert-True ($stText -match 'Meiryo UI') "[$($pair.Name)] Meiryo UI font verified in xl/styles.xml"
             Assert-True ($stText -match '333333') "[$($pair.Name)] Exact Dark Gray (#333333) verified in xl/styles.xml"
             Assert-True ($stText -match '1A2B4C') "[$($pair.Name)] Exact Midnight Navy (#1A2B4C) verified in xl/styles.xml"
@@ -1351,12 +1355,13 @@ namespace AuroraTestMock
                 Assert-True ($cText -match 'Meiryo UI') "[$($pair.Name)] Comparison chart XML uses Meiryo UI font"
             }
 
-            # Verify sheet content routing (updated/added/unchanged tables appear in their expected sheets)
+            # Verify sheet content routing (updated/added/unchanged tables + changed/unchanged columns + diagnostics)
             $allXmlText = ''
-            foreach ($ze in $z.Entries | Where-Object { $_.FullName -match '^xl/(sharedStrings|worksheets/sheet[3456])\.xml$' }) {
+            foreach ($ze in $z.Entries | Where-Object { $_.FullName -match '^xl/(sharedStrings|worksheets/sheet[345678])\.xml$' }) {
                 $sr = New-Object System.IO.StreamReader($ze.Open()); $allXmlText += $sr.ReadToEnd(); $sr.Dispose()
             }
             Assert-True ($allXmlText -match 'users' -and $allXmlText -match 'new_batch_results' -and $allXmlText -match 'm_products' -and $allXmlText -match 'legacy_temp') "[$($pair.Name)] All categorized table names present in comparison workbook XML"
+            Assert-True ($allXmlText -match '変更なし' -and $allXmlText -match 'ハッシュ完全一致' -and $allXmlText -match '性能リスク・警告の推移') "[$($pair.Name)] Sheets 05/07/08 include unchanged column/table evidence and deep diagnostic sections"
         }
         finally { $z.Dispose() }
     }
@@ -1669,6 +1674,566 @@ namespace AuroraTestMock
     if ($drExited) { $drProc.WaitForExit() }
     $drErr = $drDrain.GetStderrText()
     Assert-True ($drExited -and $drErr -match 'STDERR_MARKER') "ProcessOutputDrain drains high-volume stdout/stderr asynchronously without pipe deadlock"
+
+    Write-Host "`n=== 10. DirectDB (No-CSV) Before/After Rich Comparison, CustomXML Snapshot, Hidden-Update, DB Metadata & Legacy Fallback ===" -ForegroundColor Cyan
+
+    # 10.1 Rich Aurora MySQL 8.4.7 Mock Server with full information_schema + SHOW GLOBAL STATUS/VARIABLES + Before/After phases
+    $richMockCs = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+namespace AuroraTestMock
+{
+    public class RichDirectDbMockServer : IDisposable
+    {
+        private TcpListener _listener;
+        private Thread _thread;
+        private volatile bool _stop;
+        public int Port { get; private set; }
+        public string Phase { get; set; } // "before" or "after"
+
+        public RichDirectDbMockServer()
+        {
+            Phase = "before";
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            _thread = new Thread(RunLoop);
+            _thread.IsBackground = true;
+            _thread.Start();
+        }
+
+        private void RunLoop()
+        {
+            while (!_stop)
+            {
+                try
+                {
+                    if (!_listener.Pending()) { Thread.Sleep(15); continue; }
+                    using (TcpClient client = _listener.AcceptTcpClient())
+                    {
+                        try { HandleClient(client); }
+                        catch (IOException) { }
+                        catch (SocketException) { }
+                    }
+                }
+                catch { break; }
+            }
+        }
+
+        private void HandleClient(TcpClient client)
+        {
+            NetworkStream ns = client.GetStream();
+            byte seq = 0;
+            byte[] nonce = Encoding.ASCII.GetBytes("12345678901234567890");
+            using (MemoryStream ms = new MemoryStream())
+            {
+                ms.WriteByte(0x0A);
+                byte[] ver = Encoding.ASCII.GetBytes("8.4.7-aurora-rich\0");
+                ms.Write(ver, 0, ver.Length);
+                ms.Write(new byte[] { 1, 0, 0, 0 }, 0, 4);
+                ms.Write(nonce, 0, 8);
+                ms.WriteByte(0x00);
+                ushort lowCaps = 0xA20D;
+                ms.WriteByte((byte)(lowCaps & 0xFF)); ms.WriteByte((byte)(lowCaps >> 8));
+                ms.WriteByte(255);
+                ms.Write(new byte[] { 2, 0 }, 0, 2);
+                ushort hiCaps = 0x000A;
+                ms.WriteByte((byte)(hiCaps & 0xFF)); ms.WriteByte((byte)(hiCaps >> 8));
+                ms.WriteByte(21);
+                ms.Write(new byte[10], 0, 10);
+                ms.Write(nonce, 8, 12);
+                ms.WriteByte(0x00);
+                byte[] plug = Encoding.ASCII.GetBytes("caching_sha2_password\0");
+                ms.Write(plug, 0, plug.Length);
+                WritePkt(ns, ms.ToArray(), ref seq);
+            }
+            ReadPkt(ns, ref seq);
+            WritePkt(ns, new byte[] { 0x01, 0x03 }, ref seq);
+            WritePkt(ns, new byte[] { 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 }, ref seq);
+
+            while (!_stop)
+            {
+                byte[] cmd;
+                try { cmd = ReadPkt(ns, ref seq); }
+                catch { break; }
+                if (cmd.Length == 0 || cmd[0] == 0x01) break;
+                if (cmd[0] != 0x03) continue;
+                string sql = Encoding.UTF8.GetString(cmd, 1, cmd.Length - 1).Trim();
+                bool isAfter = string.Equals(Phase, "after", StringComparison.OrdinalIgnoreCase);
+
+                if (sql.StartsWith("SET ", StringComparison.OrdinalIgnoreCase))
+                {
+                    WritePkt(ns, new byte[] { 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 }, ref seq);
+                }
+                else if (sql.IndexOf("SHOW GLOBAL STATUS", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string[][] rows = isAfter ? new string[][] {
+                        new string[] { "Uptime", "10600" },
+                        new string[] { "Questions", "17000" },
+                        new string[] { "Com_select", "12000" },
+                        new string[] { "Com_insert", "2400" },
+                        new string[] { "Com_update", "1500" },
+                        new string[] { "Com_delete", "250" },
+                        new string[] { "Com_commit", "4000" },
+                        new string[] { "Com_rollback", "12" },
+                        new string[] { "Slow_queries", "5" },
+                        new string[] { "Innodb_rows_read", "85000" },
+                        new string[] { "Innodb_rows_inserted", "2400" },
+                        new string[] { "Innodb_rows_updated", "1500" },
+                        new string[] { "Innodb_rows_deleted", "250" },
+                        new string[] { "Innodb_row_lock_waits", "8" },
+                        new string[] { "Innodb_row_lock_time", "240" },
+                        new string[] { "Innodb_buffer_pool_read_requests", "500000" },
+                        new string[] { "Innodb_buffer_pool_reads", "2500" },
+                        new string[] { "Threads_running", "6" },
+                        new string[] { "Max_used_connections", "45" }
+                    } : new string[][] {
+                        new string[] { "Uptime", "10000" },
+                        new string[] { "Questions", "5000" },
+                        new string[] { "Com_select", "4000" },
+                        new string[] { "Com_insert", "400" },
+                        new string[] { "Com_update", "300" },
+                        new string[] { "Com_delete", "50" },
+                        new string[] { "Com_commit", "700" },
+                        new string[] { "Com_rollback", "2" },
+                        new string[] { "Slow_queries", "0" },
+                        new string[] { "Innodb_rows_read", "15000" },
+                        new string[] { "Innodb_rows_inserted", "400" },
+                        new string[] { "Innodb_rows_updated", "300" },
+                        new string[] { "Innodb_rows_deleted", "50" },
+                        new string[] { "Innodb_row_lock_waits", "0" },
+                        new string[] { "Innodb_row_lock_time", "0" },
+                        new string[] { "Innodb_buffer_pool_read_requests", "100000" },
+                        new string[] { "Innodb_buffer_pool_reads", "500" },
+                        new string[] { "Threads_running", "2" },
+                        new string[] { "Max_used_connections", "10" }
+                    };
+                    SendResultSet(ns, new string[] { "Variable_name", "Value" }, rows, ref seq);
+                }
+                else if (sql.IndexOf("SHOW GLOBAL VARIABLES", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    SendResultSet(ns, new string[] { "Variable_name", "Value" }, new string[][] {
+                        new string[] { "version", "8.4.7" },
+                        new string[] { "aurora_version", "3.09.0" },
+                        new string[] { "innodb_buffer_pool_size", "1073741824" },
+                        new string[] { "max_connections", "500" },
+                        new string[] { "character_set_server", "utf8mb4" }
+                    }, ref seq);
+                }
+                else if (sql.IndexOf("information_schema.TABLES", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                         sql.IndexOf("DATA_LENGTH", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string[] cols = new string[] { "TABLE_NAME", "ENGINE", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME", "UPDATE_TIME", "TABLE_COLLATION", "TABLE_COMMENT" };
+                    string[][] rows = isAfter ? new string[][] {
+                        new string[] { "config_settings", "InnoDB", "Dynamic", "4", "128", "16384", "0", "0", "5", "2026-01-01 00:00:00", "2026-11-24 15:10:00", "utf8mb4_0900_ai_ci", "" },
+                        new string[] { "m_master", "InnoDB", "Dynamic", "3", "96", "16384", "0", "0", "4", "2026-01-01 00:00:00", "2026-01-01 00:00:00", "utf8mb4_0900_ai_ci", "マスタ" },
+                        new string[] { "new_audit", "InnoDB", "Dynamic", "4", "128", "16384", "0", "0", "5", "2026-11-24 15:00:00", "2026-11-24 15:10:00", "utf8mb4_0900_ai_ci", "" },
+                        new string[] { "orders", "InnoDB", "Dynamic", "13", "256", "49152", "32768", "4096", "18", "2026-01-01 00:00:00", "2026-11-24 15:10:00", "utf8mb4_0900_ai_ci", "注文" },
+                        new string[] { "users", "InnoDB", "Dynamic", "5", "180", "16384", "16384", "0", "6", "2026-01-01 00:00:00", "2026-11-24 15:10:00", "utf8mb4_0900_ai_ci", "会員" }
+                    } : new string[][] {
+                        new string[] { "config_settings", "InnoDB", "Dynamic", "4", "128", "16384", "0", "0", "5", "2026-01-01 00:00:00", "2026-01-01 00:00:00", "utf8mb4_0900_ai_ci", "" },
+                        new string[] { "m_master", "InnoDB", "Dynamic", "3", "96", "16384", "0", "0", "4", "2026-01-01 00:00:00", "2026-01-01 00:00:00", "utf8mb4_0900_ai_ci", "マスタ" },
+                        new string[] { "orders", "InnoDB", "Dynamic", "10", "240", "16384", "16384", "0", "11", "2026-01-01 00:00:00", "2026-11-24 11:00:00", "utf8mb4_0900_ai_ci", "注文" },
+                        new string[] { "temp_work", "InnoDB", "Dynamic", "2", "64", "16384", "0", "0", "3", "2026-01-01 00:00:00", "2026-01-01 00:00:00", "utf8mb4_0900_ai_ci", "" },
+                        new string[] { "users", "InnoDB", "Dynamic", "5", "180", "16384", "0", "0", "6", "2026-01-01 00:00:00", "2026-01-01 00:00:00", "utf8mb4_0900_ai_ci", "会員" }
+                    };
+                    SendResultSet(ns, cols, rows, ref seq);
+                }
+                else if (sql.IndexOf("information_schema.COLUMNS", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string[] cols = new string[] { "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY", "COLUMN_DEFAULT", "EXTRA", "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_COMMENT" };
+                    List<string[]> rows = new List<string[]>();
+                    rows.Add(new string[] { "config_settings", "id", "1", "bigint", "NO", "PRI", null, "auto_increment", null, null, "" });
+                    rows.Add(new string[] { "config_settings", "cfg_key", "2", "varchar(64)", "NO", "UNI", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "config_settings", "cfg_val", "3", "varchar(64)", "NO", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "config_settings", "note", "4", "varchar(64)", "YES", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "m_master", "id", "1", "int", "NO", "PRI", null, "auto_increment", null, null, "" });
+                    rows.Add(new string[] { "m_master", "code", "2", "varchar(16)", "NO", "UNI", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "m_master", "label", "3", "varchar(64)", "NO", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "orders", "id", "1", "bigint", "NO", "PRI", null, "auto_increment", null, null, "" });
+                    rows.Add(new string[] { "orders", "user_id", "2", "bigint", "NO", "MUL", null, "", null, null, "" });
+                    rows.Add(new string[] { "orders", "status", "3", "varchar(20)", "NO", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "orders", "amount", "4", "int", "NO", "", null, "", null, null, "" });
+                    rows.Add(new string[] { "orders", "created_at", "5", "datetime", "NO", "", null, "", null, null, "" });
+                    rows.Add(new string[] { "users", "id", "1", "bigint", "NO", "PRI", null, "auto_increment", null, null, "" });
+                    rows.Add(new string[] { "users", "plan", "2", "varchar(20)", "NO", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "users", "status", "3", isAfter ? "varchar(40)" : "varchar(20)", "NO", isAfter ? "MUL" : "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    rows.Add(new string[] { "users", "created_at", "4", "datetime", "NO", "", null, "", null, null, "" });
+                    if (isAfter)
+                    {
+                        rows.Add(new string[] { "new_audit", "id", "1", "bigint", "NO", "PRI", null, "auto_increment", null, null, "" });
+                        rows.Add(new string[] { "new_audit", "event", "2", "varchar(32)", "NO", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    }
+                    else
+                    {
+                        rows.Add(new string[] { "temp_work", "id", "1", "bigint", "NO", "PRI", null, "auto_increment", null, null, "" });
+                        rows.Add(new string[] { "temp_work", "tag", "2", "varchar(32)", "NO", "", null, "", "utf8mb4", "utf8mb4_0900_ai_ci", "" });
+                    }
+                    SendResultSet(ns, cols, rows.ToArray(), ref seq);
+                }
+                else if (sql.IndexOf("information_schema.STATISTICS", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string[] cols = new string[] { "TABLE_NAME", "INDEX_NAME", "NON_UNIQUE", "SEQ_IN_INDEX", "COLUMN_NAME", "CARDINALITY", "INDEX_TYPE" };
+                    List<string[]> rows = new List<string[]>();
+                    rows.Add(new string[] { "orders", "PRIMARY", "0", "1", "id", isAfter ? "13" : "10", "BTREE" });
+                    rows.Add(new string[] { "orders", "idx_orders_user", "1", "1", "user_id", isAfter ? "6" : "5", "BTREE" });
+                    rows.Add(new string[] { "users", "PRIMARY", "0", "1", "id", "5", "BTREE" });
+                    if (isAfter) rows.Add(new string[] { "users", "idx_users_status", "1", "1", "status", "2", "BTREE" });
+                    SendResultSet(ns, cols, rows.ToArray(), ref seq);
+                }
+                else if (sql.IndexOf("information_schema.KEY_COLUMN_USAGE", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    SendResultSet(ns, new string[] { "CONSTRAINT_NAME", "TABLE_NAME", "COLUMN_NAME", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME" }, new string[][] {
+                        new string[] { "fk_orders_user", "orders", "user_id", "users", "id" }
+                    }, ref seq);
+                }
+                else if (sql.IndexOf("SHOW FULL TABLES", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string[][] rows = isAfter ? new string[][] {
+                        new string[] { "config_settings", "BASE TABLE" },
+                        new string[] { "m_master", "BASE TABLE" },
+                        new string[] { "new_audit", "BASE TABLE" },
+                        new string[] { "orders", "BASE TABLE" },
+                        new string[] { "users", "BASE TABLE" }
+                    } : new string[][] {
+                        new string[] { "config_settings", "BASE TABLE" },
+                        new string[] { "m_master", "BASE TABLE" },
+                        new string[] { "orders", "BASE TABLE" },
+                        new string[] { "temp_work", "BASE TABLE" },
+                        new string[] { "users", "BASE TABLE" }
+                    };
+                    SendResultSet(ns, new string[] { "Tables_in_richdb", "Table_type" }, rows, ref seq);
+                }
+                else if (sql.IndexOf("config_settings", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    // Stat-invariant hidden mutation on id=2: BBB2 -> BXY2 (same row count=4, same distinct=4, same len=4, same min=AAA1, same max=DDD4, same Top1!)
+                    string[][] rows = isAfter ? new string[][] {
+                        new string[] { "1", "K_01", "AAA1", "fixed" },
+                        new string[] { "2", "K_02", "BXY2", "fixed" },
+                        new string[] { "3", "K_03", "CCC3", "fixed" },
+                        new string[] { "4", "K_04", "DDD4", "fixed" }
+                    } : new string[][] {
+                        new string[] { "1", "K_01", "AAA1", "fixed" },
+                        new string[] { "2", "K_02", "BBB2", "fixed" },
+                        new string[] { "3", "K_03", "CCC3", "fixed" },
+                        new string[] { "4", "K_04", "DDD4", "fixed" }
+                    };
+                    SendResultSet(ns, new string[] { "id", "cfg_key", "cfg_val", "note" }, rows, ref seq);
+                }
+                else if (sql.IndexOf("m_master", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    SendResultSet(ns, new string[] { "id", "code", "label" }, new string[][] {
+                        new string[] { "1", "M01", "東京" },
+                        new string[] { "2", "M02", "大阪" },
+                        new string[] { "3", "M03", "福岡" }
+                    }, ref seq);
+                }
+                else if (sql.IndexOf("users", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string[][] rows = isAfter ? new string[][] {
+                        new string[] { "1", "STANDARD", "ACTIVE", "2026-01-01 09:00:00" },
+                        new string[] { "2", "STANDARD", "ACTIVE", "2026-01-02 09:00:00" },
+                        new string[] { "3", "PRO",      "ACTIVE", "2026-01-03 09:00:00" },
+                        new string[] { "4", "PRO",      "ACTIVE", "2026-01-04 09:00:00" },
+                        new string[] { "5", "STANDARD", "SUSPENDED", "2026-01-05 09:00:00" }
+                    } : new string[][] {
+                        new string[] { "1", "STANDARD", "ACTIVE", "2026-01-01 09:00:00" },
+                        new string[] { "2", "STANDARD", "ACTIVE", "2026-01-02 09:00:00" },
+                        new string[] { "3", "STANDARD", "ACTIVE", "2026-01-03 09:00:00" },
+                        new string[] { "4", "PRO",      "ACTIVE", "2026-01-04 09:00:00" },
+                        new string[] { "5", "STANDARD", "ACTIVE", "2026-01-05 09:00:00" }
+                    };
+                    SendResultSet(ns, new string[] { "id", "plan", "status", "created_at" }, rows, ref seq);
+                }
+                else if (sql.IndexOf("orders", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    List<string[]> rows = new List<string[]>();
+                    if (!isAfter)
+                    {
+                        rows.Add(new string[] { "1", "1", "PAID",    "1000", "2026-11-24 10:00:00" });
+                        rows.Add(new string[] { "2", "2", "PENDING", "2000", "2026-11-24 10:10:00" });
+                        rows.Add(new string[] { "3", "3", "PAID",    "3000", "2026-11-24 10:20:00" });
+                        rows.Add(new string[] { "4", "4", "PAID",    "4000", "2026-11-24 10:30:00" });
+                        rows.Add(new string[] { "5", "5", "PAID",    "5000", "2026-11-24 10:40:00" });
+                        rows.Add(new string[] { "6", "1", "PAID",    "6000", "2026-11-24 11:00:00" });
+                        rows.Add(new string[] { "7", "2", "PAID",    "7000", "2026-11-24 11:10:00" });
+                        rows.Add(new string[] { "8", "3", "PAID",    "8000", "2026-11-24 11:20:00" });
+                        rows.Add(new string[] { "9", "4", "PAID",    "9000", "2026-11-24 11:30:00" });
+                        rows.Add(new string[] { "10","5", "PAID",    "10000","2026-11-24 11:40:00" });
+                    }
+                    else
+                    {
+                        // id=1 DELETED; id=2 UPDATED (PENDING->PAID, 2000->2500); id=3..10 UNCHANGED; id=11..14 INSERTED (id=13 ERROR status, id=14 orphan user_id=999!)
+                        rows.Add(new string[] { "2", "2", "PAID",    "2500", "2026-11-24 10:10:00" });
+                        rows.Add(new string[] { "3", "3", "PAID",    "3000", "2026-11-24 10:20:00" });
+                        rows.Add(new string[] { "4", "4", "PAID",    "4000", "2026-11-24 10:30:00" });
+                        rows.Add(new string[] { "5", "5", "PAID",    "5000", "2026-11-24 10:40:00" });
+                        rows.Add(new string[] { "6", "1", "PAID",    "6000", "2026-11-24 11:00:00" });
+                        rows.Add(new string[] { "7", "2", "PAID",    "7000", "2026-11-24 11:10:00" });
+                        rows.Add(new string[] { "8", "3", "PAID",    "8000", "2026-11-24 11:20:00" });
+                        rows.Add(new string[] { "9", "4", "PAID",    "9000", "2026-11-24 11:30:00" });
+                        rows.Add(new string[] { "10","5", "PAID",    "10000","2026-11-24 11:40:00" });
+                        rows.Add(new string[] { "11","1", "PAID",    "1500", "2026-11-24 15:01:00" });
+                        rows.Add(new string[] { "12","2", "PAID",    "1800", "2026-11-24 15:05:00" });
+                        rows.Add(new string[] { "13","3", "ERROR",   "0",    "2026-11-24 15:10:00" });
+                        rows.Add(new string[] { "14","999","PAID",   "2200", "2026-11-24 15:15:00" });
+                    }
+                    SendResultSet(ns, new string[] { "id", "user_id", "status", "amount", "created_at" }, rows.ToArray(), ref seq);
+                }
+                else if (sql.IndexOf("new_audit", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    SendResultSet(ns, new string[] { "id", "event" }, new string[][] {
+                        new string[] { "1", "TEST_START" }, new string[] { "2", "LOAD_PEAK" },
+                        new string[] { "3", "CHECKPOINT" }, new string[] { "4", "TEST_END" }
+                    }, ref seq);
+                }
+                else if (sql.IndexOf("temp_work", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    SendResultSet(ns, new string[] { "id", "tag" }, new string[][] {
+                        new string[] { "1", "PRE_1" }, new string[] { "2", "PRE_2" }
+                    }, ref seq);
+                }
+                else
+                {
+                    SendResultSet(ns, new string[] { "k" }, new string[0][], ref seq);
+                }
+            }
+        }
+
+        private void SendResultSet(NetworkStream ns, string[] cols, string[][] rows, ref byte seq)
+        {
+            WritePkt(ns, new byte[] { (byte)cols.Length }, ref seq);
+            for (int c = 0; c < cols.Length; c++)
+            {
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    WriteLenStr(ms, "def"); WriteLenStr(ms, "richdb"); WriteLenStr(ms, "t"); WriteLenStr(ms, "t");
+                    WriteLenStr(ms, cols[c]); WriteLenStr(ms, cols[c]);
+                    ms.WriteByte(0x0C);
+                    byte flagsLow = (c == 0 && cols[c] == "id") ? (byte)0x02 : (byte)0x00;
+                    ms.Write(new byte[] { 0xFF, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFD, flagsLow, 0x00, 0x00, 0x00, 0x00 }, 0, 12);
+                    WritePkt(ns, ms.ToArray(), ref seq);
+                }
+            }
+            WritePkt(ns, new byte[] { 0xFE, 0x00, 0x00, 0x02, 0x00 }, ref seq);
+            foreach (string[] r in rows)
+            {
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    foreach (string cell in r)
+                    {
+                        if (cell == null) ms.WriteByte(0xFB);
+                        else WriteLenStr(ms, cell);
+                    }
+                    WritePkt(ns, ms.ToArray(), ref seq);
+                }
+            }
+            WritePkt(ns, new byte[] { 0xFE, 0x00, 0x00, 0x02, 0x00 }, ref seq);
+        }
+
+        private static void WriteLenStr(Stream s, string v)
+        {
+            byte[] b = Encoding.UTF8.GetBytes(v);
+            s.WriteByte((byte)b.Length);
+            s.Write(b, 0, b.Length);
+        }
+        private static byte[] ReadPkt(NetworkStream ns, ref byte seq)
+        {
+            byte[] hdr = new byte[4];
+            int off = 0;
+            while (off < 4) { int r = ns.Read(hdr, off, 4 - off); if (r <= 0) throw new EndOfStreamException(); off += r; }
+            int len = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16);
+            seq = (byte)(hdr[3] + 1);
+            byte[] body = new byte[len];
+            off = 0;
+            while (off < len) { int r = ns.Read(body, off, len - off); if (r <= 0) throw new EndOfStreamException(); off += r; }
+            return body;
+        }
+        private static void WritePkt(NetworkStream ns, byte[] body, ref byte seq)
+        {
+            byte[] hdr = new byte[] { (byte)(body.Length & 0xFF), (byte)((body.Length >> 8) & 0xFF), (byte)((body.Length >> 16) & 0xFF), seq++ };
+            ns.Write(hdr, 0, 4);
+            ns.Write(body, 0, body.Length);
+            ns.Flush();
+        }
+        public void Dispose()
+        {
+            _stop = true;
+            try { _listener.Stop(); } catch { }
+        }
+    }
+}
+'@
+    if (-not ([System.Management.Automation.PSTypeName]'AuroraTestMock.RichDirectDbMockServer').Type) {
+        Add-Type -TypeDefinition $richMockCs -ReferencedAssemblies @('System', 'System.Core')
+    }
+
+    $richDir = Join-Path $workDir 'direct_before_after_nocsv'
+    New-Item -ItemType Directory -Path $richDir -Force | Out-Null
+    $richMock = New-Object AuroraTestMock.RichDirectDbMockServer
+    try {
+        $richCfg = @{
+            ServerName = '127.0.0.1'; Port = $richMock.Port; Database = 'richdb'; UserName = 'tester'; Password = 'pw'
+            UseSshTunnel = $false; SshHost = ''; SshPort = 22; SshUser = ''; SshKeyPath = ''; SshPassphrase = ''
+            SslMode = 'Disabled'; SslCaCert = ''
+        }
+        $directBeforeCom = Join-Path $richDir 'Direct_Before_COM.xlsx'
+        $directBeforeXml = Join-Path $richDir 'Direct_Before_XML.xlsx'
+        $directAfterCom  = Join-Path $richDir 'Direct_After_COM.xlsx'
+        $directAfterXml  = Join-Path $richDir 'Direct_After_XML.xlsx'
+
+        $richMock.Phase = 'before'
+        $null = Invoke-AnalyzerPipeline -RunMode 'DirectAnalyze' -ConnConfig $richCfg -DbLabel 'Aurora_Perf_Direct' -ExcelOutputPath $directBeforeCom -Engine 'Com'
+        $null = Invoke-AnalyzerPipeline -RunMode 'DirectAnalyze' -ConnConfig $richCfg -DbLabel 'Aurora_Perf_Direct' -ExcelOutputPath $directBeforeXml -Engine 'OpenXml'
+        Start-Sleep -Seconds 2
+        $richMock.Phase = 'after'
+        $null = Invoke-AnalyzerPipeline -RunMode 'DirectAnalyze' -ConnConfig $richCfg -DbLabel 'Aurora_Perf_Direct' -ExcelOutputPath $directAfterCom -Engine 'Com'
+        $null = Invoke-AnalyzerPipeline -RunMode 'DirectAnalyze' -ConnConfig $richCfg -DbLabel 'Aurora_Perf_Direct' -ExcelOutputPath $directAfterXml -Engine 'OpenXml'
+
+        $csvCountInRichDir = @(Get-ChildItem -LiteralPath $richDir -Filter '*.csv' -Recurse).Count
+        Assert-True ($csvCountInRichDir -eq 0) "DirectAnalyze Before & After emitted ZERO CSV files ($csvCountInRichDir CSVs)"
+
+        # Verify both COM and OpenXML default-mode DirectAnalyze reports keep exact 3 visible sheets AND embed customXml/item1.xml
+        foreach ($rp in @(@{ Name = 'Direct Before COM'; Path = $directBeforeCom }, @{ Name = 'Direct Before XML'; Path = $directBeforeXml })) {
+            $rz = [System.IO.Compression.ZipFile]::OpenRead($rp.Path)
+            try {
+                $rWb = New-Object System.Xml.XmlDocument
+                $rSr = New-Object System.IO.StreamReader($rz.GetEntry('xl/workbook.xml').Open()); $rWb.LoadXml($rSr.ReadToEnd()); $rSr.Dispose()
+                $rNsm = New-Object System.Xml.XmlNamespaceManager (New-Object System.Xml.NameTable); $rNsm.AddNamespace('x', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main')
+                $rSheets = @($rWb.SelectNodes('//x:sheets/x:sheet', $rNsm) | ForEach-Object { $_.GetAttribute('name') })
+                $hasCustomXml = (@($rz.Entries | Where-Object { $_.FullName -like 'customXml/item*.xml' -and $_.FullName -notlike '*itemProps*' }).Count -ge 1)
+                Assert-True ($rSheets.Count -eq 3 -and $hasCustomXml) "[$($rp.Name)] Keeps exact 3 visible sheets while embedding lossless CustomXML snapshot"
+            }
+            finally { $rz.Dispose() }
+        }
+
+        # Verify real Microsoft Excel COM opens OpenXML-generated CustomXML workbook cleanly without corruption/repair
+        $xlOpenTest = $null; $wbOpenTest = $null; $xlOpenPid = 0
+        try {
+            $xlOpenTest = New-Object -ComObject Excel.Application
+            try { $xlOpenPid = [AuroraAnalyzer.ComHelper]::GetWindowProcessId([int]$xlOpenTest.Hwnd) } catch { $xlOpenPid = 0 }
+            $xlOpenTest.Visible = $false; $xlOpenTest.DisplayAlerts = $false
+            $wbOpenTest = $xlOpenTest.Workbooks.Open($directBeforeXml, 0, $true)
+            $openedSheets = $wbOpenTest.Worksheets.Count
+            $openedXmlParts = $wbOpenTest.CustomXMLParts.Count
+            Assert-True ($openedSheets -eq 3 -and $openedXmlParts -ge 1) "Real Excel COM opens OpenXML DirectAnalyze workbook cleanly (Sheets=$openedSheets, CustomXMLParts=$openedXmlParts)"
+            $wbOpenTest.Close($false)
+            $xlOpenTest.Quit()
+        }
+        finally {
+            if ($null -ne $wbOpenTest) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wbOpenTest) } catch {} }
+            if ($null -ne $xlOpenTest) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($xlOpenTest) } catch {} }
+            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+            if ($xlOpenPid -gt 0) { try { $p = [Diagnostics.Process]::GetProcessById($xlOpenPid); if (-not $p.HasExited -and -not $p.WaitForExit(1000)) { $p.Kill() } } catch {} }
+        }
+
+        # Verify cross-engine identity on DirectDB Before COM vs OpenXML (0 false positives!)
+        $directIdentity = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($directBeforeCom, $directBeforeXml)
+        Assert-True ($directIdentity.UsedFullSnapshot -and $directIdentity.TotalUniqueTableCount -eq 5 -and $directIdentity.UnchangedTableCount -eq 5 -and $directIdentity.ChangedTableCount -eq 0 -and $directIdentity.ChangedColumnTotal -eq 0) "DirectDB Before COM vs OpenXML yields 0 false positives (5/5 tables & all columns unchanged)"
+
+        # Verify rich DirectDB Before vs After comparison (default 3-sheet reports, ZERO CSV!)
+        $directCmp = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($directBeforeCom, $directAfterCom)
+        Assert-True ($directCmp.UsedFullSnapshot -and $directCmp.BeforeIsDirectDb -and $directCmp.AfterIsDirectDb -and $directCmp.BeforeSourceMode -eq 'DB直接' -and $directCmp.AfterSourceMode -eq 'DB直接') "DirectDB Before vs After uses full embedded CustomXML snapshot & DirectDB provenance"
+        Assert-True ($directCmp.HasElapsedTime -and $directCmp.HasDbPhysicalMeta -and $directCmp.HasDbServerStatus -and $directCmp.HasAnyRowChurn) "DirectDB comparison computes elapsed velocity, physical DB metadata, server status deltas, and PK row churn"
+
+        $dMaster = $directCmp.AllTables | Where-Object { $_.TableName -eq 'm_master' }
+        $dCfg    = $directCmp.AllTables | Where-Object { $_.TableName -eq 'config_settings' }
+        $dUsers  = $directCmp.AllTables | Where-Object { $_.TableName -eq 'users' }
+        $dOrders = $directCmp.AllTables | Where-Object { $_.TableName -eq 'orders' }
+        $dNew    = $directCmp.AllTables | Where-Object { $_.TableName -eq 'new_audit' }
+        $dDel    = $directCmp.AllTables | Where-Object { $_.TableName -eq 'temp_work' }
+
+        Assert-True ($dMaster.PrimaryStatus -eq '変更なし' -and $dMaster.ContentHashStatus -eq '一致' -and $dMaster.ChangedColumnCount -eq 0 -and $dMaster.UnchangedColumnCount -eq 3) "m_master verified as unchanged via exact 256-bit ContentHash (0 changed / 3 unchanged cols)"
+        Assert-True ($dCfg.PrimaryStatus -eq '更新（データ更新）' -and $dCfg.ContentHashStatus -eq '変化' -and $dCfg.HasRowChurn -and $dCfg.RowChurnExact -and $dCfg.UpdatedRows -eq 1 -and $dCfg.UnchangedRows -eq 3 -and $dCfg.InsertedRows -eq 0 -and $dCfg.DeletedRows -eq 0) "config_settings stat-invariant hidden mutation caught by ContentHash & PK RowChurn (Updated=1, Unchanged=3)"
+        $cfgValCol = $directCmp.AllColumnComparisons | Where-Object { $_.TableName -eq 'config_settings' -and $_.ColumnName -eq 'cfg_val' }
+        $cfgKeyCol = $directCmp.AllColumnComparisons | Where-Object { $_.TableName -eq 'config_settings' -and $_.ColumnName -eq 'cfg_key' }
+        Assert-True ($cfgValCol.IsChanged -and $cfgValCol.ContentHashStatus -eq '変化' -and (-not $cfgKeyCol.IsChanged) -and $cfgKeyCol.ContentHashStatus -eq '一致') "AllColumnComparisons pinpoints hidden changed column (cfg_val) while confirming unchanged sibling columns (cfg_key)"
+
+        Assert-True ($dOrders.PrimaryStatus -eq '追加・更新' -and $dOrders.RowDelta -eq 3 -and $dOrders.HasRowChurn -and $dOrders.RowChurnExact -and $dOrders.InsertedRows -eq 4 -and $dOrders.UpdatedRows -eq 1 -and $dOrders.DeletedRows -eq 1 -and $dOrders.UnchangedRows -eq 8) "orders exact PK RowChurn detects simultaneous +4 inserts, 1 update, -1 delete, 8 unchanged (net +3)"
+        Assert-True ($dOrders.HasAutoIncrement -and $dOrders.AutoIncrementDelta -eq 7 -and $dOrders.AutoIncrementGap -eq 4 -and $dOrders.DataLengthDeltaKB -gt 0 -and $dOrders.IndexLengthDeltaKB -gt 0 -and $dOrders.DataFreeDeltaKB -gt 0) "orders detects physical InnoDB Data/Index/DataFree growth and AUTO_INCREMENT rollback gap (+7 vs +3 = gap 4)"
+        Assert-True (@($dOrders.ColumnDiffs | Where-Object { $_.Category -eq 'カテゴリ分布' -and $_.Severity -eq '警告' -and $_.MetricName -match 'ERROR' -and $_.DeltaSummary -match '異常系値新規出現' }).Count -ge 1) "orders detects newly appeared anomaly/error category value 'ERROR' with 警告 alert"
+
+        Assert-True (@($directCmp.DbSchemaDiffs | Where-Object { $_.TableName -eq 'users' -and $_.ObjectType -eq 'カラムDDL' -and $_.ObjectName -eq 'status' }).Count -ge 1) "DbSchemaDiffs detects DDL type widening on users.status (varchar(20) -> varchar(40))"
+        Assert-True (@($directCmp.DbSchemaDiffs | Where-Object { $_.TableName -eq 'users' -and $_.ObjectType -eq 'インデックス' -and $_.ObjectName -eq 'idx_users_status' -and $_.ChangeType -eq '追加' }).Count -ge 1) "DbSchemaDiffs detects newly added index idx_users_status"
+        Assert-True ($directCmp.OrphanRowDelta -eq 1 -and @($directCmp.RelationshipComparisons | Where-Object { $_.RelationKey -eq 'users.id → orders.user_id' -and $_.OrphanDelta -eq 1 -and $_.HasAlert }).Count -eq 1) "RelationshipComparisons detects +1 new FK orphan row on users.id → orders.user_id"
+        Assert-True (@($directCmp.TimeSeriesDeltas | Where-Object { $_.TableColumn -eq 'orders.created_at' -and $_.Granularity -eq '時間帯別' -and $_.PeriodLabel -eq '15:00台' -and $_.DeltaCount -eq 4 }).Count -eq 1) "TimeSeriesDeltas captures exact +4 orders spike in 15:00台 time bucket"
+        Assert-True ($directCmp.ServerMetricComparisons.Count -ge 10 -and @($directCmp.ServerMetricComparisons | Where-Object { $_.MetricName -match 'Slow_queries' -and $_.DeltaValue -eq 5 -and $_.Severity -eq '警告' }).Count -eq 1 -and @($directCmp.ServerMetricComparisons | Where-Object { $_.MetricName -match 'Buffer Pool' }).Count -ge 1) "ServerMetricComparisons captures SHOW GLOBAL STATUS workload deltas, Slow_queries alert, and Buffer Pool hit ratio"
+        Assert-True ($dNew.PrimaryStatus -eq '追加（新規テーブル）' -and $dDel.PrimaryStatus -eq '削除（テーブル消失）' -and ($directCmp.ChangedColumnTotal + $directCmp.UnchangedColumnTotal) -eq $directCmp.TotalUniqueColumnCount) "New/deleted tables and complete changed+unchanged column totals are accounted accurately"
+
+        # Generate full 8-sheet comparison reports from DirectDB-Before & DirectDB-After via .bat (COM & OpenXML) + full WCAG/Design Audit
+        $directDiffCom = Join-Path $richDir 'Direct_Diff_COM.xlsx'
+        $directDiffXml = Join-Path $richDir 'Direct_Diff_XML.xlsx'
+        $batDirectCmpCom = cmd.exe /c "`"$batPath`" -Mode CompareAnalysis -NoGui -BeforeAnalysisPath `"$directBeforeCom`" -AfterAnalysisPath `"$directAfterCom`" -OutputPath `"$directDiffCom`" -ExcelEngine Com" 2>&1
+        Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $directDiffCom)) "Two-stage .bat CompareAnalysis on DirectDB reports (COM) succeeded"
+        if ($LASTEXITCODE -ne 0) { Write-Host ($batDirectCmpCom -join "`n") -ForegroundColor Red }
+        $batDirectCmpXml = cmd.exe /c "`"$batPath`" -Mode CompareAnalysis -NoGui -BeforeAnalysisPath `"$directBeforeXml`" -AfterAnalysisPath `"$directAfterXml`" -OutputPath `"$directDiffXml`" -ExcelEngine OpenXml" 2>&1
+        Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $directDiffXml)) "Two-stage .bat CompareAnalysis on DirectDB reports (OpenXML) succeeded"
+        if ($LASTEXITCODE -ne 0) { Write-Host ($batDirectCmpXml -join "`n") -ForegroundColor Red }
+
+        Test-WorkbookVisualAudit -Label 'DirectDB Compare COM (8-sheet rich)'     -XlsxPath $directDiffCom -IsAnalysisWorkbook $false -IsComWorkbook $true  -HasDetailedSheets $false
+        Test-WorkbookVisualAudit -Label 'DirectDB Compare OpenXML (8-sheet rich)' -XlsxPath $directDiffXml -IsAnalysisWorkbook $false -IsComWorkbook $false -HasDetailedSheets $false
+
+        # 10.4 Clock reversal & DB Restart/Failover detection (compare After -> Before reversed)
+        $revCmp = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($directAfterCom, $directBeforeCom)
+        Assert-True ($revCmp.ClockReversed -and $revCmp.DbRestartDetected -and ($revCmp.Insights -join "`n") -match '分析日時の逆転' -and ($revCmp.Insights -join "`n") -match '再起動/フェイルオーバー') "Swapped Before/After triggers ClockReversed and DbRestartDetected alerts accurately"
+    }
+    finally { $richMock.Dispose() }
+
+    # 10.2 Legacy .xlsx (NO customXml part) fallback & mixed legacy-vs-new 0-false-positive verification
+    function Copy-WithoutCustomXml([string]$Src, [string]$Dst) {
+        $srcZip = [System.IO.Compression.ZipFile]::OpenRead($Src)
+        $dstZip = [System.IO.Compression.ZipFile]::Open($Dst, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($e in $srcZip.Entries) {
+                if ($e.FullName -like 'customXml/*') { continue }
+                $ne = $dstZip.CreateEntry($e.FullName, [System.IO.Compression.CompressionLevel]::Optimal)
+                $inS = $e.Open(); $outS = $ne.Open()
+                try { $inS.CopyTo($outS) } finally { $inS.Dispose(); $outS.Dispose() }
+            }
+        }
+        finally { $srcZip.Dispose(); $dstZip.Dispose() }
+    }
+    $legacyBefore = Join-Path $workDir 'Legacy_Before_NoCustomXml.xlsx'
+    $legacyAfter  = Join-Path $workDir 'Legacy_After_NoCustomXml.xlsx'
+    Copy-WithoutCustomXml $beforeXmlXlsx $legacyBefore
+    Copy-WithoutCustomXml $afterXmlXlsx  $legacyAfter
+    $legSnap = [AuroraAnalyzer.AnalysisComparisonEngine]::LoadAnalysisWorkbook($legacyBefore)
+    $legVsNewSame = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($legacyBefore, $beforeXmlXlsx)
+    $legVsLegDiff = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($legacyBefore, $legacyAfter)
+    Assert-True (-not $legSnap.HasEmbeddedSnapshot) "Legacy workbook without customXml cleanly falls back to visible-sheet parsing"
+    Assert-True ($legVsNewSame.TotalUniqueTableCount -eq 7 -and $legVsNewSame.UnchangedTableCount -eq 7 -and $legVsNewSame.ChangedTableCount -eq 0) "Mixed Legacy (no customXml) vs New (with customXml) identical dataset yields 0 false positives (7/7 unchanged)"
+    Assert-True ($legVsLegDiff.TotalUniqueTableCount -eq 8 -and $legVsLegDiff.UnchangedTables.Count -eq 2 -and $legVsLegDiff.AddedTables.Count -eq 3 -and $legVsLegDiff.UpdatedTables.Count -eq 3 -and $legVsLegDiff.DeletedTables.Count -eq 1) "Legacy-vs-Legacy comparison preserves full 8-table bucket accuracy (Unchanged=2, Added=3, Updated=3, Deleted=1)"
+
+    # 10.3 Large-table Bottom-K coordinated sampling (> 2,048 rows) row churn estimation end-to-end through CustomXML
+    $bigDirB = Join-Path $workDir 'big_sketch_before'
+    $bigDirA = Join-Path $workDir 'big_sketch_after'
+    New-Item -ItemType Directory -Path $bigDirB, $bigDirA -Force | Out-Null
+    $bigLinesB = New-Object System.Collections.Generic.List[string]
+    $bigLinesB.Add('id,payload')
+    for ($i = 1; $i -le 3000; $i++) { $bigLinesB.Add("$i,val_$i") }
+    [System.IO.File]::WriteAllLines((Join-Path $bigDirB 'big_events.csv'), $bigLinesB, (New-Object System.Text.UTF8Encoding($false)))
+
+    $bigLinesA = New-Object System.Collections.Generic.List[string]
+    $bigLinesA.Add('id,payload')
+    for ($i = 51; $i -le 3200; $i++) {
+        $v = if ($i -le 150) { "mod_$i" } else { "val_$i" }
+        $bigLinesA.Add("$i,$v")
+    }
+    [System.IO.File]::WriteAllLines((Join-Path $bigDirA 'big_events.csv'), $bigLinesA, (New-Object System.Text.UTF8Encoding($false)))
+
+    $bigXlsxB = Join-Path $workDir 'big_before.xlsx'
+    $bigXlsxA = Join-Path $workDir 'big_after.xlsx'
+    $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $bigDirB -ExcelOutputPath $bigXlsxB -Engine 'OpenXml'
+    $null = Invoke-AnalyzerPipeline -RunMode 'AnalyzeOnly' -CsvFolder $bigDirA -ExcelOutputPath $bigXlsxA -Engine 'OpenXml'
+    $bigCmp = [AuroraAnalyzer.AnalysisComparisonEngine]::CompareAnalysisWorkbooks($bigXlsxB, $bigXlsxA)
+    $bigT = $bigCmp.AllTables[0]
+    Assert-True ($bigT.HasRowChurn -and (-not $bigT.RowChurnExact) -and $bigT.RowDelta -eq 150 -and ($bigT.InsertedRows - $bigT.DeletedRows) -eq 150 -and $bigT.UpdatedRows -ge 65 -and $bigT.UpdatedRows -le 135 -and $bigT.DeletedRows -ge 20 -and $bigT.DeletedRows -le 80 -and $bigT.InsertedRows -ge 155 -and $bigT.InsertedRows -le 245) "Bottom-K coordinated sketch (>2,048 rows) end-to-end accurately estimates churn (+$($bigT.InsertedRows) / upd $($bigT.UpdatedRows) / -$($bigT.DeletedRows) / unc $($bigT.UnchangedRows); exact net delta=+150)"
 
     Write-Host "`n============================================================" -ForegroundColor Cyan
     Write-Host "VERIFICATION SUMMARY: PASS = $passCount, FAIL = $failCount" -ForegroundColor $(if ($failCount -eq 0) { 'Green' } else { 'Red' })

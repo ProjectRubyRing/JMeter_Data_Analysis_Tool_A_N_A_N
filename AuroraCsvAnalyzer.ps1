@@ -437,6 +437,7 @@ namespace AuroraAnalyzer
         public string Name;
         public byte ColumnType;
         public ushort Charset;
+        public uint ColumnLength;
         public ushort Flags;
     }
 
@@ -1375,7 +1376,8 @@ namespace AuroraAnalyzer
                 {
                     info.Charset = (ushort)(pkt[p] | (pkt[p + 1] << 8));
                     p += 2;
-                    p += 4; // column_length
+                    info.ColumnLength = (uint)(pkt[p] | (pkt[p + 1] << 8) | (pkt[p + 2] << 16) | (pkt[p + 3] << 24));
+                    p += 4;
                     info.ColumnType = pkt[p++];
                     info.Flags = (ushort)(pkt[p] | (pkt[p + 1] << 8));
                 }
@@ -1576,6 +1578,479 @@ namespace AuroraAnalyzer
     // =========================================================================
     //  Performance-Testing CSV Statistical & Distribution Analyzer
     // =========================================================================
+    public struct RowSketchEntry
+    {
+        public ulong PkHash;
+        public ulong RowHash;
+    }
+
+    public class RowChurnSketch
+    {
+        public string KeyColumns;
+        public bool IsValid;
+        public bool IsExact;
+        public long TotalRows;
+        public ulong MaxKeptPkHash;
+        public List<RowSketchEntry> Entries;
+
+        public RowChurnSketch()
+        {
+            KeyColumns = "";
+            Entries = new List<RowSketchEntry>();
+        }
+    }
+
+    public class DbColumnMetadata
+    {
+        public string ColumnName;
+        public int OrdinalPosition;
+        public string ColumnType;
+        public string IsNullable;
+        public string ColumnKey;
+        public string ColumnDefault;
+        public string Extra;
+        public string CharacterSetName;
+        public string CollationName;
+        public string ColumnComment;
+
+        public DbColumnMetadata()
+        {
+            ColumnName = "";
+            ColumnType = "";
+            IsNullable = "";
+            ColumnKey = "";
+            ColumnDefault = "";
+            Extra = "";
+            CharacterSetName = "";
+            CollationName = "";
+            ColumnComment = "";
+        }
+    }
+
+    public class DbIndexMetadata
+    {
+        public string IndexName;
+        public bool NonUnique;
+        public string IndexType;
+        public string Columns;
+        public long Cardinality;
+
+        public DbIndexMetadata()
+        {
+            IndexName = "";
+            IndexType = "";
+            Columns = "";
+        }
+    }
+
+    public class DbForeignKeyMetadata
+    {
+        public string ConstraintName;
+        public string ColumnName;
+        public string ReferencedTableName;
+        public string ReferencedColumnName;
+
+        public DbForeignKeyMetadata()
+        {
+            ConstraintName = "";
+            ColumnName = "";
+            ReferencedTableName = "";
+            ReferencedColumnName = "";
+        }
+    }
+
+    public class DbTableMetadata
+    {
+        public bool HasMetadata;
+        public string Engine;
+        public string RowFormat;
+        public long EstTableRows;
+        public long AvgRowLength;
+        public long DataLength;
+        public long IndexLength;
+        public long DataFree;
+        public bool HasAutoIncrement;
+        public long AutoIncrement;
+        public string CreateTime;
+        public string UpdateTime;
+        public string TableCollation;
+        public string TableComment;
+        public List<DbIndexMetadata> Indexes;
+        public List<DbForeignKeyMetadata> DeclaredFks;
+
+        public DbTableMetadata()
+        {
+            Engine = "";
+            RowFormat = "";
+            CreateTime = "";
+            UpdateTime = "";
+            TableCollation = "";
+            TableComment = "";
+            Indexes = new List<DbIndexMetadata>();
+            DeclaredFks = new List<DbForeignKeyMetadata>();
+        }
+    }
+
+    public class DbServerMetadata
+    {
+        public bool HasVariables;
+        public bool HasStatus;
+        public Dictionary<string, string> Variables;
+        public Dictionary<string, long> StatusCounters;
+
+        public DbServerMetadata()
+        {
+            Variables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            StatusCounters = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    internal static class ContentHashHelper
+    {
+        internal static bool IsNullToken(string raw)
+        {
+            return raw == null || raw.Length == 0 || raw == "\\N" ||
+                   string.Equals(raw, "NULL", StringComparison.Ordinal) ||
+                   string.Equals(raw, "(null)", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static ulong Mix64(ulong z)
+        {
+            unchecked
+            {
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+                return z ^ (z >> 31);
+            }
+        }
+
+        internal static void HashString128(string s, out ulong h1, out ulong h2)
+        {
+            unchecked
+            {
+                ulong a = 0xCBF29CE484222325UL;
+                ulong b = 0x9E3779B97F4A7C15UL;
+                int len = s != null ? s.Length : 0;
+                int normLen = 0;
+                for (int i = 0; i < len; i++)
+                {
+                    char ch = s[i];
+                    if (ch == '\r' && i + 1 < len && s[i + 1] == '\n') continue;
+                    a = (a ^ ch) * 0x100000001B3UL;
+                    b = (b * 0x517CC1B727220A95UL) ^ ((ulong)ch + 0x9E3779B97F4A7C15UL);
+                    normLen++;
+                }
+                h1 = Mix64(a ^ ((ulong)normLen * 0x9E3779B185EBCA87UL));
+                h2 = Mix64(b ^ ((ulong)normLen * 0xC2B2AE3D27D4EB4FUL) ^ (h1 >> 17));
+            }
+        }
+
+        internal static void ComputeRowHash128(IList<string> values, int colCount, out ulong h1, out ulong h2)
+        {
+            unchecked
+            {
+                ulong a = 0x84222325CBF29CE4UL ^ ((ulong)colCount * 0x9E3779B97F4A7C15UL);
+                ulong b = 0x6A09E667F3BCC908UL ^ ((ulong)colCount * 0xBF58476D1CE4E5B9UL);
+                int vCount = values != null ? values.Count : 0;
+                for (int i = 0; i < colCount; i++)
+                {
+                    string raw = i < vCount ? values[i] : null;
+                    ulong ch1, ch2;
+                    if (IsNullToken(raw))
+                    {
+                        ch1 = Mix64(0x1111111111111111UL ^ (ulong)(i + 1));
+                        ch2 = Mix64(0x2222222222222222UL ^ (ulong)(i + 1));
+                    }
+                    else
+                    {
+                        HashString128(raw, out ch1, out ch2);
+                    }
+                    a = Mix64(a ^ (ch1 + (ulong)(i + 1) * 0x9E3779B97F4A7C15UL));
+                    b = Mix64(b ^ (ch2 + (ulong)(i + 1) * 0x517CC1B727220A95UL));
+                }
+                h1 = a;
+                h2 = b;
+            }
+        }
+
+        internal static ulong ComputeKeyHash64(IList<string> values, int[] keyCols, out bool isNullKey)
+        {
+            isNullKey = false;
+            if (values == null || keyCols == null || keyCols.Length == 0)
+            {
+                isNullKey = true;
+                return 0UL;
+            }
+            unchecked
+            {
+                ulong acc = 0xA0761D6478BD642FUL ^ ((ulong)keyCols.Length * 0x9E3779B97F4A7C15UL);
+                for (int k = 0; k < keyCols.Length; k++)
+                {
+                    int ci = keyCols[k];
+                    string raw = (ci >= 0 && ci < values.Count) ? values[ci] : null;
+                    if (IsNullToken(raw))
+                    {
+                        isNullKey = true;
+                        return 0UL;
+                    }
+                    ulong h1, h2;
+                    HashString128(raw, out h1, out h2);
+                    acc = Mix64(acc ^ h1 ^ (h2 * 0x9E3779B185EBCA87UL) ^ ((ulong)(k + 1) * 0xBF58476D1CE4E5B9UL));
+                }
+                return acc;
+            }
+        }
+
+        internal static string Format256(ulong s1, ulong s2, ulong x1, ulong x2)
+        {
+            return s1.ToString("x16", CultureInfo.InvariantCulture) +
+                   s2.ToString("x16", CultureInfo.InvariantCulture) +
+                   x1.ToString("x16", CultureInfo.InvariantCulture) +
+                   x2.ToString("x16", CultureInfo.InvariantCulture);
+        }
+
+        internal static string Format128(ulong s1, ulong s2)
+        {
+            return s1.ToString("x16", CultureInfo.InvariantCulture) +
+                   s2.ToString("x16", CultureInfo.InvariantCulture);
+        }
+
+        internal static string EncodeSketchEntries(List<RowSketchEntry> entries, int maxCount)
+        {
+            if (entries == null || entries.Count == 0 || maxCount <= 0) return "";
+            int n = Math.Min(entries.Count, maxCount);
+            byte[] buf = new byte[n * 16];
+            for (int i = 0; i < n; i++)
+            {
+                ulong pk = entries[i].PkHash;
+                ulong rh = entries[i].RowHash;
+                int o = i * 16;
+                for (int b = 0; b < 8; b++)
+                {
+                    buf[o + b] = (byte)(pk >> (b * 8));
+                    buf[o + 8 + b] = (byte)(rh >> (b * 8));
+                }
+            }
+            return Convert.ToBase64String(buf);
+        }
+
+        internal static List<RowSketchEntry> DecodeSketchEntries(string base64)
+        {
+            List<RowSketchEntry> list = new List<RowSketchEntry>();
+            if (string.IsNullOrWhiteSpace(base64)) return list;
+            try
+            {
+                byte[] buf = Convert.FromBase64String(base64.Trim());
+                int n = buf.Length / 16;
+                list.Capacity = n;
+                for (int i = 0; i < n; i++)
+                {
+                    int o = i * 16;
+                    ulong pk = 0UL;
+                    ulong rh = 0UL;
+                    for (int b = 0; b < 8; b++)
+                    {
+                        pk |= ((ulong)buf[o + b]) << (b * 8);
+                        rh |= ((ulong)buf[o + 8 + b]) << (b * 8);
+                    }
+                    RowSketchEntry entry;
+                    entry.PkHash = pk;
+                    entry.RowHash = rh;
+                    list.Add(entry);
+                }
+            }
+            catch { list.Clear(); }
+            return list;
+        }
+
+        internal static int[] SelectSketchKeyColumns(IList<string> headers, IList<string> explicitPkCols, out string keyLabel)
+        {
+            keyLabel = "";
+            if (headers == null || headers.Count == 0) return null;
+
+            if (explicitPkCols != null && explicitPkCols.Count > 0)
+            {
+                List<int> idxs = new List<int>(explicitPkCols.Count);
+                List<string> names = new List<string>(explicitPkCols.Count);
+                bool allFound = true;
+                for (int k = 0; k < explicitPkCols.Count; k++)
+                {
+                    int found = -1;
+                    for (int h = 0; h < headers.Count; h++)
+                    {
+                        if (string.Equals(headers[h], explicitPkCols[k], StringComparison.OrdinalIgnoreCase))
+                        {
+                            found = h;
+                            break;
+                        }
+                    }
+                    if (found < 0) { allFound = false; break; }
+                    idxs.Add(found);
+                    names.Add(headers[found]);
+                }
+                if (allFound && idxs.Count > 0)
+                {
+                    keyLabel = string.Join("+", names.ToArray());
+                    return idxs.ToArray();
+                }
+            }
+
+            // Heuristic fallback (matches CSV & DirectDB identically when no explicit PK metadata)
+            for (int h = 0; h < headers.Count; h++)
+            {
+                if (string.Equals(headers[h], "id", StringComparison.OrdinalIgnoreCase))
+                {
+                    keyLabel = headers[h];
+                    return new int[] { h };
+                }
+            }
+
+            string h0 = headers[0] ?? "";
+            bool h0LooksPk = h0.EndsWith("_id", StringComparison.OrdinalIgnoreCase) ||
+                             h0.EndsWith("_cd", StringComparison.OrdinalIgnoreCase) ||
+                             h0.EndsWith("_code", StringComparison.OrdinalIgnoreCase) ||
+                             h0.EndsWith("_no", StringComparison.OrdinalIgnoreCase) ||
+                             h0.EndsWith("_key", StringComparison.OrdinalIgnoreCase) ||
+                             h0.EndsWith("_uuid", StringComparison.OrdinalIgnoreCase) ||
+                             headers.Count == 1;
+            if (h0LooksPk)
+            {
+                keyLabel = h0;
+                return new int[] { 0 };
+            }
+            return null;
+        }
+    }
+
+    internal sealed class RowChurnSketchBuilder
+    {
+        internal const int DefaultCap = 2048;
+        private readonly int[] _keyCols;
+        private readonly string _keyLabel;
+        private readonly bool _explicitPk;
+        private readonly int _cap;
+        private readonly RowSketchEntry[] _heap;
+        private int _count;
+        private long _totalRows;
+        private bool _invalidKey;
+
+        internal RowChurnSketchBuilder(int[] keyCols, string keyLabel, bool explicitPk, int cap)
+        {
+            _keyCols = keyCols;
+            _keyLabel = keyLabel ?? "";
+            _explicitPk = explicitPk;
+            _cap = cap > 0 ? cap : DefaultCap;
+            _heap = (keyCols != null && keyCols.Length > 0) ? new RowSketchEntry[_cap] : null;
+        }
+
+        internal bool IsExplicitPk { get { return _explicitPk; } }
+        internal int[] KeyCols { get { return _keyCols; } }
+
+        internal void Add(IList<string> rowValues, ulong rowHash)
+        {
+            _totalRows++;
+            if (_invalidKey || _heap == null) return;
+            bool isNullKey;
+            ulong pkHash = ContentHashHelper.ComputeKeyHash64(rowValues, _keyCols, out isNullKey);
+            if (isNullKey)
+            {
+                _invalidKey = true;
+                return;
+            }
+            if (_count < _cap)
+            {
+                RowSketchEntry entry;
+                entry.PkHash = pkHash;
+                entry.RowHash = rowHash;
+                _heap[_count] = entry;
+                SiftUp(_count);
+                _count++;
+            }
+            else if (pkHash < _heap[0].PkHash)
+            {
+                RowSketchEntry entry;
+                entry.PkHash = pkHash;
+                entry.RowHash = rowHash;
+                _heap[0] = entry;
+                SiftDown(0);
+            }
+            else if (pkHash == _heap[0].PkHash)
+            {
+                _invalidKey = true;
+            }
+        }
+
+        private void SiftUp(int idx)
+        {
+            while (idx > 0)
+            {
+                int parent = (idx - 1) >> 1;
+                if (_heap[parent].PkHash >= _heap[idx].PkHash) break;
+                RowSketchEntry tmp = _heap[parent];
+                _heap[parent] = _heap[idx];
+                _heap[idx] = tmp;
+                idx = parent;
+            }
+        }
+
+        private void SiftDown(int idx)
+        {
+            while (true)
+            {
+                int left = (idx << 1) + 1;
+                if (left >= _count) break;
+                int largest = left;
+                int right = left + 1;
+                if (right < _count && _heap[right].PkHash > _heap[left].PkHash) largest = right;
+                if (_heap[idx].PkHash >= _heap[largest].PkHash) break;
+                RowSketchEntry tmp = _heap[idx];
+                _heap[idx] = _heap[largest];
+                _heap[largest] = tmp;
+                idx = largest;
+            }
+        }
+
+        internal RowChurnSketch Build(TableAnalysis finalizedTable)
+        {
+            RowChurnSketch sk = new RowChurnSketch();
+            sk.KeyColumns = _keyLabel;
+            sk.TotalRows = _totalRows;
+            if (_invalidKey || _heap == null || _totalRows == 0 || _count == 0)
+            {
+                sk.IsValid = false;
+                return sk;
+            }
+
+            // For single-column heuristic key, verify uniqueness on full table when not capped
+            if (!_explicitPk && _keyCols.Length == 1 && finalizedTable != null && _keyCols[0] < finalizedTable.Columns.Count)
+            {
+                ColumnAnalysis kc = finalizedTable.Columns[_keyCols[0]];
+                if (kc.NullCount > 0 || (!kc.DistinctCapped && kc.DistinctCount < _totalRows))
+                {
+                    sk.IsValid = false;
+                    return sk;
+                }
+            }
+
+            List<RowSketchEntry> list = new List<RowSketchEntry>(_count);
+            for (int i = 0; i < _count; i++) list.Add(_heap[i]);
+            list.Sort(delegate(RowSketchEntry a, RowSketchEntry b) { return a.PkHash.CompareTo(b.PkHash); });
+            for (int i = 1; i < list.Count; i++)
+            {
+                if (list[i].PkHash == list[i - 1].PkHash)
+                {
+                    sk.IsValid = false;
+                    return sk;
+                }
+            }
+            sk.IsValid = true;
+            sk.IsExact = (_totalRows <= _cap);
+            sk.MaxKeptPkHash = sk.IsExact ? ulong.MaxValue : list[list.Count - 1].PkHash;
+            sk.Entries = list;
+            return sk;
+        }
+    }
+
     public class ValueShareItem
     {
         public string Value;
@@ -1632,6 +2107,7 @@ namespace AuroraAnalyzer
         public double NumP99;
         public double NumMax;
         public double NumStdDev;
+        public double NumSum;
         public long ZeroCount;
         public double ZeroRate;
         public long NegativeCount;
@@ -1674,8 +2150,13 @@ namespace AuroraAnalyzer
         public long PeakDayCount;
         public double PeakBurstRatio;
         public SortedDictionary<string, long> MonthlyCounts;
+        public SortedDictionary<string, long> RecentDailyCounts;
         public long[] DayOfWeekCounts; // 0=Mon .. 6=Sun
         public long[] HourlyCounts;    // 0..23
+
+        public string ContentHash;
+        public string DistinctSetHash;
+        public DbColumnMetadata DbMeta;
 
         public string AlertNote;
 
@@ -1684,8 +2165,11 @@ namespace AuroraAnalyzer
             Histogram = new List<HistogramBin>();
             TopValues = new List<ValueShareItem>();
             MonthlyCounts = new SortedDictionary<string, long>(StringComparer.Ordinal);
+            RecentDailyCounts = new SortedDictionary<string, long>(StringComparer.Ordinal);
             DayOfWeekCounts = new long[7];
             HourlyCounts = new long[24];
+            ContentHash = "";
+            DistinctSetHash = "";
             AlertNote = "";
             Top1Value = "";
             PeakDay = "";
@@ -1734,6 +2218,9 @@ namespace AuroraAnalyzer
         public int HighWarningCount;
         public int WarningCount;
         public string WarningSummary;
+        public string RowMultisetHash;
+        public RowChurnSketch RowSketch;
+        public DbTableMetadata DbMeta;
         public List<ColumnAnalysis> Columns;
 
         public TableAnalysis()
@@ -1748,6 +2235,7 @@ namespace AuroraAnalyzer
             RelationSummary = "-";
             JMeterReadiness = "対象外";
             WarningSummary = "";
+            RowMultisetHash = "";
         }
     }
 
@@ -1830,6 +2318,7 @@ namespace AuroraAnalyzer
         public List<WarningItem> Warnings;
         public List<JMeterCandidateItem> JMeterCandidates;
         public List<string> AuroraInsights;
+        public DbServerMetadata DbServer;
 
         // Aggregated time-series across all datetime columns (primary timestamp per table)
         public SortedDictionary<string, long> GlobalMonthlyCounts;
@@ -1889,10 +2378,17 @@ namespace AuroraAnalyzer
         public double NumMax;
         public double NumMean;
         public double NumM2;
+        public double NumSum;
+        public double NumSumComp;
         public long NumCount;
         public long ZeroCount;
         public long NegativeCount;
         public List<double> NumSample;
+
+        public ulong HashSum1;
+        public ulong HashSum2;
+        public ulong HashXor1;
+        public ulong HashXor2;
 
         public Dictionary<string, long> Freq;
         public bool DistinctCapped;
@@ -1953,13 +2449,22 @@ namespace AuroraAnalyzer
         public void Add(string raw)
         {
             TotalRows++;
-            if (raw == null || raw.Length == 0 || raw == "\\N" || string.Equals(raw, "NULL", StringComparison.Ordinal) || string.Equals(raw, "(null)", StringComparison.OrdinalIgnoreCase))
+            if (ContentHashHelper.IsNullToken(raw))
             {
                 NullCount++;
                 return;
             }
 
             NonNullCount++;
+            ulong vh1, vh2;
+            ContentHashHelper.HashString128(raw, out vh1, out vh2);
+            unchecked
+            {
+                HashSum1 += vh1;
+                HashSum2 += vh2;
+                HashXor1 ^= vh1;
+                HashXor2 ^= vh2;
+            }
             int charLen = raw.Length;
             int byteLen = Encoding.UTF8.GetByteCount(raw);
             if (charLen < MinCharLen) MinCharLen = charLen;
@@ -2104,7 +2609,12 @@ namespace AuroraAnalyzer
             if (v == 0.0) ZeroCount++;
             if (v < 0.0) NegativeCount++;
 
-            // Welford online mean & variance
+            // Welford online mean & variance + Neumaier compensated sum
+            double sumT = NumSum + v;
+            if (Math.Abs(NumSum) >= Math.Abs(v)) NumSumComp += (NumSum - sumT) + v;
+            else NumSumComp += (v - sumT) + NumSum;
+            NumSum = sumT;
+
             double delta = v - NumMean;
             NumMean += delta / NumCount;
             double delta2 = v - NumMean;
@@ -2135,6 +2645,8 @@ namespace AuroraAnalyzer
         internal readonly Dictionary<string, Dictionary<string, long>> KeyMaps =
             new Dictionary<string, Dictionary<string, long>>(StringComparer.OrdinalIgnoreCase);
         private List<ColumnAccumulator> _columns;
+        private RowChurnSketchBuilder _sketchBuilder;
+        private ulong _rowHashSum1, _rowHashSum2, _rowHashXor1, _rowHashXor2;
         private long _rows, _raggedRows, _sumRowBytes, _minRowBytes = long.MaxValue, _maxRowBytes;
 
         internal CsvTableProfile(string path, string encodingName, IList<string> headers)
@@ -2144,6 +2656,11 @@ namespace AuroraAnalyzer
                 TableName = Path.GetFileNameWithoutExtension(path), EncodingName = encodingName
             };
             _columns = CsvAnalysisEngine.CreateColumnAccumulators(headers);
+            List<string> normHeaders = new List<string>(_columns.Count);
+            for (int i = 0; i < _columns.Count; i++) normHeaders.Add(_columns[i].ColumnName);
+            string keyLabel;
+            int[] keyCols = ContentHashHelper.SelectSketchKeyColumns(normHeaders, null, out keyLabel);
+            _sketchBuilder = new RowChurnSketchBuilder(keyCols, keyLabel, false, RowChurnSketchBuilder.DefaultCap);
         }
 
         internal void AddRow(IList<string> row)
@@ -2157,6 +2674,16 @@ namespace AuroraAnalyzer
                 if (!string.IsNullOrEmpty(value)) bytes += Encoding.UTF8.GetByteCount(value);
                 _columns[i].Add(value);
             }
+            ulong rh1, rh2;
+            ContentHashHelper.ComputeRowHash128(row, _columns.Count, out rh1, out rh2);
+            unchecked
+            {
+                _rowHashSum1 += rh1;
+                _rowHashSum2 += rh2;
+                _rowHashXor1 ^= rh1;
+                _rowHashXor2 ^= rh2;
+            }
+            if (_sketchBuilder != null) _sketchBuilder.Add(row, rh1);
             _rows++;
             _sumRowBytes += bytes;
             if (bytes < _minRowBytes) _minRowBytes = bytes;
@@ -2168,6 +2695,20 @@ namespace AuroraAnalyzer
             Table.FileSizeBytes = size;
             long effectiveMin = _rows > 0 && _minRowBytes != long.MaxValue ? _minRowBytes : 0L;
             CsvAnalysisEngine.FinalizeTableAnalysis(Table, _columns, _rows, _raggedRows, _sumRowBytes, effectiveMin, _maxRowBytes, KeyMaps);
+            unchecked
+            {
+                ulong rcMix = ContentHashHelper.Mix64((ulong)_rows ^ 0x517CC1B727220A95UL);
+                Table.RowMultisetHash = ContentHashHelper.Format256(
+                    _rowHashSum1 ^ rcMix,
+                    _rowHashSum2 + rcMix,
+                    _rowHashXor1 ^ ContentHashHelper.Mix64((ulong)Table.ColumnCount),
+                    _rowHashXor2);
+            }
+            if (_sketchBuilder != null)
+            {
+                Table.RowSketch = _sketchBuilder.Build(Table);
+                _sketchBuilder = null;
+            }
             _columns = null; // Only finalized statistics and FK key maps survive between tables.
         }
     }
@@ -2676,6 +3217,35 @@ namespace AuroraAnalyzer
             ca.NonAsciiCount = acc.NonAsciiCount;
             ca.NonAsciiRate = acc.NonNullCount > 0 ? ((double)acc.NonAsciiCount / acc.NonNullCount) : 0.0;
 
+            unchecked
+            {
+                ulong nullMix = ContentHashHelper.Mix64((ulong)acc.NullCount ^ 0xA0761D6478BD642FUL);
+                ulong nnMix = ContentHashHelper.Mix64((ulong)acc.NonNullCount ^ 0xE7037ED1A0B428DBUL);
+                ca.ContentHash = ContentHashHelper.Format256(
+                    acc.HashSum1 ^ nullMix,
+                    acc.HashSum2 + nnMix,
+                    acc.HashXor1 ^ nnMix,
+                    acc.HashXor2 ^ nullMix);
+            }
+            if (!acc.DistinctCapped)
+            {
+                if (acc.Freq.Count == 0)
+                {
+                    ca.DistinctSetHash = "00000000000000000000000000000000";
+                }
+                else
+                {
+                    ulong ds1 = 0UL, ds2 = 0UL;
+                    foreach (string fk in acc.Freq.Keys)
+                    {
+                        ulong kh1, kh2;
+                        ContentHashHelper.HashString128(fk, out kh1, out kh2);
+                        unchecked { ds1 += kh1; ds2 ^= kh2; }
+                    }
+                    ca.DistinctSetHash = ContentHashHelper.Format128(ds1, ds2);
+                }
+            }
+
             if (acc.NonNullCount == 0)
             {
                 ca.InferredType = "空 (全NULL)";
@@ -2866,6 +3436,7 @@ namespace AuroraAnalyzer
                 ca.NumMin = acc.NumMin;
                 ca.NumMax = acc.NumMax;
                 ca.NumMean = acc.NumMean;
+                ca.NumSum = acc.NumSum + acc.NumSumComp;
                 ca.NumStdDev = acc.NumCount > 1 ? Math.Sqrt(acc.NumM2 / (acc.NumCount - 1)) : 0.0;
                 ca.ZeroCount = acc.ZeroCount;
                 ca.ZeroRate = (double)acc.ZeroCount / acc.NumCount;
@@ -2961,6 +3532,19 @@ namespace AuroraAnalyzer
                     ca.PeakDay = peakD;
                     ca.PeakDayCount = peakC;
                     ca.PeakBurstRatio = ca.AvgPerDay > 0 ? (peakC / ca.AvgPerDay) : 1.0;
+
+                    List<string> sortedDays = new List<string>(acc.DailyCounts.Keys);
+                    sortedDays.Sort(StringComparer.Ordinal);
+                    int startIdx = Math.Max(0, sortedDays.Count - 31);
+                    for (int di = startIdx; di < sortedDays.Count; di++)
+                    {
+                        string dk = sortedDays[di];
+                        ca.RecentDailyCounts[dk] = acc.DailyCounts[dk];
+                    }
+                    if (!string.IsNullOrEmpty(peakD) && !ca.RecentDailyCounts.ContainsKey(peakD))
+                    {
+                        ca.RecentDailyCounts[peakD] = peakC;
+                    }
                 }
             }
 
@@ -3736,6 +4320,8 @@ namespace AuroraAnalyzer
     {
         private readonly FolderAnalysisResult _result;
         private readonly Dictionary<string, Dictionary<string, Dictionary<string, long>>> _keyMaps;
+        private Dictionary<string, DbTableMetadata> _tableMetaMap;
+        private Dictionary<string, Dictionary<string, DbColumnMetadata>> _colMetaMap;
 
         public DirectAnalysisSession(string sourceDescription)
         {
@@ -3745,6 +4331,18 @@ namespace AuroraAnalyzer
             _result.SourceMode = "DirectDB";
             _result.AnalyzedAt = DateTime.Now;
             _keyMaps = new Dictionary<string, Dictionary<string, Dictionary<string, long>>>(StringComparer.OrdinalIgnoreCase);
+            _tableMetaMap = new Dictionary<string, DbTableMetadata>(StringComparer.OrdinalIgnoreCase);
+            _colMetaMap = new Dictionary<string, Dictionary<string, DbColumnMetadata>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        public void AttachDbMetadata(
+            DbServerMetadata serverMeta,
+            Dictionary<string, DbTableMetadata> tableMetaMap,
+            Dictionary<string, Dictionary<string, DbColumnMetadata>> colMetaMap)
+        {
+            _result.DbServer = serverMeta;
+            if (tableMetaMap != null) _tableMetaMap = tableMetaMap;
+            if (colMetaMap != null) _colMetaMap = colMetaMap;
         }
 
         public TableAnalysis AnalyzeMySqlTable(
@@ -3779,7 +4377,26 @@ namespace AuroraAnalyzer
             ta.FilePath = "";
             ta.EncodingName = "UTF-8 (DB直接)";
 
+            Dictionary<string, DbColumnMetadata> tblColMeta = null;
+            _colMetaMap.TryGetValue(tableName, out tblColMeta);
+
+            List<string> explicitPkCols = null;
+            if (tblColMeta != null && tblColMeta.Count > 0)
+            {
+                List<DbColumnMetadata> priCols = tblColMeta.Values
+                    .Where(cm => string.Equals(cm.ColumnKey, "PRI", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(cm => cm.OrdinalPosition)
+                    .ToList();
+                if (priCols.Count > 0)
+                {
+                    explicitPkCols = new List<string>(priCols.Count);
+                    for (int pi = 0; pi < priCols.Count; pi++) explicitPkCols.Add(priCols[pi].ColumnName);
+                }
+            }
+
             List<ColumnAccumulator> accs = new List<ColumnAccumulator>();
+            RowChurnSketchBuilder sketchBuilder = null;
+            ulong rowHashSum1 = 0UL, rowHashSum2 = 0UL, rowHashXor1 = 0UL, rowHashXor2 = 0UL;
             long rowCount = 0;
             long sumRowBytes = 0;
             long minRowBytes = long.MaxValue;
@@ -3795,16 +4412,27 @@ namespace AuroraAnalyzer
                 {
                     receivedColumns = true;
                     List<string> headers = new List<string>(cols.Count);
+                    List<string> wirePriCols = new List<string>();
                     for (int i = 0; i < cols.Count; i++)
                     {
                         string cn = cols[i].Name ?? "";
                         headers.Add(cn);
                         csvEquivBytes += MySql84Client.CalcCsvEncodedUtf8Length(cn);
+                        if ((cols[i].Flags & 0x0002) != 0) wirePriCols.Add(cn);
                     }
                     if (cols.Count > 1) csvEquivBytes += (cols.Count - 1);
                     csvEquivBytes += 2L; // CRLF
                     accs = CsvAnalysisEngine.CreateColumnAccumulators(headers);
                     colCount = accs.Count;
+
+                    List<string> normHeaders = new List<string>(colCount);
+                    for (int i = 0; i < colCount; i++) normHeaders.Add(accs[i].ColumnName);
+                    List<string> pkSrc = (explicitPkCols != null && explicitPkCols.Count > 0)
+                        ? explicitPkCols
+                        : (wirePriCols.Count > 0 ? wirePriCols : null);
+                    string keyLabel;
+                    int[] keyCols = ContentHashHelper.SelectSketchKeyColumns(normHeaders, pkSrc, out keyLabel);
+                    sketchBuilder = new RowChurnSketchBuilder(keyCols, keyLabel, pkSrc != null && pkSrc.Count > 0, RowChurnSketchBuilder.DefaultCap);
                 },
                 delegate(string[] rowVals, long rawRowBytes, long csvLineBytes)
                 {
@@ -3812,6 +4440,16 @@ namespace AuroraAnalyzer
                     {
                         accs[c].Add(rowVals[c]);
                     }
+                    ulong rh1, rh2;
+                    ContentHashHelper.ComputeRowHash128(rowVals, colCount, out rh1, out rh2);
+                    unchecked
+                    {
+                        rowHashSum1 += rh1;
+                        rowHashSum2 += rh2;
+                        rowHashXor1 ^= rh1;
+                        rowHashXor2 ^= rh2;
+                    }
+                    if (sketchBuilder != null) sketchBuilder.Add(rowVals, rh1);
                     sumRowBytes += rawRowBytes;
                     if (rawRowBytes < minRowBytes) minRowBytes = rawRowBytes;
                     if (rawRowBytes > maxRowBytes) maxRowBytes = rawRowBytes;
@@ -3825,6 +4463,37 @@ namespace AuroraAnalyzer
             ta.FileSizeBytes = receivedColumns ? csvEquivBytes : 0L;
             long effectiveMinRowBytes = rowCount > 0 && minRowBytes != long.MaxValue ? minRowBytes : 0L;
             CsvAnalysisEngine.FinalizeTableAnalysis(ta, accs, rowCount, 0L, sumRowBytes, effectiveMinRowBytes, maxRowBytes, tableKeyMaps);
+
+            unchecked
+            {
+                ulong rcMix = ContentHashHelper.Mix64((ulong)rowCount ^ 0x517CC1B727220A95UL);
+                ta.RowMultisetHash = ContentHashHelper.Format256(
+                    rowHashSum1 ^ rcMix,
+                    rowHashSum2 + rcMix,
+                    rowHashXor1 ^ ContentHashHelper.Mix64((ulong)ta.ColumnCount),
+                    rowHashXor2);
+            }
+            if (sketchBuilder != null)
+            {
+                ta.RowSketch = sketchBuilder.Build(ta);
+            }
+
+            DbTableMetadata tm;
+            if (_tableMetaMap.TryGetValue(tableName, out tm))
+            {
+                ta.DbMeta = tm;
+            }
+            if (tblColMeta != null)
+            {
+                for (int ci = 0; ci < ta.Columns.Count; ci++)
+                {
+                    DbColumnMetadata cm;
+                    if (tblColMeta.TryGetValue(ta.Columns[ci].ColumnName, out cm))
+                    {
+                        ta.Columns[ci].DbMeta = cm;
+                    }
+                }
+            }
 
             _result.Tables.Add(ta);
             _keyMaps[ta.TableName] = tableKeyMaps;
@@ -3856,6 +4525,7 @@ namespace AuroraAnalyzer
         public string Value;
         public long Count;
         public double Share;
+        public double CumulativeShare;
     }
 
     public class SnapshotNumericStats
@@ -3863,6 +4533,10 @@ namespace AuroraAnalyzer
         public string ColumnName;
         public long NonNullCount;
         public double Min;
+        public bool HasP05;
+        public double P05;
+        public bool HasP10;
+        public double P10;
         public double P25;
         public double Median;
         public double Mean;
@@ -3873,17 +4547,26 @@ namespace AuroraAnalyzer
         public double P99;
         public double Max;
         public double StdDev;
+        public bool HasSum;
+        public double Sum;
         public bool HasZeroRate;
         public double ZeroRate;
         public bool HasNegativeRate;
         public double NegativeRate;
         public double OutlierRate;
+        public List<HistogramBin> Histogram;
+
+        public SnapshotNumericStats()
+        {
+            Histogram = new List<HistogramBin>();
+        }
     }
 
     public class SnapshotDateTimeStats
     {
         public string ColumnName;
         public long NonNullCount;
+        public bool HasTimeComponent;
         public string MinDate;
         public string MaxDate;
         public double DateSpanDays;
@@ -3891,41 +4574,87 @@ namespace AuroraAnalyzer
         public string PeakDay;
         public long PeakDayCount;
         public double PeakBurstRatio;
+        public SortedDictionary<string, long> MonthlyCounts;
+        public SortedDictionary<string, long> RecentDailyCounts;
+        public long[] DayOfWeekCounts;
+        public long[] HourlyCounts;
+        public bool HasTimeSeriesDist;
+
+        public SnapshotDateTimeStats()
+        {
+            MinDate = "-";
+            MaxDate = "-";
+            PeakDay = "";
+            MonthlyCounts = new SortedDictionary<string, long>(StringComparer.Ordinal);
+            RecentDailyCounts = new SortedDictionary<string, long>(StringComparer.Ordinal);
+            DayOfWeekCounts = new long[7];
+            HourlyCounts = new long[24];
+        }
     }
 
     public class SnapshotColumn
     {
         public string TableName;
         public string ColumnName;
+        public int ColumnIndex;
         public string InferredType;
+        public string KeyRole;
         public long TotalRows;
+        public long NonNullCount;
         public long NullCount;
         public double NullRate;
         public long DistinctCount;
+        public bool DistinctCapped;
         public double CardinalityRate;
         public string SelectivityRating;
+        public bool IsCandidatePk;
+        public int MinCharLen;
+        public double AvgCharLen;
+        public int MaxCharLen;
+        public long MinByteLen;
         public double AvgByteLen;
         public long P95ByteLen;
         public long MaxByteLen;
         public string Top1Value;
+        public long Top1Count;
         public double Top1Share;
         public double Top3Share;
+        public double Top5Share;
+        public double Top10Share;
         public double GiniCoefficient;
+        public double NormalizedEntropy;
+        public bool HasNormalizedEntropy;
         public string SkewRisk;
+        public bool IsCategorical;
+        public long WhitespaceOnlyCount;
+        public long MultilineCount;
+        public long NonAsciiCount;
+        public double NonAsciiRate;
+        public bool HasCharQualityCounts;
         public string AlertNote;
         public string MinValueText;
         public string MaxValueText;
+        public string DetailStatsSummary;
+        public string RelationSummary;
+        public string ContentHash;
+        public string DistinctSetHash;
+        public DbColumnMetadata DbMeta;
         public Dictionary<string, long> TopDistCounts;
 
         public SnapshotColumn()
         {
             InferredType = "";
+            KeyRole = "";
             SelectivityRating = "";
             Top1Value = "";
             SkewRisk = "";
             AlertNote = "";
             MinValueText = "";
             MaxValueText = "";
+            DetailStatsSummary = "";
+            RelationSummary = "";
+            ContentHash = "";
+            DistinctSetHash = "";
             TopDistCounts = new Dictionary<string, long>(StringComparer.Ordinal);
         }
     }
@@ -3941,15 +4670,32 @@ namespace AuroraAnalyzer
         public int ColumnCount;
         public double FileSizeKB;
         public double SizeShare;
+        public long MinRowBytes;
         public double AvgRowBytes;
         public long MaxRowBytes;
         public double EstInnoDbKB;
+        public long EstInnoDbPages;
+        public double RowsPerInnoDbPage;
         public double AvgNullRate;
+        public double AvgCardinalityRate;
+        public string ColumnTypeBreakdown;
+        public string QualityRiskBreakdown;
+        public long RaggedRowCount;
         public string CandidatePks;
+        public string CategoricalColumns;
         public string DateColumns;
+        public string PrimaryDateRange;
+        public string RelationSummary;
+        public string JMeterReadiness;
+        public int WarningCount;
+        public int HighWarningCount;
         public string WarningSummary;
+        public string RowMultisetHash;
+        public RowChurnSketch RowSketch;
+        public DbTableMetadata DbMeta;
 
         public Dictionary<string, SnapshotColumn> Columns;
+        public List<SnapshotColumn> ColumnList;
         public Dictionary<string, Dictionary<string, SnapshotCategoryItem>> Distributions;
         public Dictionary<string, SnapshotNumericStats> NumericStats;
         public Dictionary<string, SnapshotDateTimeStats> DateTimeStats;
@@ -3959,13 +4705,97 @@ namespace AuroraAnalyzer
             FileName = "";
             EncodingName = "";
             InferredRole = "";
+            ColumnTypeBreakdown = "";
+            QualityRiskBreakdown = "";
             CandidatePks = "";
+            CategoricalColumns = "";
             DateColumns = "";
+            PrimaryDateRange = "";
+            RelationSummary = "";
+            JMeterReadiness = "";
             WarningSummary = "";
+            RowMultisetHash = "";
             Columns = new Dictionary<string, SnapshotColumn>(StringComparer.OrdinalIgnoreCase);
+            ColumnList = new List<SnapshotColumn>();
             Distributions = new Dictionary<string, Dictionary<string, SnapshotCategoryItem>>(StringComparer.OrdinalIgnoreCase);
             NumericStats = new Dictionary<string, SnapshotNumericStats>(StringComparer.OrdinalIgnoreCase);
             DateTimeStats = new Dictionary<string, SnapshotDateTimeStats>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    public class SnapshotRelationship
+    {
+        public string ParentTable;
+        public string ParentColumn;
+        public string ChildTable;
+        public string ChildColumn;
+        public long ParentDistinctCount;
+        public long ChildNonNullRows;
+        public long ChildDistinctKeys;
+        public long MatchedRows;
+        public long OrphanRows;
+        public double MatchRate;
+        public long FanOutMin;
+        public double FanOutAvg;
+        public double FanOutP50;
+        public double FanOutP95;
+        public double FanOutP99;
+        public long FanOutMax;
+        public string MaxFanOutKey;
+        public string RiskLevel;
+        public string Note;
+
+        public SnapshotRelationship()
+        {
+            ParentTable = "";
+            ParentColumn = "";
+            ChildTable = "";
+            ChildColumn = "";
+            MaxFanOutKey = "";
+            RiskLevel = "";
+            Note = "";
+        }
+    }
+
+    public class SnapshotWarning
+    {
+        public string Severity;
+        public string Category;
+        public string TableName;
+        public string ColumnName;
+        public string MetricValue;
+        public string PerfImpact;
+        public string Recommendation;
+
+        public SnapshotWarning()
+        {
+            Severity = "";
+            Category = "";
+            TableName = "";
+            ColumnName = "";
+            MetricValue = "";
+            PerfImpact = "";
+            Recommendation = "";
+        }
+    }
+
+    public class SnapshotJMeterCandidate
+    {
+        public string TableName;
+        public string KeyColumn;
+        public long UniqueCount;
+        public long TotalRows;
+        public string DataType;
+        public string Suitability;
+        public string RecommendedUsage;
+
+        public SnapshotJMeterCandidate()
+        {
+            TableName = "";
+            KeyColumn = "";
+            DataType = "";
+            Suitability = "";
+            RecommendedUsage = "";
         }
     }
 
@@ -3975,17 +4805,999 @@ namespace AuroraAnalyzer
         public string FileName;
         public string Subtitle;
         public string AnalyzedAtText;
+        public DateTime? AnalyzedAt;
         public string InputFolder;
+        public string SourceMode;
+        public bool IsDirectDb;
+        public string DbLabel;
+        public bool HasEmbeddedSnapshot;
+        public int SnapshotVersion;
+        public double EstMinAcuCurrent;
+        public double EstMinAcu10x;
+        public bool HasAcuEstimate;
+        public long TotalEstInnoDbPages;
+        public long TotalOrphanRows;
+        public string PrimaryTimeSeriesSource;
+        public DbServerMetadata DbServer;
+
         public Dictionary<string, SnapshotTable> Tables;
         public List<SnapshotTable> TableList;
+        public List<SnapshotRelationship> Relationships;
+        public List<SnapshotWarning> Warnings;
+        public List<SnapshotJMeterCandidate> JMeterCandidates;
 
         public AnalysisWorkbookSnapshot()
         {
             Subtitle = "";
             AnalyzedAtText = "";
             InputFolder = "";
+            SourceMode = "";
+            DbLabel = "";
+            PrimaryTimeSeriesSource = "";
             Tables = new Dictionary<string, SnapshotTable>(StringComparer.OrdinalIgnoreCase);
             TableList = new List<SnapshotTable>();
+            Relationships = new List<SnapshotRelationship>();
+            Warnings = new List<SnapshotWarning>();
+            JMeterCandidates = new List<SnapshotJMeterCandidate>();
+        }
+    }
+
+    // =========================================================================
+    //  Lossless OOXML CustomXML Snapshot Codec (Standard customXml/item1.xml)
+    // =========================================================================
+    public static class AnalysisSnapshotCodec
+    {
+        public const string SnapshotNamespace = "urn:aurora-csv-analyzer:snapshot:v2";
+        private const int MaxTotalSketchEntries = 32768;
+
+        private static string CleanXml(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            StringBuilder sb = null;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char ch = s[i];
+                if (ch == '\r')
+                {
+                    if (sb == null) { sb = new StringBuilder(s.Length); sb.Append(s, 0, i); }
+                    if (i + 1 < s.Length && s[i + 1] == '\n') i++;
+                    sb.Append('\n');
+                    continue;
+                }
+                bool valid = (ch == 0x9 || ch == 0xA || (ch >= 0x20 && ch <= 0xD7FF) || (ch >= 0xE000 && ch <= 0xFFFD));
+                if (!valid && char.IsHighSurrogate(ch) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                {
+                    if (sb != null) { sb.Append(ch); sb.Append(s[i + 1]); }
+                    i++;
+                    continue;
+                }
+                if (!valid)
+                {
+                    if (sb == null) { sb = new StringBuilder(s.Length); sb.Append(s, 0, i); }
+                    continue;
+                }
+                if (sb != null) sb.Append(ch);
+            }
+            return sb != null ? sb.ToString() : s;
+        }
+
+        private static string FmtD(double v)
+        {
+            if (double.IsNaN(v) || double.IsInfinity(v)) return "0";
+            return v.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        private static string FmtL(long v)
+        {
+            return v.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string FmtUL(ulong v)
+        {
+            return v.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static void WriteAttrIf(XmlWriter xw, string name, string val)
+        {
+            if (!string.IsNullOrEmpty(val)) xw.WriteAttributeString(name, CleanXml(val));
+        }
+
+        public static string SerializeToXml(FolderAnalysisResult analysis, string dbLabel)
+        {
+            if (analysis == null) return "";
+
+            // Adaptively budget sketch entries across all tables so embedded XML remains lightweight
+            int totalSketchEntries = 0;
+            for (int i = 0; i < analysis.Tables.Count; i++)
+            {
+                RowChurnSketch sk = analysis.Tables[i].RowSketch;
+                if (sk != null && sk.IsValid && sk.Entries != null) totalSketchEntries += sk.Entries.Count;
+            }
+            int perTableCap = RowChurnSketchBuilder.DefaultCap;
+            if (totalSketchEntries > MaxTotalSketchEntries && analysis.Tables.Count > 0)
+            {
+                perTableCap = Math.Max(64, MaxTotalSketchEntries / analysis.Tables.Count);
+            }
+
+            XmlWriterSettings ws = new XmlWriterSettings();
+            ws.Encoding = new UTF8Encoding(false);
+            ws.Indent = false;
+            ws.OmitXmlDeclaration = false;
+            ws.CheckCharacters = false;
+
+            using (MemoryStream ms = new MemoryStream(65536))
+            {
+                using (XmlWriter xw = XmlWriter.Create(ms, ws))
+                {
+                    xw.WriteStartDocument();
+                    xw.WriteStartElement("AuroraAnalysisSnapshot", SnapshotNamespace);
+                    xw.WriteAttributeString("version", "2");
+                    xw.WriteAttributeString("sourceMode", CleanXml(analysis.SourceMode ?? "CSV"));
+                    xw.WriteAttributeString("isDirectDb", analysis.IsDirectDb ? "1" : "0");
+                    xw.WriteAttributeString("analyzedAt", analysis.AnalyzedAt.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture));
+                    xw.WriteAttributeString("analyzedAtDisplay", analysis.AnalyzedAt.ToString("yyyy/MM/dd HH:mm:ss", CultureInfo.InvariantCulture));
+                    WriteAttrIf(xw, "inputFolder", analysis.InputFolder);
+                    WriteAttrIf(xw, "dbLabel", dbLabel);
+                    xw.WriteAttributeString("tableCount", FmtL(analysis.TableCount));
+                    xw.WriteAttributeString("totalRows", FmtL(analysis.TotalRows));
+                    xw.WriteAttributeString("totalColumns", FmtL(analysis.TotalColumns));
+                    xw.WriteAttributeString("totalFileBytes", FmtL(analysis.TotalFileBytes));
+                    xw.WriteAttributeString("totalEstInnoDbBytes", FmtL(analysis.TotalEstInnoDbBytes));
+                    xw.WriteAttributeString("totalEstInnoDbPages", FmtL(analysis.TotalEstInnoDbPages));
+                    xw.WriteAttributeString("totalOrphanRows", FmtL(analysis.TotalOrphanRows));
+                    xw.WriteAttributeString("estMinAcuCurrent", FmtD(analysis.EstMinAcuCurrent));
+                    xw.WriteAttributeString("estMinAcu10x", FmtD(analysis.EstMinAcu10x));
+                    WriteAttrIf(xw, "primaryTsSource", analysis.PrimaryTimeSeriesSource);
+
+                    if (analysis.DbServer != null && (analysis.DbServer.HasVariables || analysis.DbServer.HasStatus))
+                    {
+                        xw.WriteStartElement("DbServer", SnapshotNamespace);
+                        if (analysis.DbServer.HasVariables)
+                        {
+                            xw.WriteStartElement("Variables", SnapshotNamespace);
+                            foreach (KeyValuePair<string, string> kv in analysis.DbServer.Variables)
+                            {
+                                xw.WriteStartElement("V", SnapshotNamespace);
+                                xw.WriteAttributeString("k", CleanXml(kv.Key));
+                                xw.WriteAttributeString("v", CleanXml(kv.Value));
+                                xw.WriteEndElement();
+                            }
+                            xw.WriteEndElement();
+                        }
+                        if (analysis.DbServer.HasStatus)
+                        {
+                            xw.WriteStartElement("Status", SnapshotNamespace);
+                            foreach (KeyValuePair<string, long> kv in analysis.DbServer.StatusCounters)
+                            {
+                                xw.WriteStartElement("S", SnapshotNamespace);
+                                xw.WriteAttributeString("k", CleanXml(kv.Key));
+                                xw.WriteAttributeString("v", FmtL(kv.Value));
+                                xw.WriteEndElement();
+                            }
+                            xw.WriteEndElement();
+                        }
+                        xw.WriteEndElement();
+                    }
+
+                    xw.WriteStartElement("Tables", SnapshotNamespace);
+                    for (int ti = 0; ti < analysis.Tables.Count; ti++)
+                    {
+                        TableAnalysis t = analysis.Tables[ti];
+                        xw.WriteStartElement("Table", SnapshotNamespace);
+                        xw.WriteAttributeString("name", CleanXml(t.TableName));
+                        WriteAttrIf(xw, "file", t.FileName);
+                        WriteAttrIf(xw, "enc", t.EncodingName);
+                        WriteAttrIf(xw, "role", t.InferredRole);
+                        xw.WriteAttributeString("rows", FmtL(t.RowCount));
+                        xw.WriteAttributeString("rowShare", FmtD(t.RowShare));
+                        xw.WriteAttributeString("cols", FmtL(t.ColumnCount));
+                        xw.WriteAttributeString("sizeKB", FmtD(Math.Round(t.FileSizeBytes / 1024.0, 4)));
+                        xw.WriteAttributeString("sizeShare", FmtD(t.SizeShare));
+                        xw.WriteAttributeString("minRowB", FmtL(t.MinRowBytes));
+                        xw.WriteAttributeString("avgRowB", FmtD(t.AvgRowBytes));
+                        xw.WriteAttributeString("maxRowB", FmtL(t.MaxRowBytes));
+                        xw.WriteAttributeString("innoKB", FmtD(Math.Round(t.EstInnoDbBytes / 1024.0, 2)));
+                        xw.WriteAttributeString("innoPages", FmtL(t.EstInnoDbPages));
+                        xw.WriteAttributeString("rowsPerPg", FmtD(t.RowsPerInnoDbPage));
+                        xw.WriteAttributeString("avgNull", FmtD(t.AvgNullRate));
+                        xw.WriteAttributeString("avgCard", FmtD(t.AvgCardinalityRate));
+                        WriteAttrIf(xw, "typeBrk", t.ColumnTypeBreakdown);
+                        WriteAttrIf(xw, "qRisk", t.QualityRiskBreakdown);
+                        xw.WriteAttributeString("ragged", FmtL(t.RaggedRowCount));
+                        WriteAttrIf(xw, "pks", t.CandidatePks);
+                        WriteAttrIf(xw, "catCols", t.CategoricalColumns);
+                        WriteAttrIf(xw, "dtCols", t.DateColumns);
+                        WriteAttrIf(xw, "dtRange", t.PrimaryDateRange);
+                        WriteAttrIf(xw, "relSum", t.RelationSummary);
+                        WriteAttrIf(xw, "jmReady", t.JMeterReadiness);
+                        xw.WriteAttributeString("warnCnt", FmtL(t.WarningCount));
+                        xw.WriteAttributeString("hiWarnCnt", FmtL(t.HighWarningCount));
+                        WriteAttrIf(xw, "warnSum", t.WarningSummary);
+                        WriteAttrIf(xw, "rowHash", t.RowMultisetHash);
+
+                        if (t.DbMeta != null && (t.DbMeta.HasMetadata || t.DbMeta.Indexes.Count > 0 || t.DbMeta.DeclaredFks.Count > 0))
+                        {
+                            xw.WriteStartElement("DbMeta", SnapshotNamespace);
+                            xw.WriteAttributeString("hasMeta", t.DbMeta.HasMetadata ? "1" : "0");
+                            WriteAttrIf(xw, "engine", t.DbMeta.Engine);
+                            WriteAttrIf(xw, "rowFmt", t.DbMeta.RowFormat);
+                            xw.WriteAttributeString("estRows", FmtL(t.DbMeta.EstTableRows));
+                            xw.WriteAttributeString("avgLen", FmtL(t.DbMeta.AvgRowLength));
+                            xw.WriteAttributeString("dataLen", FmtL(t.DbMeta.DataLength));
+                            xw.WriteAttributeString("idxLen", FmtL(t.DbMeta.IndexLength));
+                            xw.WriteAttributeString("dataFree", FmtL(t.DbMeta.DataFree));
+                            if (t.DbMeta.HasAutoIncrement)
+                            {
+                                xw.WriteAttributeString("hasAi", "1");
+                                xw.WriteAttributeString("ai", FmtL(t.DbMeta.AutoIncrement));
+                            }
+                            WriteAttrIf(xw, "ctime", t.DbMeta.CreateTime);
+                            WriteAttrIf(xw, "utime", t.DbMeta.UpdateTime);
+                            WriteAttrIf(xw, "collation", t.DbMeta.TableCollation);
+                            WriteAttrIf(xw, "comment", t.DbMeta.TableComment);
+                            if (t.DbMeta.Indexes.Count > 0)
+                            {
+                                xw.WriteStartElement("Indexes", SnapshotNamespace);
+                                for (int ii = 0; ii < t.DbMeta.Indexes.Count; ii++)
+                                {
+                                    DbIndexMetadata im = t.DbMeta.Indexes[ii];
+                                    xw.WriteStartElement("Idx", SnapshotNamespace);
+                                    xw.WriteAttributeString("name", CleanXml(im.IndexName));
+                                    xw.WriteAttributeString("nonUniq", im.NonUnique ? "1" : "0");
+                                    WriteAttrIf(xw, "type", im.IndexType);
+                                    WriteAttrIf(xw, "cols", im.Columns);
+                                    xw.WriteAttributeString("card", FmtL(im.Cardinality));
+                                    xw.WriteEndElement();
+                                }
+                                xw.WriteEndElement();
+                            }
+                            if (t.DbMeta.DeclaredFks.Count > 0)
+                            {
+                                xw.WriteStartElement("Fks", SnapshotNamespace);
+                                for (int fi = 0; fi < t.DbMeta.DeclaredFks.Count; fi++)
+                                {
+                                    DbForeignKeyMetadata fk = t.DbMeta.DeclaredFks[fi];
+                                    xw.WriteStartElement("Fk", SnapshotNamespace);
+                                    xw.WriteAttributeString("name", CleanXml(fk.ConstraintName));
+                                    xw.WriteAttributeString("col", CleanXml(fk.ColumnName));
+                                    xw.WriteAttributeString("refT", CleanXml(fk.ReferencedTableName));
+                                    xw.WriteAttributeString("refC", CleanXml(fk.ReferencedColumnName));
+                                    xw.WriteEndElement();
+                                }
+                                xw.WriteEndElement();
+                            }
+                            xw.WriteEndElement();
+                        }
+
+                        if (t.RowSketch != null && t.RowSketch.IsValid && t.RowSketch.Entries != null && t.RowSketch.Entries.Count > 0)
+                        {
+                            int takeN = Math.Min(t.RowSketch.Entries.Count, perTableCap);
+                            bool effExact = t.RowSketch.IsExact && (takeN == t.RowSketch.Entries.Count);
+                            ulong effMaxPk = effExact ? ulong.MaxValue : t.RowSketch.Entries[takeN - 1].PkHash;
+                            xw.WriteStartElement("RowSketch", SnapshotNamespace);
+                            xw.WriteAttributeString("keys", CleanXml(t.RowSketch.KeyColumns));
+                            xw.WriteAttributeString("exact", effExact ? "1" : "0");
+                            xw.WriteAttributeString("total", FmtL(t.RowSketch.TotalRows));
+                            xw.WriteAttributeString("maxPk", FmtUL(effMaxPk));
+                            xw.WriteString(ContentHashHelper.EncodeSketchEntries(t.RowSketch.Entries, takeN));
+                            xw.WriteEndElement();
+                        }
+
+                        xw.WriteStartElement("Columns", SnapshotNamespace);
+                        for (int ci = 0; ci < t.Columns.Count; ci++)
+                        {
+                            ColumnAnalysis c = t.Columns[ci];
+                            xw.WriteStartElement("Col", SnapshotNamespace);
+                            xw.WriteAttributeString("idx", FmtL(c.ColumnIndex));
+                            xw.WriteAttributeString("name", CleanXml(c.ColumnName));
+                            xw.WriteAttributeString("type", CleanXml(c.InferredType));
+                            WriteAttrIf(xw, "role", c.KeyRole);
+                            xw.WriteAttributeString("rows", FmtL(c.TotalRows));
+                            xw.WriteAttributeString("nn", FmtL(c.NonNullCount));
+                            xw.WriteAttributeString("nulls", FmtL(c.NullCount));
+                            xw.WriteAttributeString("nullR", FmtD(c.NullRate));
+                            xw.WriteAttributeString("dist", FmtL(c.DistinctCount));
+                            xw.WriteAttributeString("distCap", c.DistinctCapped ? "1" : "0");
+                            xw.WriteAttributeString("cardR", FmtD(c.CardinalityRate));
+                            WriteAttrIf(xw, "sel", c.SelectivityRating);
+                            xw.WriteAttributeString("isPk", c.IsCandidatePk ? "1" : "0");
+                            xw.WriteAttributeString("minC", FmtL(c.MinCharLen));
+                            xw.WriteAttributeString("avgC", FmtD(c.AvgCharLen));
+                            xw.WriteAttributeString("maxC", FmtL(c.MaxCharLen));
+                            xw.WriteAttributeString("minB", FmtL(c.MinByteLen));
+                            xw.WriteAttributeString("avgB", FmtD(c.AvgByteLen));
+                            xw.WriteAttributeString("p95B", FmtL(c.P95ByteLen));
+                            xw.WriteAttributeString("maxB", FmtL(c.MaxByteLen));
+                            WriteAttrIf(xw, "top1", c.Top1Value);
+                            xw.WriteAttributeString("top1C", FmtL(c.Top1Count));
+                            xw.WriteAttributeString("top1S", FmtD(c.Top1Share));
+                            xw.WriteAttributeString("top3S", FmtD(c.Top3Share));
+                            xw.WriteAttributeString("top5S", FmtD(c.Top5Share));
+                            xw.WriteAttributeString("top10S", FmtD(c.Top10Share));
+                            xw.WriteAttributeString("gini", FmtD(c.GiniCoefficient));
+                            xw.WriteAttributeString("ent", FmtD(c.NormalizedEntropy));
+                            WriteAttrIf(xw, "skew", c.SkewRisk);
+                            xw.WriteAttributeString("isCat", c.IsCategorical ? "1" : "0");
+                            xw.WriteAttributeString("ws", FmtL(c.WhitespaceOnlyCount));
+                            xw.WriteAttributeString("ml", FmtL(c.MultilineCount));
+                            xw.WriteAttributeString("na", FmtL(c.NonAsciiCount));
+                            xw.WriteAttributeString("naR", FmtD(c.NonAsciiRate));
+                            WriteAttrIf(xw, "minV", c.MinValueText == "-" ? "" : c.MinValueText);
+                            WriteAttrIf(xw, "maxV", c.MaxValueText == "-" ? "" : c.MaxValueText);
+                            WriteAttrIf(xw, "detSum", c.DetailStatsSummary == "-" ? "" : c.DetailStatsSummary);
+                            WriteAttrIf(xw, "relSum", c.RelationSummary == "-" ? "" : c.RelationSummary);
+                            WriteAttrIf(xw, "alert", c.AlertNote);
+                            WriteAttrIf(xw, "cHash", c.ContentHash);
+                            WriteAttrIf(xw, "dHash", c.DistinctSetHash);
+
+                            if (c.DbMeta != null)
+                            {
+                                xw.WriteStartElement("DbCol", SnapshotNamespace);
+                                xw.WriteAttributeString("pos", FmtL(c.DbMeta.OrdinalPosition));
+                                WriteAttrIf(xw, "ddl", c.DbMeta.ColumnType);
+                                WriteAttrIf(xw, "null", c.DbMeta.IsNullable);
+                                WriteAttrIf(xw, "key", c.DbMeta.ColumnKey);
+                                WriteAttrIf(xw, "def", c.DbMeta.ColumnDefault);
+                                WriteAttrIf(xw, "extra", c.DbMeta.Extra);
+                                WriteAttrIf(xw, "cs", c.DbMeta.CharacterSetName);
+                                WriteAttrIf(xw, "coll", c.DbMeta.CollationName);
+                                WriteAttrIf(xw, "cmt", c.DbMeta.ColumnComment);
+                                xw.WriteEndElement();
+                            }
+
+                            if (c.TopValues != null && c.TopValues.Count > 0 && !c.IsCandidatePk)
+                            {
+                                xw.WriteStartElement("Top", SnapshotNamespace);
+                                for (int vi = 0; vi < c.TopValues.Count; vi++)
+                                {
+                                    ValueShareItem tv = c.TopValues[vi];
+                                    xw.WriteStartElement("I", SnapshotNamespace);
+                                    xw.WriteAttributeString("v", CleanXml(tv.Value));
+                                    xw.WriteAttributeString("c", FmtL(tv.Count));
+                                    xw.WriteAttributeString("s", FmtD(tv.Share));
+                                    xw.WriteAttributeString("cs", FmtD(tv.CumulativeShare));
+                                    xw.WriteEndElement();
+                                }
+                                xw.WriteEndElement();
+                            }
+
+                            if (c.IsNumeric && c.NonNullCount > 0)
+                            {
+                                xw.WriteStartElement("Num", SnapshotNamespace);
+                                xw.WriteAttributeString("nn", FmtL(c.NonNullCount));
+                                xw.WriteAttributeString("min", FmtD(c.NumMin));
+                                xw.WriteAttributeString("p05", FmtD(c.NumP05));
+                                xw.WriteAttributeString("p10", FmtD(c.NumP10));
+                                xw.WriteAttributeString("p25", FmtD(c.NumP25));
+                                xw.WriteAttributeString("med", FmtD(c.NumMedian));
+                                xw.WriteAttributeString("mean", FmtD(c.NumMean));
+                                xw.WriteAttributeString("p75", FmtD(c.NumP75));
+                                xw.WriteAttributeString("p90", FmtD(c.NumP90));
+                                xw.WriteAttributeString("p95", FmtD(c.NumP95));
+                                xw.WriteAttributeString("p99", FmtD(c.NumP99));
+                                xw.WriteAttributeString("max", FmtD(c.NumMax));
+                                xw.WriteAttributeString("std", FmtD(c.NumStdDev));
+                                xw.WriteAttributeString("sum", FmtD(c.NumSum));
+                                xw.WriteAttributeString("zR", FmtD(c.ZeroRate));
+                                xw.WriteAttributeString("nR", FmtD(c.NegativeRate));
+                                xw.WriteAttributeString("oR", FmtD(c.OutlierRate));
+                                xw.WriteEndElement();
+                            }
+
+                            if (c.IsDateTime && c.NonNullCount > 0 && c.MinDate.HasValue && c.MaxDate.HasValue)
+                            {
+                                xw.WriteStartElement("Dt", SnapshotNamespace);
+                                xw.WriteAttributeString("nn", FmtL(c.NonNullCount));
+                                xw.WriteAttributeString("hasT", c.HasTimeComponent ? "1" : "0");
+                                xw.WriteAttributeString("min", c.MinDate.Value.ToString("yyyy/MM/dd HH:mm:ss", CultureInfo.InvariantCulture));
+                                xw.WriteAttributeString("max", c.MaxDate.Value.ToString("yyyy/MM/dd HH:mm:ss", CultureInfo.InvariantCulture));
+                                xw.WriteAttributeString("span", FmtD(c.DateSpanDays));
+                                xw.WriteAttributeString("avg", FmtD(c.AvgPerDay));
+                                WriteAttrIf(xw, "pkD", c.PeakDay);
+                                xw.WriteAttributeString("pkC", FmtL(c.PeakDayCount));
+                                xw.WriteAttributeString("pkR", FmtD(c.PeakBurstRatio));
+                                if (c.MonthlyCounts != null && c.MonthlyCounts.Count > 0)
+                                {
+                                    xw.WriteStartElement("M", SnapshotNamespace);
+                                    foreach (KeyValuePair<string, long> mk in c.MonthlyCounts)
+                                    {
+                                        xw.WriteStartElement("E", SnapshotNamespace);
+                                        xw.WriteAttributeString("k", CleanXml(mk.Key));
+                                        xw.WriteAttributeString("v", FmtL(mk.Value));
+                                        xw.WriteEndElement();
+                                    }
+                                    xw.WriteEndElement();
+                                }
+                                if (c.RecentDailyCounts != null && c.RecentDailyCounts.Count > 0)
+                                {
+                                    xw.WriteStartElement("D", SnapshotNamespace);
+                                    foreach (KeyValuePair<string, long> dk in c.RecentDailyCounts)
+                                    {
+                                        xw.WriteStartElement("E", SnapshotNamespace);
+                                        xw.WriteAttributeString("k", CleanXml(dk.Key));
+                                        xw.WriteAttributeString("v", FmtL(dk.Value));
+                                        xw.WriteEndElement();
+                                    }
+                                    xw.WriteEndElement();
+                                }
+                                if (c.DayOfWeekCounts != null && c.DayOfWeekCounts.Length == 7)
+                                {
+                                    xw.WriteElementString("Dow", SnapshotNamespace, string.Join(",", c.DayOfWeekCounts.Select(x => FmtL(x)).ToArray()));
+                                }
+                                if (c.HourlyCounts != null && c.HourlyCounts.Length == 24)
+                                {
+                                    xw.WriteElementString("Hr", SnapshotNamespace, string.Join(",", c.HourlyCounts.Select(x => FmtL(x)).ToArray()));
+                                }
+                                xw.WriteEndElement();
+                            }
+
+                            xw.WriteEndElement(); // Col
+                        }
+                        xw.WriteEndElement(); // Columns
+                        xw.WriteEndElement(); // Table
+                    }
+                    xw.WriteEndElement(); // Tables
+
+                    if (analysis.Relationships != null && analysis.Relationships.Count > 0)
+                    {
+                        xw.WriteStartElement("Relationships", SnapshotNamespace);
+                        for (int ri = 0; ri < analysis.Relationships.Count; ri++)
+                        {
+                            RelationshipAnalysis rl = analysis.Relationships[ri];
+                            xw.WriteStartElement("Rel", SnapshotNamespace);
+                            xw.WriteAttributeString("pT", CleanXml(rl.ParentTable));
+                            xw.WriteAttributeString("pC", CleanXml(rl.ParentColumn));
+                            xw.WriteAttributeString("cT", CleanXml(rl.ChildTable));
+                            xw.WriteAttributeString("cC", CleanXml(rl.ChildColumn));
+                            xw.WriteAttributeString("pD", FmtL(rl.ParentDistinctCount));
+                            xw.WriteAttributeString("cN", FmtL(rl.ChildNonNullRows));
+                            xw.WriteAttributeString("cD", FmtL(rl.ChildDistinctKeys));
+                            xw.WriteAttributeString("mR", FmtL(rl.MatchedRows));
+                            xw.WriteAttributeString("oR", FmtL(rl.OrphanRows));
+                            xw.WriteAttributeString("rate", FmtD(rl.MatchRate));
+                            xw.WriteAttributeString("fMin", FmtL(rl.FanOutMin));
+                            xw.WriteAttributeString("fAvg", FmtD(rl.FanOutAvg));
+                            xw.WriteAttributeString("fP50", FmtD(rl.FanOutP50));
+                            xw.WriteAttributeString("fP95", FmtD(rl.FanOutP95));
+                            xw.WriteAttributeString("fP99", FmtD(rl.FanOutP99));
+                            xw.WriteAttributeString("fMax", FmtL(rl.FanOutMax));
+                            WriteAttrIf(xw, "maxK", rl.MaxFanOutKey);
+                            WriteAttrIf(xw, "risk", rl.RiskLevel);
+                            WriteAttrIf(xw, "note", rl.Note);
+                            xw.WriteEndElement();
+                        }
+                        xw.WriteEndElement();
+                    }
+
+                    if (analysis.Warnings != null && analysis.Warnings.Count > 0)
+                    {
+                        xw.WriteStartElement("Warnings", SnapshotNamespace);
+                        for (int wi = 0; wi < analysis.Warnings.Count; wi++)
+                        {
+                            WarningItem w = analysis.Warnings[wi];
+                            xw.WriteStartElement("W", SnapshotNamespace);
+                            xw.WriteAttributeString("sev", CleanXml(w.Severity));
+                            xw.WriteAttributeString("cat", CleanXml(w.Category));
+                            xw.WriteAttributeString("tbl", CleanXml(w.TableName));
+                            xw.WriteAttributeString("col", CleanXml(w.ColumnName));
+                            WriteAttrIf(xw, "met", w.MetricValue);
+                            WriteAttrIf(xw, "imp", w.PerfImpact);
+                            WriteAttrIf(xw, "rec", w.Recommendation);
+                            xw.WriteEndElement();
+                        }
+                        xw.WriteEndElement();
+                    }
+
+                    if (analysis.JMeterCandidates != null && analysis.JMeterCandidates.Count > 0)
+                    {
+                        xw.WriteStartElement("JMeter", SnapshotNamespace);
+                        for (int ji = 0; ji < analysis.JMeterCandidates.Count; ji++)
+                        {
+                            JMeterCandidateItem jc = analysis.JMeterCandidates[ji];
+                            xw.WriteStartElement("J", SnapshotNamespace);
+                            xw.WriteAttributeString("tbl", CleanXml(jc.TableName));
+                            xw.WriteAttributeString("col", CleanXml(jc.KeyColumn));
+                            xw.WriteAttributeString("uniq", FmtL(jc.UniqueCount));
+                            xw.WriteAttributeString("tot", FmtL(jc.TotalRows));
+                            WriteAttrIf(xw, "type", jc.DataType);
+                            WriteAttrIf(xw, "suit", jc.Suitability);
+                            WriteAttrIf(xw, "use", jc.RecommendedUsage);
+                            xw.WriteEndElement();
+                        }
+                        xw.WriteEndElement();
+                    }
+
+                    xw.WriteEndElement(); // AuroraAnalysisSnapshot
+                    xw.WriteEndDocument();
+                }
+                return Encoding.UTF8.GetString(ms.ToArray());
+            }
+        }
+
+        private static string Attr(XmlNode node, string name)
+        {
+            if (node == null || node.Attributes == null) return "";
+            XmlAttribute a = node.Attributes[name];
+            if (a == null || string.IsNullOrEmpty(a.Value)) return "";
+            string v = a.Value;
+            if (v.IndexOf('\r') >= 0) v = v.Replace("\r\n", "\n").Replace("\r", "\n");
+            return v;
+        }
+
+        private static long AttrL(XmlNode node, string name)
+        {
+            string s = Attr(node, name);
+            long v;
+            return long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : 0L;
+        }
+
+        private static ulong AttrUL(XmlNode node, string name)
+        {
+            string s = Attr(node, name);
+            ulong v;
+            return ulong.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : 0UL;
+        }
+
+        private static double AttrD(XmlNode node, string name)
+        {
+            string s = Attr(node, name);
+            double v;
+            return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0.0;
+        }
+
+        private static long[] ParseCsvLongs(string csv, int expectedLen)
+        {
+            long[] arr = new long[expectedLen];
+            if (string.IsNullOrWhiteSpace(csv)) return arr;
+            string[] parts = csv.Split(',');
+            for (int i = 0; i < parts.Length && i < expectedLen; i++)
+            {
+                long v;
+                if (long.TryParse(parts[i].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) arr[i] = v;
+            }
+            return arr;
+        }
+
+        public static bool TryLoadFromZip(ZipArchive zip, AnalysisWorkbookSnapshot snap)
+        {
+            if (zip == null || snap == null) return false;
+            foreach (ZipArchiveEntry entry in zip.Entries)
+            {
+                string norm = entry.FullName.Replace('\\', '/').TrimStart('/');
+                if (!norm.StartsWith("customXml/item", StringComparison.OrdinalIgnoreCase) ||
+                    !norm.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) ||
+                    norm.IndexOf("itemProps", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    continue;
+                }
+                try
+                {
+                    XmlDocument doc = new XmlDocument();
+                    doc.XmlResolver = null;
+                    XmlReaderSettings rs = new XmlReaderSettings();
+                    rs.DtdProcessing = DtdProcessing.Prohibit;
+                    rs.CheckCharacters = false;
+                    using (Stream s = entry.Open())
+                    using (XmlReader xr = XmlReader.Create(s, rs))
+                    {
+                        doc.Load(xr);
+                    }
+                    XmlElement root = doc.DocumentElement;
+                    if (root == null || root.LocalName != "AuroraAnalysisSnapshot") continue;
+                    PopulateSnapshotFromXml(root, snap);
+                    return true;
+                }
+                catch
+                {
+                    // Skip non-matching customXml parts
+                }
+            }
+            return false;
+        }
+
+        private static void PopulateSnapshotFromXml(XmlElement root, AnalysisWorkbookSnapshot snap)
+        {
+            snap.HasEmbeddedSnapshot = true;
+            snap.SnapshotVersion = (int)AttrL(root, "version");
+            snap.SourceMode = Attr(root, "sourceMode");
+            snap.IsDirectDb = Attr(root, "isDirectDb") == "1";
+            snap.DbLabel = Attr(root, "dbLabel");
+            string inp = Attr(root, "inputFolder");
+            if (!string.IsNullOrEmpty(inp)) snap.InputFolder = inp;
+            string dispAt = Attr(root, "analyzedAtDisplay");
+            if (!string.IsNullOrEmpty(dispAt)) snap.AnalyzedAtText = dispAt;
+            string isoAt = Attr(root, "analyzedAt");
+            DateTime parsedDt;
+            if (!string.IsNullOrEmpty(isoAt) && DateTime.TryParseExact(isoAt, new string[] { "yyyy-MM-ddTHH:mm:ss.fff", "yyyy-MM-ddTHH:mm:ss" }, CultureInfo.InvariantCulture, DateTimeStyles.None, out parsedDt))
+            {
+                snap.AnalyzedAt = parsedDt;
+            }
+            snap.TotalEstInnoDbPages = AttrL(root, "totalEstInnoDbPages");
+            snap.TotalOrphanRows = AttrL(root, "totalOrphanRows");
+            snap.EstMinAcuCurrent = AttrD(root, "estMinAcuCurrent");
+            snap.EstMinAcu10x = AttrD(root, "estMinAcu10x");
+            snap.HasAcuEstimate = snap.EstMinAcuCurrent > 0.0;
+            snap.PrimaryTimeSeriesSource = Attr(root, "primaryTsSource");
+
+            foreach (XmlNode child in root.ChildNodes)
+            {
+                if (child.NodeType != XmlNodeType.Element) continue;
+                if (child.LocalName == "DbServer")
+                {
+                    DbServerMetadata srv = new DbServerMetadata();
+                    foreach (XmlNode sub in child.ChildNodes)
+                    {
+                        if (sub.NodeType != XmlNodeType.Element) continue;
+                        if (sub.LocalName == "Variables")
+                        {
+                            foreach (XmlNode vn in sub.ChildNodes)
+                            {
+                                if (vn.NodeType != XmlNodeType.Element) continue;
+                                string k = Attr(vn, "k");
+                                if (!string.IsNullOrEmpty(k)) srv.Variables[k] = Attr(vn, "v");
+                            }
+                            if (srv.Variables.Count > 0) srv.HasVariables = true;
+                        }
+                        else if (sub.LocalName == "Status")
+                        {
+                            foreach (XmlNode sn in sub.ChildNodes)
+                            {
+                                if (sn.NodeType != XmlNodeType.Element) continue;
+                                string k = Attr(sn, "k");
+                                if (!string.IsNullOrEmpty(k)) srv.StatusCounters[k] = AttrL(sn, "v");
+                            }
+                            if (srv.StatusCounters.Count > 0) srv.HasStatus = true;
+                        }
+                    }
+                    snap.DbServer = srv;
+                }
+                else if (child.LocalName == "Tables")
+                {
+                    foreach (XmlNode tn in child.ChildNodes)
+                    {
+                        if (tn.NodeType != XmlNodeType.Element || tn.LocalName != "Table") continue;
+                        SnapshotTable st = new SnapshotTable();
+                        st.TableName = Attr(tn, "name");
+                        st.FileName = Attr(tn, "file");
+                        st.EncodingName = Attr(tn, "enc");
+                        st.InferredRole = Attr(tn, "role");
+                        st.RowCount = AttrL(tn, "rows");
+                        st.RowShare = AttrD(tn, "rowShare");
+                        st.ColumnCount = (int)AttrL(tn, "cols");
+                        st.FileSizeKB = AttrD(tn, "sizeKB");
+                        st.SizeShare = AttrD(tn, "sizeShare");
+                        st.MinRowBytes = AttrL(tn, "minRowB");
+                        st.AvgRowBytes = AttrD(tn, "avgRowB");
+                        st.MaxRowBytes = AttrL(tn, "maxRowB");
+                        st.EstInnoDbKB = AttrD(tn, "innoKB");
+                        st.EstInnoDbPages = AttrL(tn, "innoPages");
+                        st.RowsPerInnoDbPage = AttrD(tn, "rowsPerPg");
+                        st.AvgNullRate = AttrD(tn, "avgNull");
+                        st.AvgCardinalityRate = AttrD(tn, "avgCard");
+                        st.ColumnTypeBreakdown = Attr(tn, "typeBrk");
+                        st.QualityRiskBreakdown = Attr(tn, "qRisk");
+                        st.RaggedRowCount = AttrL(tn, "ragged");
+                        st.CandidatePks = Attr(tn, "pks");
+                        st.CategoricalColumns = Attr(tn, "catCols");
+                        st.DateColumns = Attr(tn, "dtCols");
+                        st.PrimaryDateRange = Attr(tn, "dtRange");
+                        st.RelationSummary = Attr(tn, "relSum");
+                        st.JMeterReadiness = Attr(tn, "jmReady");
+                        st.WarningCount = (int)AttrL(tn, "warnCnt");
+                        st.HighWarningCount = (int)AttrL(tn, "hiWarnCnt");
+                        st.WarningSummary = Attr(tn, "warnSum");
+                        st.RowMultisetHash = Attr(tn, "rowHash");
+
+                        foreach (XmlNode tSub in tn.ChildNodes)
+                        {
+                            if (tSub.NodeType != XmlNodeType.Element) continue;
+                            if (tSub.LocalName == "DbMeta")
+                            {
+                                DbTableMetadata dm = new DbTableMetadata();
+                                dm.HasMetadata = Attr(tSub, "hasMeta") == "1";
+                                dm.Engine = Attr(tSub, "engine");
+                                dm.RowFormat = Attr(tSub, "rowFmt");
+                                dm.EstTableRows = AttrL(tSub, "estRows");
+                                dm.AvgRowLength = AttrL(tSub, "avgLen");
+                                dm.DataLength = AttrL(tSub, "dataLen");
+                                dm.IndexLength = AttrL(tSub, "idxLen");
+                                dm.DataFree = AttrL(tSub, "dataFree");
+                                dm.HasAutoIncrement = Attr(tSub, "hasAi") == "1";
+                                dm.AutoIncrement = AttrL(tSub, "ai");
+                                dm.CreateTime = Attr(tSub, "ctime");
+                                dm.UpdateTime = Attr(tSub, "utime");
+                                dm.TableCollation = Attr(tSub, "collation");
+                                dm.TableComment = Attr(tSub, "comment");
+                                foreach (XmlNode dSub in tSub.ChildNodes)
+                                {
+                                    if (dSub.NodeType != XmlNodeType.Element) continue;
+                                    if (dSub.LocalName == "Indexes")
+                                    {
+                                        foreach (XmlNode ix in dSub.ChildNodes)
+                                        {
+                                            if (ix.NodeType != XmlNodeType.Element) continue;
+                                            DbIndexMetadata im = new DbIndexMetadata();
+                                            im.IndexName = Attr(ix, "name");
+                                            im.NonUnique = Attr(ix, "nonUniq") == "1";
+                                            im.IndexType = Attr(ix, "type");
+                                            im.Columns = Attr(ix, "cols");
+                                            im.Cardinality = AttrL(ix, "card");
+                                            dm.Indexes.Add(im);
+                                        }
+                                    }
+                                    else if (dSub.LocalName == "Fks")
+                                    {
+                                        foreach (XmlNode fn in dSub.ChildNodes)
+                                        {
+                                            if (fn.NodeType != XmlNodeType.Element) continue;
+                                            DbForeignKeyMetadata fk = new DbForeignKeyMetadata();
+                                            fk.ConstraintName = Attr(fn, "name");
+                                            fk.ColumnName = Attr(fn, "col");
+                                            fk.ReferencedTableName = Attr(fn, "refT");
+                                            fk.ReferencedColumnName = Attr(fn, "refC");
+                                            dm.DeclaredFks.Add(fk);
+                                        }
+                                    }
+                                }
+                                st.DbMeta = dm;
+                            }
+                            else if (tSub.LocalName == "RowSketch")
+                            {
+                                RowChurnSketch sk = new RowChurnSketch();
+                                sk.KeyColumns = Attr(tSub, "keys");
+                                sk.IsExact = Attr(tSub, "exact") == "1";
+                                sk.TotalRows = AttrL(tSub, "total");
+                                sk.MaxKeptPkHash = AttrUL(tSub, "maxPk");
+                                sk.Entries = ContentHashHelper.DecodeSketchEntries(tSub.InnerText);
+                                sk.IsValid = sk.Entries.Count > 0 && !string.IsNullOrEmpty(sk.KeyColumns);
+                                st.RowSketch = sk;
+                            }
+                            else if (tSub.LocalName == "Columns")
+                            {
+                                foreach (XmlNode cn in tSub.ChildNodes)
+                                {
+                                    if (cn.NodeType != XmlNodeType.Element || cn.LocalName != "Col") continue;
+                                    SnapshotColumn sc = new SnapshotColumn();
+                                    sc.TableName = st.TableName;
+                                    sc.ColumnIndex = (int)AttrL(cn, "idx");
+                                    sc.ColumnName = Attr(cn, "name");
+                                    sc.InferredType = Attr(cn, "type");
+                                    sc.KeyRole = Attr(cn, "role");
+                                    sc.TotalRows = AttrL(cn, "rows");
+                                    sc.NonNullCount = AttrL(cn, "nn");
+                                    sc.NullCount = AttrL(cn, "nulls");
+                                    sc.NullRate = AttrD(cn, "nullR");
+                                    sc.DistinctCount = AttrL(cn, "dist");
+                                    sc.DistinctCapped = Attr(cn, "distCap") == "1";
+                                    sc.CardinalityRate = AttrD(cn, "cardR");
+                                    sc.SelectivityRating = Attr(cn, "sel");
+                                    sc.IsCandidatePk = Attr(cn, "isPk") == "1";
+                                    sc.MinCharLen = (int)AttrL(cn, "minC");
+                                    sc.AvgCharLen = AttrD(cn, "avgC");
+                                    sc.MaxCharLen = (int)AttrL(cn, "maxC");
+                                    sc.MinByteLen = AttrL(cn, "minB");
+                                    sc.AvgByteLen = AttrD(cn, "avgB");
+                                    sc.P95ByteLen = AttrL(cn, "p95B");
+                                    sc.MaxByteLen = AttrL(cn, "maxB");
+                                    sc.Top1Value = Attr(cn, "top1");
+                                    sc.Top1Count = AttrL(cn, "top1C");
+                                    sc.Top1Share = AttrD(cn, "top1S");
+                                    sc.Top3Share = AttrD(cn, "top3S");
+                                    sc.Top5Share = AttrD(cn, "top5S");
+                                    sc.Top10Share = AttrD(cn, "top10S");
+                                    sc.GiniCoefficient = AttrD(cn, "gini");
+                                    sc.NormalizedEntropy = AttrD(cn, "ent");
+                                    sc.HasNormalizedEntropy = true;
+                                    sc.SkewRisk = Attr(cn, "skew");
+                                    sc.IsCategorical = Attr(cn, "isCat") == "1";
+                                    sc.WhitespaceOnlyCount = AttrL(cn, "ws");
+                                    sc.MultilineCount = AttrL(cn, "ml");
+                                    sc.NonAsciiCount = AttrL(cn, "na");
+                                    sc.NonAsciiRate = AttrD(cn, "naR");
+                                    sc.HasCharQualityCounts = true;
+                                    sc.MinValueText = Attr(cn, "minV");
+                                    sc.MaxValueText = Attr(cn, "maxV");
+                                    sc.DetailStatsSummary = Attr(cn, "detSum");
+                                    sc.RelationSummary = Attr(cn, "relSum");
+                                    sc.AlertNote = Attr(cn, "alert");
+                                    sc.ContentHash = Attr(cn, "cHash");
+                                    sc.DistinctSetHash = Attr(cn, "dHash");
+
+                                    foreach (XmlNode cSub in cn.ChildNodes)
+                                    {
+                                        if (cSub.NodeType != XmlNodeType.Element) continue;
+                                        if (cSub.LocalName == "DbCol")
+                                        {
+                                            DbColumnMetadata cm = new DbColumnMetadata();
+                                            cm.ColumnName = sc.ColumnName;
+                                            cm.OrdinalPosition = (int)AttrL(cSub, "pos");
+                                            cm.ColumnType = Attr(cSub, "ddl");
+                                            cm.IsNullable = Attr(cSub, "null");
+                                            cm.ColumnKey = Attr(cSub, "key");
+                                            cm.ColumnDefault = Attr(cSub, "def");
+                                            cm.Extra = Attr(cSub, "extra");
+                                            cm.CharacterSetName = Attr(cSub, "cs");
+                                            cm.CollationName = Attr(cSub, "coll");
+                                            cm.ColumnComment = Attr(cSub, "cmt");
+                                            sc.DbMeta = cm;
+                                        }
+                                        else if (cSub.LocalName == "Top")
+                                        {
+                                            Dictionary<string, SnapshotCategoryItem> dist = new Dictionary<string, SnapshotCategoryItem>(StringComparer.Ordinal);
+                                            int topIdx = 0;
+                                            foreach (XmlNode itemN in cSub.ChildNodes)
+                                            {
+                                                if (itemN.NodeType != XmlNodeType.Element) continue;
+                                                SnapshotCategoryItem ci = new SnapshotCategoryItem();
+                                                ci.Value = Attr(itemN, "v");
+                                                ci.Count = AttrL(itemN, "c");
+                                                ci.Share = AttrD(itemN, "s");
+                                                ci.CumulativeShare = AttrD(itemN, "cs");
+                                                if (!dist.ContainsKey(ci.Value)) dist[ci.Value] = ci;
+                                                if (topIdx < 5 && !(sc.NonNullCount > 0 && sc.DistinctCount == sc.NonNullCount && sc.DistinctCount > 10))
+                                                {
+                                                    string compactKey = (ci.Value ?? "").Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
+                                                    if (compactKey.Length > 24) compactKey = compactKey.Substring(0, 21) + "...";
+                                                    if (!string.IsNullOrEmpty(compactKey) && !sc.TopDistCounts.ContainsKey(compactKey))
+                                                    {
+                                                        sc.TopDistCounts[compactKey] = ci.Count;
+                                                    }
+                                                }
+                                                topIdx++;
+                                            }
+                                            if (sc.IsCategorical && dist.Count > 0)
+                                            {
+                                                st.Distributions[sc.ColumnName] = dist;
+                                            }
+                                        }
+                                        else if (cSub.LocalName == "Num")
+                                        {
+                                            SnapshotNumericStats ns = new SnapshotNumericStats();
+                                            ns.ColumnName = sc.ColumnName;
+                                            ns.NonNullCount = AttrL(cSub, "nn");
+                                            ns.Min = AttrD(cSub, "min");
+                                            ns.HasP05 = true; ns.P05 = AttrD(cSub, "p05");
+                                            ns.HasP10 = true; ns.P10 = AttrD(cSub, "p10");
+                                            ns.P25 = AttrD(cSub, "p25");
+                                            ns.Median = AttrD(cSub, "med");
+                                            ns.Mean = AttrD(cSub, "mean");
+                                            ns.P75 = AttrD(cSub, "p75");
+                                            ns.HasP90 = true; ns.P90 = AttrD(cSub, "p90");
+                                            ns.P95 = AttrD(cSub, "p95");
+                                            ns.P99 = AttrD(cSub, "p99");
+                                            ns.Max = AttrD(cSub, "max");
+                                            ns.StdDev = AttrD(cSub, "std");
+                                            ns.HasSum = true; ns.Sum = AttrD(cSub, "sum");
+                                            ns.HasZeroRate = true; ns.ZeroRate = AttrD(cSub, "zR");
+                                            ns.HasNegativeRate = true; ns.NegativeRate = AttrD(cSub, "nR");
+                                            ns.OutlierRate = AttrD(cSub, "oR");
+                                            st.NumericStats[sc.ColumnName] = ns;
+                                        }
+                                        else if (cSub.LocalName == "Dt")
+                                        {
+                                            SnapshotDateTimeStats ds = new SnapshotDateTimeStats();
+                                            ds.ColumnName = sc.ColumnName;
+                                            ds.NonNullCount = AttrL(cSub, "nn");
+                                            ds.HasTimeComponent = Attr(cSub, "hasT") == "1";
+                                            ds.MinDate = Attr(cSub, "min");
+                                            ds.MaxDate = Attr(cSub, "max");
+                                            ds.DateSpanDays = AttrD(cSub, "span");
+                                            ds.AvgPerDay = AttrD(cSub, "avg");
+                                            ds.PeakDay = Attr(cSub, "pkD");
+                                            ds.PeakDayCount = AttrL(cSub, "pkC");
+                                            ds.PeakBurstRatio = AttrD(cSub, "pkR");
+                                            foreach (XmlNode dtSub in cSub.ChildNodes)
+                                            {
+                                                if (dtSub.NodeType != XmlNodeType.Element) continue;
+                                                if (dtSub.LocalName == "M")
+                                                {
+                                                    foreach (XmlNode en in dtSub.ChildNodes)
+                                                    {
+                                                        if (en.NodeType != XmlNodeType.Element) continue;
+                                                        string k = Attr(en, "k");
+                                                        if (!string.IsNullOrEmpty(k)) ds.MonthlyCounts[k] = AttrL(en, "v");
+                                                    }
+                                                    ds.HasTimeSeriesDist = true;
+                                                }
+                                                else if (dtSub.LocalName == "D")
+                                                {
+                                                    foreach (XmlNode en in dtSub.ChildNodes)
+                                                    {
+                                                        if (en.NodeType != XmlNodeType.Element) continue;
+                                                        string k = Attr(en, "k");
+                                                        if (!string.IsNullOrEmpty(k)) ds.RecentDailyCounts[k] = AttrL(en, "v");
+                                                    }
+                                                    ds.HasTimeSeriesDist = true;
+                                                }
+                                                else if (dtSub.LocalName == "Dow")
+                                                {
+                                                    ds.DayOfWeekCounts = ParseCsvLongs(dtSub.InnerText, 7);
+                                                    ds.HasTimeSeriesDist = true;
+                                                }
+                                                else if (dtSub.LocalName == "Hr")
+                                                {
+                                                    ds.HourlyCounts = ParseCsvLongs(dtSub.InnerText, 24);
+                                                    ds.HasTimeSeriesDist = true;
+                                                }
+                                            }
+                                            st.DateTimeStats[sc.ColumnName] = ds;
+                                        }
+                                    }
+
+                                    st.Columns[sc.ColumnName] = sc;
+                                    st.ColumnList.Add(sc);
+                                }
+                            }
+                        }
+
+                        if (!string.IsNullOrEmpty(st.TableName) && !snap.Tables.ContainsKey(st.TableName))
+                        {
+                            snap.Tables[st.TableName] = st;
+                            snap.TableList.Add(st);
+                        }
+                    }
+                }
+                else if (child.LocalName == "Relationships")
+                {
+                    foreach (XmlNode rn in child.ChildNodes)
+                    {
+                        if (rn.NodeType != XmlNodeType.Element) continue;
+                        SnapshotRelationship sr = new SnapshotRelationship();
+                        sr.ParentTable = Attr(rn, "pT");
+                        sr.ParentColumn = Attr(rn, "pC");
+                        sr.ChildTable = Attr(rn, "cT");
+                        sr.ChildColumn = Attr(rn, "cC");
+                        sr.ParentDistinctCount = AttrL(rn, "pD");
+                        sr.ChildNonNullRows = AttrL(rn, "cN");
+                        sr.ChildDistinctKeys = AttrL(rn, "cD");
+                        sr.MatchedRows = AttrL(rn, "mR");
+                        sr.OrphanRows = AttrL(rn, "oR");
+                        sr.MatchRate = AttrD(rn, "rate");
+                        sr.FanOutMin = AttrL(rn, "fMin");
+                        sr.FanOutAvg = AttrD(rn, "fAvg");
+                        sr.FanOutP50 = AttrD(rn, "fP50");
+                        sr.FanOutP95 = AttrD(rn, "fP95");
+                        sr.FanOutP99 = AttrD(rn, "fP99");
+                        sr.FanOutMax = AttrL(rn, "fMax");
+                        sr.MaxFanOutKey = Attr(rn, "maxK");
+                        sr.RiskLevel = Attr(rn, "risk");
+                        sr.Note = Attr(rn, "note");
+                        snap.Relationships.Add(sr);
+                    }
+                }
+                else if (child.LocalName == "Warnings")
+                {
+                    foreach (XmlNode wn in child.ChildNodes)
+                    {
+                        if (wn.NodeType != XmlNodeType.Element) continue;
+                        SnapshotWarning sw = new SnapshotWarning();
+                        sw.Severity = Attr(wn, "sev");
+                        sw.Category = Attr(wn, "cat");
+                        sw.TableName = Attr(wn, "tbl");
+                        sw.ColumnName = Attr(wn, "col");
+                        sw.MetricValue = Attr(wn, "met");
+                        sw.PerfImpact = Attr(wn, "imp");
+                        sw.Recommendation = Attr(wn, "rec");
+                        snap.Warnings.Add(sw);
+                    }
+                }
+                else if (child.LocalName == "JMeter")
+                {
+                    foreach (XmlNode jn in child.ChildNodes)
+                    {
+                        if (jn.NodeType != XmlNodeType.Element) continue;
+                        SnapshotJMeterCandidate sj = new SnapshotJMeterCandidate();
+                        sj.TableName = Attr(jn, "tbl");
+                        sj.KeyColumn = Attr(jn, "col");
+                        sj.UniqueCount = AttrL(jn, "uniq");
+                        sj.TotalRows = AttrL(jn, "tot");
+                        sj.DataType = Attr(jn, "type");
+                        sj.Suitability = Attr(jn, "suit");
+                        sj.RecommendedUsage = Attr(jn, "use");
+                        snap.JMeterCandidates.Add(sj);
+                    }
+                }
+            }
         }
     }
 
@@ -3993,12 +5805,234 @@ namespace AuroraAnalyzer
     {
         public string TableName;
         public string ColumnName;
-        public string Category;      // スキーマ追加 / スキーマ削除 / テーブル指標 / カラム統計 / カテゴリ分布 / 数値統計 / 時系列・日時
+        public string Category;      // スキーマ追加 / スキーマ削除 / DDLスキーマ / インデックス / 外部キー / 物理DB指標 / テーブル指標 / 内容ハッシュ / カラム統計 / カテゴリ分布 / 数値統計 / 時系列・日時
         public string MetricName;
         public string BeforeValue;
         public string AfterValue;
         public string DeltaSummary;
         public string Severity;      // 通常 / 注意 / 警告
+    }
+
+    public class ColumnComparisonItem
+    {
+        public string TableName;
+        public string ColumnName;
+        public int ColumnIndex;
+        public string TableStatus;
+        public string ColumnStatus;  // 追加（新規テーブル） / 削除（テーブル消失） / 追加（新規カラム） / 削除（カラム消失） / 変更あり（スキーマ・データ） / 変更あり（スキーマ変更） / 変更あり（データ更新） / 変更あり（追加・統計変化） / 変更なし
+        public bool IsChanged;
+        public bool IsUnchanged;
+        public string BeforeType;
+        public string AfterType;
+        public string TypeDisplay;
+        public string DdlKeyDisplay;
+        public long BeforeNonNull;
+        public long AfterNonNull;
+        public long NonNullDelta;
+        public long BeforeNullCount;
+        public long AfterNullCount;
+        public long NullCountDelta;
+        public string NullChangeDisplay;
+        public long BeforeDistinct;
+        public long AfterDistinct;
+        public long DistinctDelta;
+        public string DistinctChangeDisplay;
+        public string ByteLenDisplay;
+        public string MinValDisplay;
+        public string MaxValDisplay;
+        public string Top1Display;
+        public string NumericSumDeltaDisplay;
+        public string ContentHashStatus; // 一致 / 変化 / 追加 / 削除 / 未取得(旧形式)
+        public int DiffCount;
+        public string ChangeSummary;
+        public string Severity;          // 警告 / 注意 / 通常 / 変化なし
+
+        public ColumnComparisonItem()
+        {
+            TableName = "";
+            ColumnName = "";
+            TableStatus = "";
+            ColumnStatus = "";
+            BeforeType = "";
+            AfterType = "";
+            TypeDisplay = "";
+            DdlKeyDisplay = "-";
+            NullChangeDisplay = "-";
+            DistinctChangeDisplay = "-";
+            ByteLenDisplay = "-";
+            MinValDisplay = "-";
+            MaxValDisplay = "-";
+            Top1Display = "-";
+            NumericSumDeltaDisplay = "-";
+            ContentHashStatus = "-";
+            ChangeSummary = "";
+            Severity = "変化なし";
+        }
+    }
+
+    public class WarningComparisonItem
+    {
+        public string Status;       // 新規発生 / 悪化 / 継続 / 改善 / 解消
+        public string Severity;
+        public string Category;
+        public string TableName;
+        public string ColumnName;
+        public string BeforeMetric;
+        public string AfterMetric;
+        public string PerfImpact;
+        public string Recommendation;
+        public bool IsAlert;
+
+        public WarningComparisonItem()
+        {
+            Status = "";
+            Severity = "";
+            Category = "";
+            TableName = "";
+            ColumnName = "";
+            BeforeMetric = "-";
+            AfterMetric = "-";
+            PerfImpact = "";
+            Recommendation = "";
+        }
+    }
+
+    public class RelationshipComparisonItem
+    {
+        public string Status;       // 新規検出 / 消失 / 悪化（要注意） / 改善 / 変化あり / 変化なし
+        public string RelationKey;
+        public string ParentTable;
+        public string ParentColumn;
+        public string ChildTable;
+        public string ChildColumn;
+        public double BeforeMatchRate;
+        public double AfterMatchRate;
+        public double MatchRateDelta;
+        public long BeforeOrphanRows;
+        public long AfterOrphanRows;
+        public long OrphanDelta;
+        public double BeforeFanOutAvg;
+        public double AfterFanOutAvg;
+        public double BeforeFanOutP95;
+        public double AfterFanOutP95;
+        public long BeforeFanOutMax;
+        public long AfterFanOutMax;
+        public long FanOutMaxDelta;
+        public string BeforeRisk;
+        public string AfterRisk;
+        public string Note;
+        public bool HasAlert;
+
+        public RelationshipComparisonItem()
+        {
+            Status = "";
+            RelationKey = "";
+            ParentTable = "";
+            ParentColumn = "";
+            ChildTable = "";
+            ChildColumn = "";
+            BeforeRisk = "-";
+            AfterRisk = "-";
+            Note = "";
+        }
+    }
+
+    public class JMeterComparisonItem
+    {
+        public string Status;       // 新規候補 / 消失 / 改善 / 悪化（要注意） / キー増加 / キー減少 / 変化なし
+        public string TableName;
+        public string KeyColumn;
+        public string DataType;
+        public long BeforeUnique;
+        public long AfterUnique;
+        public long UniqueDelta;
+        public string BeforeSuitability;
+        public string AfterSuitability;
+        public string RecommendedUsage;
+        public bool HasAlert;
+
+        public JMeterComparisonItem()
+        {
+            Status = "";
+            TableName = "";
+            KeyColumn = "";
+            DataType = "";
+            BeforeSuitability = "-";
+            AfterSuitability = "-";
+            RecommendedUsage = "";
+        }
+    }
+
+    public class TimeSeriesDeltaItem
+    {
+        public string Granularity;  // 月別 / 日別 / 時間帯別 / 曜日別
+        public string TableColumn;
+        public string PeriodLabel;
+        public long BeforeCount;
+        public long AfterCount;
+        public long DeltaCount;
+        public bool HasGrowthRate;
+        public double GrowthRate;
+
+        public TimeSeriesDeltaItem()
+        {
+            Granularity = "";
+            TableColumn = "";
+            PeriodLabel = "";
+        }
+    }
+
+    public class ServerMetricComparisonItem
+    {
+        public string Category;
+        public string MetricName;
+        public string Unit;
+        public long BeforeValue;
+        public long AfterValue;
+        public long DeltaValue;
+        public string DisplayBefore;
+        public string DisplayAfter;
+        public string DisplayDelta;
+        public string RatePerSecDisplay;
+        public string Severity;
+        public string Note;
+
+        public ServerMetricComparisonItem()
+        {
+            Category = "";
+            MetricName = "";
+            Unit = "";
+            DisplayBefore = "";
+            DisplayAfter = "";
+            DisplayDelta = "";
+            RatePerSecDisplay = "-";
+            Severity = "通常";
+            Note = "";
+        }
+    }
+
+    public class DbSchemaDiffItem
+    {
+        public string TableName;
+        public string ObjectType;   // カラムDDL / インデックス / 外部キー制約 / テーブル設定
+        public string ObjectName;
+        public string ChangeType;   // 追加 / 削除 / 変更
+        public string BeforeDef;
+        public string AfterDef;
+        public string Severity;
+        public string Note;
+
+        public DbSchemaDiffItem()
+        {
+            TableName = "";
+            ObjectType = "";
+            ObjectName = "";
+            ChangeType = "";
+            BeforeDef = "-";
+            AfterDef = "-";
+            Severity = "注意";
+            Note = "";
+        }
     }
 
     public class TableComparisonItem
@@ -4020,6 +6054,8 @@ namespace AuroraAnalyzer
         public long RowDelta;
         public bool HasRowGrowthRate;
         public double RowGrowthRate;
+        public bool HasVelocity;
+        public double RowsPerMinute;
 
         public int BeforeCols;
         public int AfterCols;
@@ -4049,15 +6085,54 @@ namespace AuroraAnalyzer
         public string DateColumns;
         public string BeforeWarning;
         public string AfterWarning;
+        public int BeforeWarningCount;
+        public int AfterWarningCount;
+        public int WarningCountDelta;
+        public string BeforeJMeterReadiness;
+        public string AfterJMeterReadiness;
+
+        public string ContentHashStatus; // 一致 / 変化 / 追加 / 削除 / 未取得(旧形式)
+        public bool ContentHashChanged;
+        public bool HasRowChurn;
+        public bool RowChurnExact;
+        public long InsertedRows;
+        public long DeletedRows;
+        public long UpdatedRows;
+        public long UnchangedRows;
+        public string ChurnSummary;
+
+        public bool HasDbPhysicalMeta;
+        public double BeforeDataLengthKB;
+        public double AfterDataLengthKB;
+        public double DataLengthDeltaKB;
+        public double BeforeIndexLengthKB;
+        public double AfterIndexLengthKB;
+        public double IndexLengthDeltaKB;
+        public double BeforeDataFreeKB;
+        public double AfterDataFreeKB;
+        public double DataFreeDeltaKB;
+        public bool HasAutoIncrement;
+        public long BeforeAutoIncrement;
+        public long AfterAutoIncrement;
+        public long AutoIncrementDelta;
+        public long AutoIncrementGap;
+        public string BeforeUpdateTime;
+        public string AfterUpdateTime;
 
         public int ChangedColumnCount;
+        public int UnchangedColumnCount;
+        public int AddedColumnCount;
+        public int RemovedColumnCount;
+        public int SchemaChangedColumnCount;
         public string ChangedColumnsSummary;
+        public string UnchangedColumnsSummary;
         public string ChangeDetail;
         public string DiffSummary;
         public bool HasAlert;
         public string AlertNote;
 
         public List<ColumnDiffItem> ColumnDiffs;
+        public List<ColumnComparisonItem> ColumnComparisons;
 
         public TableComparisonItem()
         {
@@ -4069,11 +6144,19 @@ namespace AuroraAnalyzer
             DateColumns = "";
             BeforeWarning = "";
             AfterWarning = "";
+            BeforeJMeterReadiness = "";
+            AfterJMeterReadiness = "";
+            ContentHashStatus = "-";
+            ChurnSummary = "-";
+            BeforeUpdateTime = "";
+            AfterUpdateTime = "";
             ChangedColumnsSummary = "";
+            UnchangedColumnsSummary = "-";
             ChangeDetail = "";
             DiffSummary = "";
             AlertNote = "";
             ColumnDiffs = new List<ColumnDiffItem>();
+            ColumnComparisons = new List<ColumnComparisonItem>();
         }
     }
 
@@ -4089,9 +6172,57 @@ namespace AuroraAnalyzer
         public string AfterAnalyzedAt;
         public DateTime ComparedAt;
 
+        public string BeforeSourceMode;
+        public string AfterSourceMode;
+        public bool BeforeIsDirectDb;
+        public bool AfterIsDirectDb;
+        public string BeforeDbLabel;
+        public string AfterDbLabel;
+        public bool BeforeHasEmbeddedSnapshot;
+        public bool AfterHasEmbeddedSnapshot;
+        public bool UsedFullSnapshot;
+        public string PrecisionLabel;
+
+        public bool HasElapsedTime;
+        public double ElapsedSeconds;
+        public string ElapsedDisplay;
+        public bool ClockReversed;
+        public double TotalRowsPerMinute;
+        public double TotalInnoDbKBPerMinute;
+
+        public bool HasAcuComparison;
+        public double BeforeEstMinAcuCurrent;
+        public double AfterEstMinAcuCurrent;
+        public double BeforeEstMinAcu10x;
+        public double AfterEstMinAcu10x;
+
+        public bool HasDbPhysicalMeta;
+        public double BeforeTotalDataLengthKB;
+        public double AfterTotalDataLengthKB;
+        public double TotalDataLengthDeltaKB;
+        public double BeforeTotalIndexLengthKB;
+        public double AfterTotalIndexLengthKB;
+        public double TotalIndexLengthDeltaKB;
+        public double BeforeTotalDataFreeKB;
+        public double AfterTotalDataFreeKB;
+        public double TotalDataFreeDeltaKB;
+
+        public bool HasDbServerStatus;
+        public bool DbRestartDetected;
+        public long ServerUptimeDeltaSeconds;
+
+        public bool HasAnyRowChurn;
+        public int RowChurnCoveredTables;
+        public bool RowChurnAllExact;
+        public long TotalInsertedRows;
+        public long TotalUpdatedRows;
+        public long TotalDeletedRows;
+        public long TotalUnchangedRows;
+
         public int BeforeTableCount;
         public int AfterTableCount;
         public int TotalUniqueTableCount;
+        public int ChangedTableCount;
 
         public long BeforeTotalRows;
         public long AfterTotalRows;
@@ -4119,12 +6250,34 @@ namespace AuroraAnalyzer
         public int UpdatedSheetCount;
         public int AlertTableCount;
 
+        public int TotalUniqueColumnCount;
+        public int ChangedColumnTotal;
+        public int UnchangedColumnTotal;
+        public int AddedColumnTotal;
+        public int RemovedColumnTotal;
+        public int SchemaChangedColumnTotal;
+
+        public int NewWarningCount;
+        public int WorsenedWarningCount;
+        public int ResolvedWarningCount;
+        public int OngoingWarningCount;
+        public long BeforeTotalOrphanRows;
+        public long AfterTotalOrphanRows;
+        public long OrphanRowDelta;
+
         public List<TableComparisonItem> AllTables;
         public List<TableComparisonItem> UpdatedTables;
         public List<TableComparisonItem> AddedTables;
         public List<TableComparisonItem> UnchangedTables;
         public List<TableComparisonItem> DeletedTables;
         public List<ColumnDiffItem> AllColumnDiffs;
+        public List<ColumnComparisonItem> AllColumnComparisons;
+        public List<WarningComparisonItem> WarningComparisons;
+        public List<RelationshipComparisonItem> RelationshipComparisons;
+        public List<JMeterComparisonItem> JMeterComparisons;
+        public List<TimeSeriesDeltaItem> TimeSeriesDeltas;
+        public List<ServerMetricComparisonItem> ServerMetricComparisons;
+        public List<DbSchemaDiffItem> DbSchemaDiffs;
         public List<string> Insights;
 
         public AnalysisComparisonResult()
@@ -4133,18 +6286,35 @@ namespace AuroraAnalyzer
             AfterSubtitle = "";
             BeforeAnalyzedAt = "";
             AfterAnalyzedAt = "";
+            BeforeSourceMode = "";
+            AfterSourceMode = "";
+            BeforeDbLabel = "";
+            AfterDbLabel = "";
+            PrecisionLabel = "";
+            ElapsedDisplay = "-";
             AllTables = new List<TableComparisonItem>();
             UpdatedTables = new List<TableComparisonItem>();
             AddedTables = new List<TableComparisonItem>();
             UnchangedTables = new List<TableComparisonItem>();
             DeletedTables = new List<TableComparisonItem>();
             AllColumnDiffs = new List<ColumnDiffItem>();
+            AllColumnComparisons = new List<ColumnComparisonItem>();
+            WarningComparisons = new List<WarningComparisonItem>();
+            RelationshipComparisons = new List<RelationshipComparisonItem>();
+            JMeterComparisons = new List<JMeterComparisonItem>();
+            TimeSeriesDeltas = new List<TimeSeriesDeltaItem>();
+            ServerMetricComparisons = new List<ServerMetricComparisonItem>();
+            DbSchemaDiffs = new List<DbSchemaDiffItem>();
             Insights = new List<string>();
         }
     }
 
     public static class AnalysisComparisonEngine
     {
+        private static readonly Regex AnomalyValueRegex = new Regex(
+            @"(?i)(^|[\s_\-\./:])(err|error|fail|failed|failure|ng|reject|rejected|cancel|canceled|cancelled|timeout|abort|aborted|dead|deadlock|invalid|deny|denied|crash|exception|fault|異常|失敗|エラー|取消|却下|中断|タイムアウト)($|[\s_\-\./:])",
+            RegexOptions.Compiled);
+
         public static AnalysisWorkbookSnapshot LoadAnalysisWorkbook(string xlsxPath)
         {
             if (string.IsNullOrWhiteSpace(xlsxPath) || !File.Exists(xlsxPath))
@@ -4175,7 +6345,7 @@ namespace AuroraAnalyzer
                         throw new InvalidDataException("指定されたExcelファイルに '02_テーブル一覧' シートが見つかりません。本ツールで出力した分析ファイル (.xlsx) を指定してください: " + xlsxPath);
                     }
 
-                    // Extract metadata subtitle from 01_サマリー or 02_テーブル一覧
+                    // Extract metadata subtitle from 01_サマリー (keeps display metadata consistent)
                     string sumPart;
                     if (sheetParts.TryGetValue("01_サマリー", out sumPart))
                     {
@@ -4187,7 +6357,13 @@ namespace AuroraAnalyzer
                         }
                     }
 
-                    // 1. Parse 02_テーブル一覧
+                    // Prefer lossless OOXML CustomXML snapshot if present (available in DirectDB & CSV, 3-sheet & 8-sheet)
+                    if (AnalysisSnapshotCodec.TryLoadFromZip(zip, snap) && snap.TableList.Count > 0)
+                    {
+                        return snap;
+                    }
+
+                    // Fallback: parse visible worksheets (legacy .xlsx compatibility)
                     List<Dictionary<int, string>> tblRows = ReadSheetRows(zip, tblPart, sharedStrings, 0);
                     if (string.IsNullOrWhiteSpace(snap.Subtitle) && tblRows.Count >= 2)
                     {
@@ -4196,7 +6372,6 @@ namespace AuroraAnalyzer
                     }
                     ParseTablesSheet(snap, tblRows);
 
-                    // 2. Parse 03_カラム分析
                     string colPart;
                     if (sheetParts.TryGetValue("03_カラム分析", out colPart))
                     {
@@ -4204,7 +6379,6 @@ namespace AuroraAnalyzer
                         ParseColumnsSheet(snap, colRows);
                     }
 
-                    // 3. Parse 04_分布・割合分析
                     string distPart;
                     if (sheetParts.TryGetValue("04_分布・割合分析", out distPart))
                     {
@@ -4212,7 +6386,6 @@ namespace AuroraAnalyzer
                         ParseDistributionsSheet(snap, distRows);
                     }
 
-                    // 4. Parse 05_数値統計・ヒストグラム
                     string numPart;
                     if (sheetParts.TryGetValue("05_数値統計・ヒストグラム", out numPart))
                     {
@@ -4220,12 +6393,25 @@ namespace AuroraAnalyzer
                         ParseNumericSheet(snap, numRows);
                     }
 
-                    // 5. Parse 06_時系列分析
                     string dtPart;
                     if (sheetParts.TryGetValue("06_時系列分析", out dtPart))
                     {
                         List<Dictionary<int, string>> dtRows = ReadSheetRows(zip, dtPart, sharedStrings, 0);
                         ParseDateTimeSheet(snap, dtRows);
+                    }
+
+                    string relPart;
+                    if (sheetParts.TryGetValue("07_リレーション・ファンアウト", out relPart))
+                    {
+                        List<Dictionary<int, string>> relRows = ReadSheetRows(zip, relPart, sharedStrings, 0);
+                        ParseRelationshipsSheet(snap, relRows);
+                    }
+
+                    string warnPart;
+                    if (sheetParts.TryGetValue("08_性能試験ガイド・警告", out warnPart))
+                    {
+                        List<Dictionary<int, string>> warnRows = ReadSheetRows(zip, warnPart, sharedStrings, 0);
+                        ParseWarningsSheet(snap, warnRows);
                     }
                 }
             }
@@ -4256,6 +6442,22 @@ namespace AuroraAnalyzer
             return CompareSnapshots(before, after);
         }
 
+        private static string ModeDisplay(AnalysisWorkbookSnapshot s)
+        {
+            if (s.IsDirectDb || string.Equals(s.SourceMode, "DirectDB", StringComparison.OrdinalIgnoreCase)) return "DB直接";
+            return "CSV";
+        }
+
+        private static string FormatElapsed(double seconds)
+        {
+            if (seconds < 0) seconds = 0;
+            TimeSpan ts = TimeSpan.FromSeconds(Math.Round(seconds));
+            if (ts.TotalDays >= 1.0) return string.Format(CultureInfo.InvariantCulture, "{0}日{1}時間{2}分", (int)ts.TotalDays, ts.Hours, ts.Minutes);
+            if (ts.TotalHours >= 1.0) return string.Format(CultureInfo.InvariantCulture, "{0}時間{1}分{2}秒", (int)ts.TotalHours, ts.Minutes, ts.Seconds);
+            if (ts.TotalMinutes >= 1.0) return string.Format(CultureInfo.InvariantCulture, "{0}分{1}秒", (int)ts.TotalMinutes, ts.Seconds);
+            return string.Format(CultureInfo.InvariantCulture, "{0:0.0}秒", seconds);
+        }
+
         public static AnalysisComparisonResult CompareSnapshots(AnalysisWorkbookSnapshot before, AnalysisWorkbookSnapshot after)
         {
             AnalysisComparisonResult res = new AnalysisComparisonResult();
@@ -4267,21 +6469,75 @@ namespace AuroraAnalyzer
             res.AfterSubtitle = after.Subtitle;
             res.BeforeAnalyzedAt = before.AnalyzedAtText;
             res.AfterAnalyzedAt = after.AnalyzedAtText;
+            res.BeforeSourceMode = ModeDisplay(before);
+            res.AfterSourceMode = ModeDisplay(after);
+            res.BeforeIsDirectDb = before.IsDirectDb;
+            res.AfterIsDirectDb = after.IsDirectDb;
+            res.BeforeDbLabel = before.DbLabel ?? "";
+            res.AfterDbLabel = after.DbLabel ?? "";
+            res.BeforeHasEmbeddedSnapshot = before.HasEmbeddedSnapshot;
+            res.AfterHasEmbeddedSnapshot = after.HasEmbeddedSnapshot;
+            res.UsedFullSnapshot = before.HasEmbeddedSnapshot && after.HasEmbeddedSnapshot;
             res.ComparedAt = DateTime.Now;
             res.BeforeTableCount = before.TableList.Count;
             res.AfterTableCount = after.TableList.Count;
+
+            // Elapsed time calculation
+            DateTime bDt, aDt;
+            bool hasBdt = before.AnalyzedAt.HasValue;
+            bDt = hasBdt ? before.AnalyzedAt.Value : DateTime.MinValue;
+            if (!hasBdt && TryParseComparableDate(before.AnalyzedAtText, out bDt)) hasBdt = true;
+            bool hasAdt = after.AnalyzedAt.HasValue;
+            aDt = hasAdt ? after.AnalyzedAt.Value : DateTime.MinValue;
+            if (!hasAdt && TryParseComparableDate(after.AnalyzedAtText, out aDt)) hasAdt = true;
+            if (hasBdt && hasAdt)
+            {
+                double diffSec = (aDt - bDt).TotalSeconds;
+                if (diffSec < -1.0)
+                {
+                    res.ClockReversed = true;
+                    res.ElapsedDisplay = "日時逆転 (" + FormatElapsed(-diffSec) + ")";
+                }
+                else if (diffSec >= 1.0)
+                {
+                    res.HasElapsedTime = true;
+                    res.ElapsedSeconds = diffSec;
+                    res.ElapsedDisplay = FormatElapsed(diffSec);
+                }
+            }
+
+            if (before.HasAcuEstimate && after.HasAcuEstimate)
+            {
+                res.HasAcuComparison = true;
+                res.BeforeEstMinAcuCurrent = before.EstMinAcuCurrent;
+                res.AfterEstMinAcuCurrent = after.EstMinAcuCurrent;
+                res.BeforeEstMinAcu10x = before.EstMinAcu10x;
+                res.AfterEstMinAcu10x = after.EstMinAcu10x;
+            }
 
             foreach (SnapshotTable bt in before.TableList)
             {
                 res.BeforeTotalRows += bt.RowCount;
                 res.BeforeTotalSizeKB += bt.FileSizeKB;
                 res.BeforeTotalInnoDbKB += bt.EstInnoDbKB;
+                if (bt.DbMeta != null && bt.DbMeta.HasMetadata)
+                {
+                    res.BeforeTotalDataLengthKB += bt.DbMeta.DataLength / 1024.0;
+                    res.BeforeTotalIndexLengthKB += bt.DbMeta.IndexLength / 1024.0;
+                    res.BeforeTotalDataFreeKB += bt.DbMeta.DataFree / 1024.0;
+                }
             }
             foreach (SnapshotTable at in after.TableList)
             {
                 res.AfterTotalRows += at.RowCount;
                 res.AfterTotalSizeKB += at.FileSizeKB;
                 res.AfterTotalInnoDbKB += at.EstInnoDbKB;
+                if (at.DbMeta != null && at.DbMeta.HasMetadata)
+                {
+                    res.AfterTotalDataLengthKB += at.DbMeta.DataLength / 1024.0;
+                    res.AfterTotalIndexLengthKB += at.DbMeta.IndexLength / 1024.0;
+                    res.AfterTotalDataFreeKB += at.DbMeta.DataFree / 1024.0;
+                }
             }
             res.TotalRowDelta = res.AfterTotalRows - res.BeforeTotalRows;
             if (res.BeforeTotalRows > 0)
@@ -4291,6 +6547,21 @@ namespace AuroraAnalyzer
             }
             res.TotalSizeDeltaKB = Math.Round(res.AfterTotalSizeKB - res.BeforeTotalSizeKB, 2);
             res.TotalInnoDbDeltaKB = Math.Round(res.AfterTotalInnoDbKB - res.BeforeTotalInnoDbKB, 1);
+
+            // Compare MySQL Server status counters first so Uptime can supplement elapsed time if needed
+            CompareServerMetrics(before, after, res);
+            if (!res.HasElapsedTime && !res.ClockReversed && res.ServerUptimeDeltaSeconds >= 1)
+            {
+                res.HasElapsedTime = true;
+                res.ElapsedSeconds = res.ServerUptimeDeltaSeconds;
+                res.ElapsedDisplay = FormatElapsed(res.ElapsedSeconds);
+            }
+            if (res.HasElapsedTime && res.ElapsedSeconds > 0.0)
+            {
+                double mins = res.ElapsedSeconds / 60.0;
+                res.TotalRowsPerMinute = res.TotalRowDelta / mins;
+                res.TotalInnoDbKBPerMinute = res.TotalInnoDbDeltaKB / mins;
+            }
 
             // Collect union of all table names (preserving After's casing when present)
             List<string> allNames = new List<string>();
@@ -4305,6 +6576,7 @@ namespace AuroraAnalyzer
             }
             res.TotalUniqueTableCount = allNames.Count;
 
+            bool allChurnExact = true;
             foreach (string tblName in allNames)
             {
                 SnapshotTable bt = null;
@@ -4312,11 +6584,39 @@ namespace AuroraAnalyzer
                 before.Tables.TryGetValue(tblName, out bt);
                 after.Tables.TryGetValue(tblName, out at);
 
-                TableComparisonItem item = CompareSingleTable(bt, at);
+                TableComparisonItem item = CompareSingleTable(bt, at, res);
+                if (res.HasElapsedTime && res.ElapsedSeconds > 0.0)
+                {
+                    item.HasVelocity = true;
+                    item.RowsPerMinute = item.RowDelta / (res.ElapsedSeconds / 60.0);
+                }
+
                 res.AllTables.Add(item);
                 foreach (ColumnDiffItem cd in item.ColumnDiffs)
                 {
                     res.AllColumnDiffs.Add(cd);
+                }
+                foreach (ColumnComparisonItem cc in item.ColumnComparisons)
+                {
+                    res.AllColumnComparisons.Add(cc);
+                    res.TotalUniqueColumnCount++;
+                    if (cc.IsChanged) res.ChangedColumnTotal++;
+                    else res.UnchangedColumnTotal++;
+                    if (cc.ColumnStatus == "追加（新規カラム）" || cc.ColumnStatus == "追加（新規テーブル）") res.AddedColumnTotal++;
+                    else if (cc.ColumnStatus == "削除（カラム消失）" || cc.ColumnStatus == "削除（テーブル消失）") res.RemovedColumnTotal++;
+                    if (cc.ColumnStatus.IndexOf("スキーマ", StringComparison.Ordinal) >= 0) res.SchemaChangedColumnTotal++;
+                }
+
+                if (item.HasDbPhysicalMeta) res.HasDbPhysicalMeta = true;
+                if (item.HasRowChurn)
+                {
+                    res.HasAnyRowChurn = true;
+                    res.RowChurnCoveredTables++;
+                    if (!item.RowChurnExact) allChurnExact = false;
+                    res.TotalInsertedRows += item.InsertedRows;
+                    res.TotalUpdatedRows += item.UpdatedRows;
+                    res.TotalDeletedRows += item.DeletedRows;
+                    res.TotalUnchangedRows += item.UnchangedRows;
                 }
 
                 if (item.IsNewTable) res.NewTableCount++;
@@ -4334,8 +6634,51 @@ namespace AuroraAnalyzer
                 if (item.HasAlert) res.AlertTableCount++;
             }
 
+            res.RowChurnAllExact = res.HasAnyRowChurn && allChurnExact;
+            res.ChangedTableCount = res.TotalUniqueTableCount - res.UnchangedTableCount;
             res.AddedSheetCount = res.AddedTables.Count;
             res.UpdatedSheetCount = res.UpdatedTables.Count;
+
+            if (res.HasDbPhysicalMeta)
+            {
+                res.BeforeTotalDataLengthKB = Math.Round(res.BeforeTotalDataLengthKB, 1);
+                res.AfterTotalDataLengthKB = Math.Round(res.AfterTotalDataLengthKB, 1);
+                res.TotalDataLengthDeltaKB = Math.Round(res.AfterTotalDataLengthKB - res.BeforeTotalDataLengthKB, 1);
+                res.BeforeTotalIndexLengthKB = Math.Round(res.BeforeTotalIndexLengthKB, 1);
+                res.AfterTotalIndexLengthKB = Math.Round(res.AfterTotalIndexLengthKB, 1);
+                res.TotalIndexLengthDeltaKB = Math.Round(res.AfterTotalIndexLengthKB - res.BeforeTotalIndexLengthKB, 1);
+                res.BeforeTotalDataFreeKB = Math.Round(res.BeforeTotalDataFreeKB, 1);
+                res.AfterTotalDataFreeKB = Math.Round(res.AfterTotalDataFreeKB, 1);
+                res.TotalDataFreeDeltaKB = Math.Round(res.AfterTotalDataFreeKB - res.BeforeTotalDataFreeKB, 1);
+            }
+
+            // Precision provenance label
+            string modePair = string.Format("{0}×{1}", res.BeforeSourceMode, res.AfterSourceMode);
+            if (res.UsedFullSnapshot)
+            {
+                if (res.HasDbPhysicalMeta || res.HasDbServerStatus)
+                {
+                    res.PrecisionLabel = string.Format("完全照合・ハッシュ＋DBメタ ({0})", modePair);
+                }
+                else
+                {
+                    res.PrecisionLabel = string.Format("完全照合・ハッシュ＋全統計 ({0})", modePair);
+                }
+            }
+            else if (res.BeforeHasEmbeddedSnapshot || res.AfterHasEmbeddedSnapshot)
+            {
+                res.PrecisionLabel = string.Format("混在互換照合・一部旧形式 ({0})", modePair);
+            }
+            else
+            {
+                res.PrecisionLabel = string.Format("表示シート互換解析 ({0})", modePair);
+            }
+
+            // Cross-table quality, integrity, JMeter & time-series comparisons
+            CompareWarnings(before, after, res);
+            CompareRelationships(before, after, res);
+            CompareJMeterCandidates(before, after, res);
+            CompareTimeSeries(before, after, res);
 
             // Sort lists deterministically for clear presentation
             res.AllTables = res.AllTables
@@ -4375,6 +6718,14 @@ namespace AuroraAnalyzer
                 .ThenBy(d => d.Category, StringComparer.Ordinal)
                 .ToList();
 
+            res.AllColumnComparisons = res.AllColumnComparisons
+                .OrderBy(c => GetStatusSortOrder(c.TableStatus))
+                .ThenBy(c => c.TableName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(c => c.IsChanged ? 0 : 1)
+                .ThenBy(c => c.ColumnIndex)
+                .ThenBy(c => c.ColumnName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
             BuildComparisonInsights(res);
             return res;
         }
@@ -4390,7 +6741,128 @@ namespace AuroraAnalyzer
             return 6; // 変更なし
         }
 
-        private static TableComparisonItem CompareSingleTable(SnapshotTable bt, SnapshotTable at)
+        private static string FormatDdlKeyDisplay(SnapshotColumn sc)
+        {
+            if (sc == null) return "-";
+            if (sc.DbMeta != null && !string.IsNullOrEmpty(sc.DbMeta.ColumnType))
+            {
+                List<string> tags = new List<string>();
+                if (!string.IsNullOrEmpty(sc.DbMeta.ColumnKey)) tags.Add(sc.DbMeta.ColumnKey);
+                if (string.Equals(sc.DbMeta.IsNullable, "NO", StringComparison.OrdinalIgnoreCase)) tags.Add("NOT NULL");
+                if (!string.IsNullOrEmpty(sc.DbMeta.Extra)) tags.Add(sc.DbMeta.Extra);
+                if (tags.Count > 0) return sc.DbMeta.ColumnType + " [" + string.Join(", ", tags.ToArray()) + "]";
+                return sc.DbMeta.ColumnType;
+            }
+            return string.IsNullOrEmpty(sc.KeyRole) ? (string.IsNullOrEmpty(sc.SelectivityRating) ? "-" : sc.SelectivityRating) : sc.KeyRole;
+        }
+
+        private static string FormatBeforeAfterText(string b, string a)
+        {
+            string sb = string.IsNullOrEmpty(b) ? "-" : b;
+            string sa = string.IsNullOrEmpty(a) ? "-" : a;
+            if (string.Equals(sb, sa, StringComparison.Ordinal)) return sa;
+            return sb + " → " + sa;
+        }
+
+        private static void ComputeRowChurnFromSketches(SnapshotTable bt, SnapshotTable at, TableComparisonItem item)
+        {
+            if (bt == null || at == null) return;
+            if (bt.RowCount == 0 && at.RowCount == 0)
+            {
+                item.HasRowChurn = true;
+                item.RowChurnExact = true;
+                item.ChurnSummary = "0件 (変動なし)";
+                return;
+            }
+            if (bt.RowCount == 0 && at.RowCount > 0)
+            {
+                item.HasRowChurn = true;
+                item.RowChurnExact = true;
+                item.InsertedRows = at.RowCount;
+                item.ChurnSummary = string.Format("挿入 +{0:#,##0} / 更新 0 / 削除 0", at.RowCount);
+                return;
+            }
+            if (bt.RowCount > 0 && at.RowCount == 0)
+            {
+                item.HasRowChurn = true;
+                item.RowChurnExact = true;
+                item.DeletedRows = bt.RowCount;
+                item.ChurnSummary = string.Format("挿入 0 / 更新 0 / 削除 -{0:#,##0}", bt.RowCount);
+                return;
+            }
+
+            RowChurnSketch bs = bt.RowSketch;
+            RowChurnSketch as_ = at.RowSketch;
+            if (bs == null || !bs.IsValid || as_ == null || !as_.IsValid) return;
+            if (!string.Equals(bs.KeyColumns, as_.KeyColumns, StringComparison.OrdinalIgnoreCase)) return;
+
+            ulong threshold = Math.Min(bs.IsExact ? ulong.MaxValue : bs.MaxKeptPkHash, as_.IsExact ? ulong.MaxValue : as_.MaxKeptPkHash);
+            int bi = 0, ai = 0;
+            int bLim = bs.Entries.Count;
+            int aLim = as_.Entries.Count;
+            long wIns = 0, wDel = 0, wUpd = 0, wUnc = 0;
+
+            while (bi < bLim && bs.Entries[bi].PkHash <= threshold && ai < aLim && as_.Entries[ai].PkHash <= threshold)
+            {
+                ulong bp = bs.Entries[bi].PkHash;
+                ulong ap = as_.Entries[ai].PkHash;
+                if (bp == ap)
+                {
+                    if (bs.Entries[bi].RowHash == as_.Entries[ai].RowHash) wUnc++;
+                    else wUpd++;
+                    bi++; ai++;
+                }
+                else if (bp < ap)
+                {
+                    wDel++;
+                    bi++;
+                }
+                else
+                {
+                    wIns++;
+                    ai++;
+                }
+            }
+            while (bi < bLim && bs.Entries[bi].PkHash <= threshold) { wDel++; bi++; }
+            while (ai < aLim && as_.Entries[ai].PkHash <= threshold) { wIns++; ai++; }
+
+            if (bs.IsExact && as_.IsExact)
+            {
+                item.HasRowChurn = true;
+                item.RowChurnExact = true;
+                item.InsertedRows = wIns;
+                item.DeletedRows = wDel;
+                item.UpdatedRows = wUpd;
+                item.UnchangedRows = wUnc;
+                item.ChurnSummary = string.Format("挿入 +{0:#,##0} / 更新 {1:#,##0} / 削除 -{2:#,##0} / 無変更 {3:#,##0}", wIns, wUpd, wDel, wUnc);
+            }
+            else if ((wIns + wDel + wUpd + wUnc) >= 20)
+            {
+                long wBefore = wUnc + wUpd + wDel;
+                long wAfter = wUnc + wUpd + wIns;
+                double scale = (wBefore + wAfter) > 0 ? ((double)(bt.RowCount + at.RowCount) / (double)(wBefore + wAfter)) : 1.0;
+                long estUpd = (long)Math.Round(wUpd * scale);
+                long estDel = (long)Math.Round(wDel * scale);
+                long estIns = estDel + item.RowDelta;
+                if (estIns < 0)
+                {
+                    estDel = -item.RowDelta;
+                    estIns = 0;
+                }
+                if (estUpd > bt.RowCount - estDel) estUpd = Math.Max(0L, bt.RowCount - estDel);
+                long estUnc = Math.Max(0L, bt.RowCount - estDel - estUpd);
+
+                item.HasRowChurn = true;
+                item.RowChurnExact = false;
+                item.InsertedRows = estIns;
+                item.DeletedRows = estDel;
+                item.UpdatedRows = estUpd;
+                item.UnchangedRows = estUnc;
+                item.ChurnSummary = string.Format("推定 挿入 +{0:#,##0} / 更新 ~{1:#,##0} / 削除 -{2:#,##0}", estIns, estUpd, estDel);
+            }
+        }
+
+        private static TableComparisonItem CompareSingleTable(SnapshotTable bt, SnapshotTable at, AnalysisComparisonResult parentRes)
         {
             TableComparisonItem item = new TableComparisonItem();
 
@@ -4426,8 +6898,39 @@ namespace AuroraAnalyzer
                 item.DateColumns = at.DateColumns;
                 item.BeforeWarning = "-";
                 item.AfterWarning = string.IsNullOrEmpty(at.WarningSummary) ? "正常" : at.WarningSummary;
+                item.AfterWarningCount = at.WarningCount;
+                item.WarningCountDelta = at.WarningCount;
+                item.AfterJMeterReadiness = at.JMeterReadiness;
+                item.ContentHashStatus = !string.IsNullOrEmpty(at.RowMultisetHash) ? "追加" : "未取得(旧形式)";
+                item.ContentHashChanged = true;
+                item.HasRowChurn = true;
+                item.RowChurnExact = true;
+                item.InsertedRows = at.RowCount;
+                item.ChurnSummary = string.Format("新規追加 +{0:#,##0}件", at.RowCount);
+
+                if (at.DbMeta != null && at.DbMeta.HasMetadata)
+                {
+                    item.HasDbPhysicalMeta = true;
+                    item.AfterDataLengthKB = Math.Round(at.DbMeta.DataLength / 1024.0, 1);
+                    item.DataLengthDeltaKB = item.AfterDataLengthKB;
+                    item.AfterIndexLengthKB = Math.Round(at.DbMeta.IndexLength / 1024.0, 1);
+                    item.IndexLengthDeltaKB = item.AfterIndexLengthKB;
+                    item.AfterDataFreeKB = Math.Round(at.DbMeta.DataFree / 1024.0, 1);
+                    item.DataFreeDeltaKB = item.AfterDataFreeKB;
+                    if (at.DbMeta.HasAutoIncrement)
+                    {
+                        item.HasAutoIncrement = true;
+                        item.AfterAutoIncrement = at.DbMeta.AutoIncrement;
+                        item.AutoIncrementDelta = at.DbMeta.AutoIncrement;
+                    }
+                    item.AfterUpdateTime = at.DbMeta.UpdateTime;
+                }
+
                 item.ChangedColumnCount = at.ColumnCount;
+                item.AddedColumnCount = at.ColumnCount;
+                item.UnchangedColumnCount = 0;
                 item.ChangedColumnsSummary = string.Format("新規テーブル ({0}列)", at.ColumnCount);
+                item.UnchangedColumnsSummary = "-";
                 item.ChangeDetail = string.Format("新規テーブル追加 ({0:#,##0}件 / {1}列)", at.RowCount, at.ColumnCount);
                 item.DiffSummary = string.Format("テスト開始後に新規追加: {0:#,##0}件, {1}列, CSV {2:#,##0.00}KB", at.RowCount, at.ColumnCount, at.FileSizeKB);
 
@@ -4442,6 +6945,37 @@ namespace AuroraAnalyzer
                 }
 
                 AddDiff(item, "-", "テーブル指標", "テーブル存在", "なし", string.Format("新規追加 ({0:#,##0}件 / {1}列)", at.RowCount, at.ColumnCount), "新規テーブル追加", "注意");
+
+                foreach (SnapshotColumn ac in GetOrderedColumns(at))
+                {
+                    ColumnComparisonItem cc = new ColumnComparisonItem();
+                    cc.TableName = at.TableName;
+                    cc.ColumnName = ac.ColumnName;
+                    cc.ColumnIndex = ac.ColumnIndex;
+                    cc.TableStatus = item.PrimaryStatus;
+                    cc.ColumnStatus = "追加（新規テーブル）";
+                    cc.IsChanged = true;
+                    cc.AfterType = ac.InferredType;
+                    cc.TypeDisplay = ac.InferredType;
+                    cc.DdlKeyDisplay = FormatDdlKeyDisplay(ac);
+                    cc.AfterNonNull = ac.NonNullCount > 0 ? ac.NonNullCount : Math.Max(0L, ac.TotalRows - ac.NullCount);
+                    cc.NonNullDelta = cc.AfterNonNull;
+                    cc.AfterNullCount = ac.NullCount;
+                    cc.NullCountDelta = ac.NullCount;
+                    cc.NullChangeDisplay = string.Format("0 → {0:#,##0}", ac.NullCount);
+                    cc.AfterDistinct = ac.DistinctCount;
+                    cc.DistinctDelta = ac.DistinctCount;
+                    cc.DistinctChangeDisplay = string.Format("0 → {0:#,##0}", ac.DistinctCount);
+                    cc.ByteLenDisplay = string.Format("平均 {0:0.0} / 最大 {1:#,##0} B", ac.AvgByteLen, ac.MaxByteLen);
+                    cc.MinValDisplay = string.IsNullOrEmpty(ac.MinValueText) ? "-" : ac.MinValueText;
+                    cc.MaxValDisplay = string.IsNullOrEmpty(ac.MaxValueText) ? "-" : ac.MaxValueText;
+                    cc.Top1Display = string.IsNullOrEmpty(ac.Top1Value) ? "-" : ac.Top1Value;
+                    cc.ContentHashStatus = !string.IsNullOrEmpty(ac.ContentHash) ? "追加" : "未取得(旧形式)";
+                    cc.DiffCount = 1;
+                    cc.ChangeSummary = string.Format("新規テーブルのカラム ({0}, ユニーク {1:#,##0})", ac.InferredType, ac.DistinctCount);
+                    cc.Severity = "注意";
+                    item.ColumnComparisons.Add(cc);
+                }
                 return item;
             }
 
@@ -4480,14 +7014,76 @@ namespace AuroraAnalyzer
                 item.DateColumns = bt.DateColumns;
                 item.BeforeWarning = string.IsNullOrEmpty(bt.WarningSummary) ? "正常" : bt.WarningSummary;
                 item.AfterWarning = "テーブル消失";
+                item.BeforeWarningCount = bt.WarningCount;
+                item.WarningCountDelta = -bt.WarningCount;
+                item.BeforeJMeterReadiness = bt.JMeterReadiness;
+                item.ContentHashStatus = !string.IsNullOrEmpty(bt.RowMultisetHash) ? "削除" : "未取得(旧形式)";
+                item.ContentHashChanged = true;
+                item.HasRowChurn = true;
+                item.RowChurnExact = true;
+                item.DeletedRows = bt.RowCount;
+                item.ChurnSummary = string.Format("テーブル消失 -{0:#,##0}件", bt.RowCount);
+
+                if (bt.DbMeta != null && bt.DbMeta.HasMetadata)
+                {
+                    item.HasDbPhysicalMeta = true;
+                    item.BeforeDataLengthKB = Math.Round(bt.DbMeta.DataLength / 1024.0, 1);
+                    item.DataLengthDeltaKB = -item.BeforeDataLengthKB;
+                    item.BeforeIndexLengthKB = Math.Round(bt.DbMeta.IndexLength / 1024.0, 1);
+                    item.IndexLengthDeltaKB = -item.BeforeIndexLengthKB;
+                    item.BeforeDataFreeKB = Math.Round(bt.DbMeta.DataFree / 1024.0, 1);
+                    item.DataFreeDeltaKB = -item.BeforeDataFreeKB;
+                    if (bt.DbMeta.HasAutoIncrement)
+                    {
+                        item.HasAutoIncrement = true;
+                        item.BeforeAutoIncrement = bt.DbMeta.AutoIncrement;
+                        item.AutoIncrementDelta = -bt.DbMeta.AutoIncrement;
+                    }
+                    item.BeforeUpdateTime = bt.DbMeta.UpdateTime;
+                }
+
                 item.ChangedColumnCount = bt.ColumnCount;
+                item.RemovedColumnCount = bt.ColumnCount;
+                item.UnchangedColumnCount = 0;
                 item.ChangedColumnsSummary = string.Format("テーブル消失 (開始前{0}列)", bt.ColumnCount);
+                item.UnchangedColumnsSummary = "-";
                 item.ChangeDetail = string.Format("テーブル消失 (開始前 {0:#,##0}件)", bt.RowCount);
                 item.DiffSummary = string.Format("テスト開始後の分析ファイルに存在せず (開始前: {0:#,##0}件, {1}列)", bt.RowCount, bt.ColumnCount);
                 item.HasAlert = true;
                 item.AlertNote = "要注意: テスト開始後にテーブルが消失/未出力";
 
                 AddDiff(item, "-", "テーブル指標", "テーブル存在", string.Format("存在 ({0:#,##0}件 / {1}列)", bt.RowCount, bt.ColumnCount), "消失", "テーブル消失", "警告");
+
+                foreach (SnapshotColumn bc in GetOrderedColumns(bt))
+                {
+                    ColumnComparisonItem cc = new ColumnComparisonItem();
+                    cc.TableName = bt.TableName;
+                    cc.ColumnName = bc.ColumnName;
+                    cc.ColumnIndex = bc.ColumnIndex;
+                    cc.TableStatus = item.PrimaryStatus;
+                    cc.ColumnStatus = "削除（テーブル消失）";
+                    cc.IsChanged = true;
+                    cc.BeforeType = bc.InferredType;
+                    cc.TypeDisplay = bc.InferredType + " → 消失";
+                    cc.DdlKeyDisplay = FormatDdlKeyDisplay(bc);
+                    cc.BeforeNonNull = bc.NonNullCount > 0 ? bc.NonNullCount : Math.Max(0L, bc.TotalRows - bc.NullCount);
+                    cc.NonNullDelta = -cc.BeforeNonNull;
+                    cc.BeforeNullCount = bc.NullCount;
+                    cc.NullCountDelta = -bc.NullCount;
+                    cc.NullChangeDisplay = string.Format("{0:#,##0} → 0", bc.NullCount);
+                    cc.BeforeDistinct = bc.DistinctCount;
+                    cc.DistinctDelta = -bc.DistinctCount;
+                    cc.DistinctChangeDisplay = string.Format("{0:#,##0} → 0", bc.DistinctCount);
+                    cc.ByteLenDisplay = string.Format("平均 {0:0.0} / 最大 {1:#,##0} B", bc.AvgByteLen, bc.MaxByteLen);
+                    cc.MinValDisplay = string.IsNullOrEmpty(bc.MinValueText) ? "-" : bc.MinValueText;
+                    cc.MaxValDisplay = string.IsNullOrEmpty(bc.MaxValueText) ? "-" : bc.MaxValueText;
+                    cc.Top1Display = string.IsNullOrEmpty(bc.Top1Value) ? "-" : bc.Top1Value;
+                    cc.ContentHashStatus = !string.IsNullOrEmpty(bc.ContentHash) ? "削除" : "未取得(旧形式)";
+                    cc.DiffCount = 1;
+                    cc.ChangeSummary = "親テーブル消失により未検出";
+                    cc.Severity = "警告";
+                    item.ColumnComparisons.Add(cc);
+                }
                 return item;
             }
 
@@ -4524,13 +7120,52 @@ namespace AuroraAnalyzer
             item.DateColumns = !string.IsNullOrEmpty(at.DateColumns) ? at.DateColumns : bt.DateColumns;
             item.BeforeWarning = string.IsNullOrEmpty(bt.WarningSummary) ? "正常" : bt.WarningSummary;
             item.AfterWarning = string.IsNullOrEmpty(at.WarningSummary) ? "正常" : at.WarningSummary;
+            item.BeforeWarningCount = bt.WarningCount;
+            item.AfterWarningCount = at.WarningCount;
+            item.WarningCountDelta = at.WarningCount - bt.WarningCount;
+            item.BeforeJMeterReadiness = bt.JMeterReadiness;
+            item.AfterJMeterReadiness = at.JMeterReadiness;
 
             bool hasIntrinsicTableChange = false;
             bool hasInPlaceMutation = false;
             bool hasSchemaChange = false;
             HashSet<string> changedColSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> schemaChangedColSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> inPlaceColSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             List<string> summaryParts = new List<string>();
             List<string> alertParts = new List<string>();
+
+            // 3.0 Exact Row Multiset Hash & PK Row Churn Sketch comparison
+            bool bothHaveRowHash = !string.IsNullOrEmpty(bt.RowMultisetHash) && !string.IsNullOrEmpty(at.RowMultisetHash);
+            if (bothHaveRowHash)
+            {
+                if (!string.Equals(bt.RowMultisetHash, at.RowMultisetHash, StringComparison.Ordinal))
+                {
+                    item.ContentHashStatus = "変化";
+                    item.ContentHashChanged = true;
+                    hasIntrinsicTableChange = true;
+                    if (item.RowDelta == 0) hasInPlaceMutation = true;
+                }
+                else
+                {
+                    item.ContentHashStatus = "一致";
+                    item.ContentHashChanged = false;
+                }
+            }
+            else
+            {
+                item.ContentHashStatus = "未取得(旧形式)";
+            }
+
+            ComputeRowChurnFromSketches(bt, at, item);
+            if (item.HasRowChurn && (item.UpdatedRows > 0 || (item.RowDelta >= 0 && item.DeletedRows > 0)))
+            {
+                hasIntrinsicTableChange = true;
+                hasInPlaceMutation = true;
+                AddDiff(item, "-", "内容ハッシュ", "行レベル変動内訳(" + (item.RowChurnExact ? "完全計測" : "Bottom-K推定") + ")",
+                    bt.RowCount.ToString("#,##0") + "件", at.RowCount.ToString("#,##0") + "件",
+                    item.ChurnSummary, (item.DeletedRows > 0 && item.RowDelta >= 0) ? "注意" : "通常");
+            }
 
             // 3.1 Table-level intrinsic comparisons (EXCLUDING No, RowShare, SizeShare)
             if (item.RowDelta != 0)
@@ -4574,7 +7209,6 @@ namespace AuroraAnalyzer
             }
             if (!NumbersNearlyEqual(bt.FileSizeKB, at.FileSizeKB, 0.005))
             {
-                // Ignore pure 3-byte UTF-8 BOM difference when no other data changed
                 bool encodingDiffOnly = !string.Equals(bt.EncodingName, at.EncodingName, StringComparison.OrdinalIgnoreCase) &&
                                         Math.Abs(at.FileSizeKB - bt.FileSizeKB) <= 0.015;
                 if (!encodingDiffOnly)
@@ -4608,12 +7242,101 @@ namespace AuroraAnalyzer
                 }
             }
 
-            // 3.2 Column-level comparison (03_カラム分析)
-            HashSet<string> allColNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (string cn in at.Columns.Keys) allColNames.Add(cn);
-            foreach (string cn in bt.Columns.Keys) allColNames.Add(cn);
+            // 3.1B DirectDB Physical InnoDB / AUTO_INCREMENT / DDL / Index / Declared FK comparisons
+            bool bothHaveDbMeta = bt.DbMeta != null && bt.DbMeta.HasMetadata && at.DbMeta != null && at.DbMeta.HasMetadata;
+            if (bothHaveDbMeta)
+            {
+                item.HasDbPhysicalMeta = true;
+                item.BeforeDataLengthKB = Math.Round(bt.DbMeta.DataLength / 1024.0, 1);
+                item.AfterDataLengthKB = Math.Round(at.DbMeta.DataLength / 1024.0, 1);
+                item.DataLengthDeltaKB = Math.Round(item.AfterDataLengthKB - item.BeforeDataLengthKB, 1);
+                item.BeforeIndexLengthKB = Math.Round(bt.DbMeta.IndexLength / 1024.0, 1);
+                item.AfterIndexLengthKB = Math.Round(at.DbMeta.IndexLength / 1024.0, 1);
+                item.IndexLengthDeltaKB = Math.Round(item.AfterIndexLengthKB - item.BeforeIndexLengthKB, 1);
+                item.BeforeDataFreeKB = Math.Round(bt.DbMeta.DataFree / 1024.0, 1);
+                item.AfterDataFreeKB = Math.Round(at.DbMeta.DataFree / 1024.0, 1);
+                item.DataFreeDeltaKB = Math.Round(item.AfterDataFreeKB - item.BeforeDataFreeKB, 1);
+                item.BeforeUpdateTime = bt.DbMeta.UpdateTime;
+                item.AfterUpdateTime = at.DbMeta.UpdateTime;
 
-            foreach (string colName in allColNames)
+                if (bt.DbMeta.DataLength != at.DbMeta.DataLength)
+                {
+                    AddDiff(item, "-", "物理DB指標", "InnoDB実データ容量(KB)",
+                        item.BeforeDataLengthKB.ToString("#,##0.0"), item.AfterDataLengthKB.ToString("#,##0.0"),
+                        FormatSignedDouble(item.DataLengthDeltaKB, "0.0") + " KB", "通常");
+                }
+                if (bt.DbMeta.IndexLength != at.DbMeta.IndexLength)
+                {
+                    AddDiff(item, "-", "物理DB指標", "InnoDB実インデックス容量(KB)",
+                        item.BeforeIndexLengthKB.ToString("#,##0.0"), item.AfterIndexLengthKB.ToString("#,##0.0"),
+                        FormatSignedDouble(item.IndexLengthDeltaKB, "0.0") + " KB", "通常");
+                }
+                if (bt.DbMeta.DataFree != at.DbMeta.DataFree)
+                {
+                    string fSev = (item.DataFreeDeltaKB >= 1024.0) ? "注意" : "通常";
+                    AddDiff(item, "-", "物理DB指標", "InnoDB空き領域/断片化(KB)",
+                        item.BeforeDataFreeKB.ToString("#,##0.0"), item.AfterDataFreeKB.ToString("#,##0.0"),
+                        FormatSignedDouble(item.DataFreeDeltaKB, "0.0") + " KB", fSev);
+                }
+
+                if (bt.DbMeta.HasAutoIncrement && at.DbMeta.HasAutoIncrement)
+                {
+                    item.HasAutoIncrement = true;
+                    item.BeforeAutoIncrement = bt.DbMeta.AutoIncrement;
+                    item.AfterAutoIncrement = at.DbMeta.AutoIncrement;
+                    item.AutoIncrementDelta = at.DbMeta.AutoIncrement - bt.DbMeta.AutoIncrement;
+                    if (item.AutoIncrementDelta != 0)
+                    {
+                        hasIntrinsicTableChange = true;
+                        long netAdded = Math.Max(0L, item.RowDelta);
+                        if (item.AutoIncrementDelta > netAdded)
+                        {
+                            item.AutoIncrementGap = item.AutoIncrementDelta - netAdded;
+                            hasInPlaceMutation = true;
+                            string gapDesc = string.Format("採番 +{0:#,##0} に対し純増 +{1:#,##0} (差 {2:#,##0}: ROLLBACKまたはINSERT後DELETEの可能性)",
+                                item.AutoIncrementDelta, netAdded, item.AutoIncrementGap);
+                            AddDiff(item, "-", "物理DB指標", "AUTO_INCREMENT進行(ギャップ検出)",
+                                bt.DbMeta.AutoIncrement.ToString("#,##0"), at.DbMeta.AutoIncrement.ToString("#,##0"),
+                                gapDesc, "注意");
+                            alertParts.Add(string.Format("AUTO_INCREMENTギャップ({0:#,##0}件)", item.AutoIncrementGap));
+                        }
+                        else
+                        {
+                            AddDiff(item, "-", "物理DB指標", "AUTO_INCREMENT",
+                                bt.DbMeta.AutoIncrement.ToString("#,##0"), at.DbMeta.AutoIncrement.ToString("#,##0"),
+                                FormatSignedInt(item.AutoIncrementDelta), "通常");
+                        }
+                    }
+                }
+
+                if (!string.Equals(bt.DbMeta.Engine, at.DbMeta.Engine, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(bt.DbMeta.RowFormat, at.DbMeta.RowFormat, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(bt.DbMeta.TableCollation, at.DbMeta.TableCollation, StringComparison.OrdinalIgnoreCase))
+                {
+                    hasIntrinsicTableChange = true;
+                    hasSchemaChange = true;
+                    hasInPlaceMutation = true;
+                    string bCfg = string.Format("{0}/{1}/{2}", bt.DbMeta.Engine, bt.DbMeta.RowFormat, bt.DbMeta.TableCollation);
+                    string aCfg = string.Format("{0}/{1}/{2}", at.DbMeta.Engine, at.DbMeta.RowFormat, at.DbMeta.TableCollation);
+                    AddDiff(item, "-", "DDLスキーマ", "テーブル定義(Engine/Format/Collation)", bCfg, aCfg, "テーブル定義変更", "警告");
+                    AddDbSchemaDiff(parentRes, item.TableName, "テーブル設定", item.TableName, "変更", bCfg, aCfg, "警告", "Engine/RowFormat/Collation変更");
+                }
+
+                // Compare Indexes
+                CompareTableIndexes(bt.DbMeta, at.DbMeta, item, parentRes, ref hasIntrinsicTableChange, ref hasSchemaChange, ref hasInPlaceMutation);
+                // Compare Declared Foreign Keys
+                CompareTableDeclaredFks(bt.DbMeta, at.DbMeta, item, parentRes, ref hasIntrinsicTableChange, ref hasSchemaChange, ref hasInPlaceMutation);
+            }
+
+            // 3.2 Column-level comparison (preserving schema order)
+            List<string> orderedColNames = new List<string>();
+            HashSet<string> seenCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (SnapshotColumn ac in GetOrderedColumns(at)) { if (seenCols.Add(ac.ColumnName)) orderedColNames.Add(ac.ColumnName); }
+            foreach (SnapshotColumn bc in GetOrderedColumns(bt)) { if (seenCols.Add(bc.ColumnName)) orderedColNames.Add(bc.ColumnName); }
+
+            Dictionary<string, List<ColumnDiffItem>> diffsByCol = new Dictionary<string, List<ColumnDiffItem>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string colName in orderedColNames)
             {
                 SnapshotColumn bc = null;
                 SnapshotColumn ac = null;
@@ -4626,7 +7349,14 @@ namespace AuroraAnalyzer
                     hasSchemaChange = true;
                     hasInPlaceMutation = true;
                     changedColSet.Add(ac.ColumnName);
-                    AddDiff(item, ac.ColumnName, "スキーマ追加", "カラム追加", "なし", ac.InferredType, "新規カラム追加", "注意");
+                    schemaChangedColSet.Add(ac.ColumnName);
+                    item.AddedColumnCount++;
+                    ColumnDiffItem df = AddDiff(item, ac.ColumnName, "スキーマ追加", "カラム追加", "なし", FormatDdlKeyDisplay(ac) + " (" + ac.InferredType + ")", "新規カラム追加", "注意");
+                    TrackColDiff(diffsByCol, ac.ColumnName, df);
+                    if (ac.DbMeta != null)
+                    {
+                        AddDbSchemaDiff(parentRes, item.TableName, "カラムDDL", ac.ColumnName, "追加", "-", FormatDdlKeyDisplay(ac), "注意", "テスト開始後にカラム追加");
+                    }
                     continue;
                 }
                 if (bc != null && ac == null)
@@ -4635,22 +7365,58 @@ namespace AuroraAnalyzer
                     hasSchemaChange = true;
                     hasInPlaceMutation = true;
                     changedColSet.Add(bc.ColumnName);
-                    AddDiff(item, bc.ColumnName, "スキーマ削除", "カラム削除", bc.InferredType, "なし", "カラム削除", "警告");
+                    schemaChangedColSet.Add(bc.ColumnName);
+                    item.RemovedColumnCount++;
+                    ColumnDiffItem df = AddDiff(item, bc.ColumnName, "スキーマ削除", "カラム削除", FormatDdlKeyDisplay(bc) + " (" + bc.InferredType + ")", "なし", "カラム削除", "警告");
+                    TrackColDiff(diffsByCol, bc.ColumnName, df);
                     alertParts.Add("カラム削除:" + bc.ColumnName);
+                    if (bc.DbMeta != null)
+                    {
+                        AddDbSchemaDiff(parentRes, item.TableName, "カラムDDL", bc.ColumnName, "削除", FormatDdlKeyDisplay(bc), "-", "警告", "テスト開始後にカラム削除");
+                    }
                     continue;
                 }
 
                 bool colChanged = false;
+                bool colSchemaChanged = false;
+                bool colInPlace = false;
+                int prevDiffCount = item.ColumnDiffs.Count;
+
+                // DDL metadata comparison (when both DirectDB snapshots have DbMeta)
+                if (bc.DbMeta != null && ac.DbMeta != null)
+                {
+                    string bDdl = FormatDdlKeyDisplay(bc);
+                    string aDdl = FormatDdlKeyDisplay(ac);
+                    if (!string.Equals(bc.DbMeta.ColumnType, ac.DbMeta.ColumnType, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(bc.DbMeta.IsNullable, ac.DbMeta.IsNullable, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(bc.DbMeta.ColumnKey, ac.DbMeta.ColumnKey, StringComparison.OrdinalIgnoreCase) ||
+                        !string.Equals(bc.DbMeta.ColumnDefault, ac.DbMeta.ColumnDefault, StringComparison.Ordinal) ||
+                        !string.Equals(bc.DbMeta.Extra, ac.DbMeta.Extra, StringComparison.OrdinalIgnoreCase))
+                    {
+                        colChanged = true;
+                        colSchemaChanged = true;
+                        colInPlace = true;
+                        hasSchemaChange = true;
+                        hasInPlaceMutation = true;
+                        item.SchemaChangedColumnCount++;
+                        string bFull = bDdl + (string.IsNullOrEmpty(bc.DbMeta.ColumnDefault) ? "" : (" DEFAULT=" + bc.DbMeta.ColumnDefault));
+                        string aFull = aDdl + (string.IsNullOrEmpty(ac.DbMeta.ColumnDefault) ? "" : (" DEFAULT=" + ac.DbMeta.ColumnDefault));
+                        AddDiff(item, ac.ColumnName, "DDLスキーマ", "MySQLカラム定義", bFull, aFull, "DDL変更", "警告");
+                        AddDbSchemaDiff(parentRes, item.TableName, "カラムDDL", ac.ColumnName, "変更", bFull, aFull, "警告", "型・NULL制約・キー・デフォルト変更");
+                    }
+                }
+
                 if (!string.Equals(bc.InferredType, ac.InferredType, StringComparison.Ordinal))
                 {
                     colChanged = true;
+                    colInPlace = true;
                     hasInPlaceMutation = true;
                     AddDiff(item, ac.ColumnName, "カラム統計", "推定データ型", bc.InferredType, ac.InferredType, "型推定変化", "注意");
                 }
                 if (bc.NullCount != ac.NullCount)
                 {
                     colChanged = true;
-                    if (item.RowDelta > 0 && ac.NullCount < bc.NullCount) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && ac.NullCount < bc.NullCount) { colInPlace = true; hasInPlaceMutation = true; }
                     AddDiff(item, ac.ColumnName, "カラム統計", "NULL件数",
                         bc.NullCount.ToString("#,##0"), ac.NullCount.ToString("#,##0"),
                         FormatSignedInt(ac.NullCount - bc.NullCount) + "件", "通常");
@@ -4658,7 +7424,7 @@ namespace AuroraAnalyzer
                 if (bc.DistinctCount != ac.DistinctCount)
                 {
                     colChanged = true;
-                    if (item.RowDelta > 0 && ac.DistinctCount < bc.DistinctCount) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && ac.DistinctCount < bc.DistinctCount) { colInPlace = true; hasInPlaceMutation = true; }
                     AddDiff(item, ac.ColumnName, "カラム統計", "ユニーク数",
                         bc.DistinctCount.ToString("#,##0"), ac.DistinctCount.ToString("#,##0"),
                         FormatSignedInt(ac.DistinctCount - bc.DistinctCount) + "種類", "通常");
@@ -4680,10 +7446,11 @@ namespace AuroraAnalyzer
                 if (bc.MaxByteLen != ac.MaxByteLen)
                 {
                     colChanged = true;
-                    if (item.RowDelta > 0 && ac.MaxByteLen < bc.MaxByteLen) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && ac.MaxByteLen < bc.MaxByteLen) { colInPlace = true; hasInPlaceMutation = true; }
+                    string bSev = (ac.MaxByteLen >= 4000 && bc.MaxByteLen < 4000) ? "注意" : "通常";
                     AddDiff(item, ac.ColumnName, "カラム統計", "最大長(B)",
                         bc.MaxByteLen.ToString("#,##0"), ac.MaxByteLen.ToString("#,##0"),
-                        FormatSignedInt(ac.MaxByteLen - bc.MaxByteLen) + " B", "通常");
+                        FormatSignedInt(ac.MaxByteLen - bc.MaxByteLen) + " B", bSev);
                 }
                 if (!Top1ValuesEqual(bc.Top1Value, ac.Top1Value))
                 {
@@ -4711,14 +7478,38 @@ namespace AuroraAnalyzer
                         bc.GiniCoefficient.ToString("0.000"), ac.GiniCoefficient.ToString("0.000"),
                         FormatSignedDouble(ac.GiniCoefficient - bc.GiniCoefficient, "0.000"), "通常");
                 }
+                if (bc.HasNormalizedEntropy && ac.HasNormalizedEntropy && !NumbersNearlyEqual(bc.NormalizedEntropy, ac.NormalizedEntropy, 0.0005))
+                {
+                    colChanged = true;
+                    AddDiff(item, ac.ColumnName, "カラム統計", "正規化エントロピー",
+                        bc.NormalizedEntropy.ToString("0.000"), ac.NormalizedEntropy.ToString("0.000"),
+                        FormatSignedDouble(ac.NormalizedEntropy - bc.NormalizedEntropy, "0.000"), "通常");
+                }
                 if (!string.Equals(bc.SkewRisk, ac.SkewRisk, StringComparison.Ordinal))
                 {
                     colChanged = true;
                     string sev = ac.SkewRisk.StartsWith("高リスク") ? "警告" : "注意";
                     AddDiff(item, ac.ColumnName, "カラム統計", "偏りリスク", bc.SkewRisk, ac.SkewRisk, "偏り評価変化", sev);
                 }
+                if (bc.HasCharQualityCounts && ac.HasCharQualityCounts)
+                {
+                    if (bc.WhitespaceOnlyCount != ac.WhitespaceOnlyCount)
+                    {
+                        colChanged = true;
+                        AddDiff(item, ac.ColumnName, "カラム統計", "空白のみ件数",
+                            bc.WhitespaceOnlyCount.ToString("#,##0"), ac.WhitespaceOnlyCount.ToString("#,##0"),
+                            FormatSignedInt(ac.WhitespaceOnlyCount - bc.WhitespaceOnlyCount) + "件", ac.WhitespaceOnlyCount > bc.WhitespaceOnlyCount ? "注意" : "通常");
+                    }
+                    if (bc.MultilineCount != ac.MultilineCount)
+                    {
+                        colChanged = true;
+                        AddDiff(item, ac.ColumnName, "カラム統計", "改行含件数",
+                            bc.MultilineCount.ToString("#,##0"), ac.MultilineCount.ToString("#,##0"),
+                            FormatSignedInt(ac.MultilineCount - bc.MultilineCount) + "件", "通常");
+                    }
+                }
 
-                // Fallback top-value distribution & Min/Max comparison when detailed sheets (04/05/06) are absent
+                // Fallback top-value distribution & Min/Max comparison when detailed dist/num/dt stats are absent
                 bool hasBothDist = bt.Distributions.ContainsKey(ac.ColumnName) && at.Distributions.ContainsKey(ac.ColumnName);
                 if (!hasBothDist && bc.TopDistCounts.Count > 0 && ac.TopDistCounts.Count > 0)
                 {
@@ -4731,21 +7522,15 @@ namespace AuroraAnalyzer
                         long aCnt = 0;
                         bool inB = bc.TopDistCounts.TryGetValue(k, out bCnt);
                         bool inA = ac.TopDistCounts.TryGetValue(k, out aCnt);
-                        if (inB && inA && bCnt != aCnt)
+                        if ((inB && inA && bCnt != aCnt) || (bc.DistinctCount <= 5 && ac.DistinctCount <= 5 && inB != inA))
                         {
                             colChanged = true;
-                            if (item.RowDelta > 0 && aCnt < bCnt) hasInPlaceMutation = true;
+                            if (item.RowDelta > 0 && aCnt < bCnt) { colInPlace = true; hasInPlaceMutation = true; }
+                            string sev = "通常";
+                            if (aCnt > bCnt && AnomalyValueRegex.IsMatch(k)) sev = (bCnt == 0) ? "警告" : "注意";
                             AddDiff(item, ac.ColumnName, "カテゴリ分布", "区分値: " + k,
                                 bCnt.ToString("#,##0") + "件", aCnt.ToString("#,##0") + "件",
-                                FormatSignedInt(aCnt - bCnt) + "件", "通常");
-                        }
-                        else if (bc.DistinctCount <= 5 && ac.DistinctCount <= 5 && inB != inA)
-                        {
-                            colChanged = true;
-                            if (item.RowDelta > 0 && aCnt < bCnt) hasInPlaceMutation = true;
-                            AddDiff(item, ac.ColumnName, "カテゴリ分布", "区分値: " + k,
-                                bCnt.ToString("#,##0") + "件", aCnt.ToString("#,##0") + "件",
-                                FormatSignedInt(aCnt - bCnt) + "件", "通常");
+                                FormatSignedInt(aCnt - bCnt) + "件" + (sev != "通常" ? " (異常系値増加)" : ""), sev);
                         }
                     }
                 }
@@ -4763,13 +7548,13 @@ namespace AuroraAnalyzer
                         if (TryParseFormattedNumber(bc.MinValueText, out bMin) && TryParseFormattedNumber(ac.MinValueText, out aMin) && !NumbersNearlyEqual(bMin, aMin, 0.005))
                         {
                             colChanged = true;
-                            if (item.RowDelta > 0 && aMin > bMin + 0.005) hasInPlaceMutation = true;
+                            if (item.RowDelta > 0 && aMin > bMin + 0.005) { colInPlace = true; hasInPlaceMutation = true; }
                             AddDiff(item, ac.ColumnName, "数値統計", "最小値", bc.MinValueText, ac.MinValueText, FormatSignedDouble(aMin - bMin, "0.##"), "通常");
                         }
                         if (TryParseFormattedNumber(bc.MaxValueText, out bMax) && TryParseFormattedNumber(ac.MaxValueText, out aMax) && !NumbersNearlyEqual(bMax, aMax, 0.005))
                         {
                             colChanged = true;
-                            if (item.RowDelta > 0 && aMax < bMax - 0.005) hasInPlaceMutation = true;
+                            if (item.RowDelta > 0 && aMax < bMax - 0.005) { colInPlace = true; hasInPlaceMutation = true; }
                             AddDiff(item, ac.ColumnName, "数値統計", "最大値", bc.MaxValueText, ac.MaxValueText, FormatSignedDouble(aMax - bMax, "0.##"), "通常");
                         }
                     }
@@ -4779,26 +7564,59 @@ namespace AuroraAnalyzer
                         if (TryParseComparableDate(bc.MinValueText, out bMinDt) && TryParseComparableDate(ac.MinValueText, out aMinDt) && Math.Abs((aMinDt - bMinDt).TotalSeconds) >= 1.0)
                         {
                             colChanged = true;
-                            if (item.RowDelta > 0 && aMinDt > bMinDt) hasInPlaceMutation = true;
+                            if (item.RowDelta > 0 && aMinDt > bMinDt) { colInPlace = true; hasInPlaceMutation = true; }
                             AddDiff(item, ac.ColumnName, "時系列・日時", "最古日時", bc.MinValueText, ac.MinValueText, "最古日時変化", "通常");
                         }
                         if (TryParseComparableDate(bc.MaxValueText, out bMaxDt) && TryParseComparableDate(ac.MaxValueText, out aMaxDt) && Math.Abs((aMaxDt - bMaxDt).TotalSeconds) >= 1.0)
                         {
                             colChanged = true;
-                            if (item.RowDelta > 0 && aMaxDt < bMaxDt) hasInPlaceMutation = true;
+                            if (item.RowDelta > 0 && aMaxDt < bMaxDt) { colInPlace = true; hasInPlaceMutation = true; }
                             AddDiff(item, ac.ColumnName, "時系列・日時", "最新日時", bc.MaxValueText, ac.MaxValueText, "最新日時更新", "通常");
                         }
                     }
+                }
+
+                // Exact Column Content Hash & Distinct Set Hash comparison (catches hidden middle-row/same-length updates!)
+                bool bothHaveColHash = !string.IsNullOrEmpty(bc.ContentHash) && !string.IsNullOrEmpty(ac.ContentHash);
+                if (bothHaveColHash && !string.Equals(bc.ContentHash, ac.ContentHash, StringComparison.Ordinal))
+                {
+                    bool statAlreadyDetected = colChanged;
+                    colChanged = true;
+                    if (item.RowDelta == 0) { colInPlace = true; hasInPlaceMutation = true; }
+                    if (!statAlreadyDetected && item.RowDelta == 0)
+                    {
+                        AddDiff(item, ac.ColumnName, "内容ハッシュ", "カラム値マルチセットハッシュ",
+                            bc.ContentHash.Substring(0, 12) + "...", ac.ContentHash.Substring(0, 12) + "...",
+                            "統計指標不変のデータ更新検出 (同一長/同一件数の値書換)", "注意");
+                    }
+                }
+                if (!string.IsNullOrEmpty(bc.DistinctSetHash) && !string.IsNullOrEmpty(ac.DistinctSetHash) &&
+                    bc.DistinctCount == ac.DistinctCount &&
+                    !string.Equals(bc.DistinctSetHash, ac.DistinctSetHash, StringComparison.Ordinal))
+                {
+                    colChanged = true;
+                    colInPlace = true;
+                    hasInPlaceMutation = true;
+                    AddDiff(item, ac.ColumnName, "内容ハッシュ", "ユニーク値集合ハッシュ",
+                        bc.DistinctSetHash.Substring(0, 12) + "...", ac.DistinctSetHash.Substring(0, 12) + "...",
+                        string.Format("ユニーク数同一({0:#,##0}種類)だが構成値が変化", ac.DistinctCount), "注意");
+                }
+
+                for (int di = prevDiffCount; di < item.ColumnDiffs.Count; di++)
+                {
+                    TrackColDiff(diffsByCol, ac.ColumnName, item.ColumnDiffs[di]);
                 }
 
                 if (colChanged)
                 {
                     hasIntrinsicTableChange = true;
                     changedColSet.Add(ac.ColumnName);
+                    if (colSchemaChanged) schemaChangedColSet.Add(ac.ColumnName);
+                    if (colInPlace) inPlaceColSet.Add(ac.ColumnName);
                 }
             }
 
-            // 3.3 Category distribution comparison (04_分布・割合分析)
+            // 3.3 Category distribution comparison (Full Top20 from snapshot or Sheet 04)
             HashSet<string> distCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string dc in at.Distributions.Keys) distCols.Add(dc);
             foreach (string dc in bt.Distributions.Keys) distCols.Add(dc);
@@ -4830,17 +7648,26 @@ namespace AuroraAnalyzer
                         changedColSet.Add(colName);
                         if (item.RowDelta > 0 && aCnt < bCnt)
                         {
-                            // Monotonicity violation under row addition -> existing rows were updated/deleted!
                             hasInPlaceMutation = true;
+                            inPlaceColSet.Add(colName);
                         }
-                        AddDiff(item, colName, "カテゴリ分布", "区分値: " + catVal,
+                        string sev = "通常";
+                        string extra = "";
+                        if (aCnt > bCnt && AnomalyValueRegex.IsMatch(catVal))
+                        {
+                            sev = (bCnt == 0) ? "警告" : "注意";
+                            extra = (bCnt == 0) ? " (異常系値新規出現)" : " (異常系値増加)";
+                            if (bCnt == 0) alertParts.Add(string.Format("{0}に異常系値'{1}'出現({2:#,##0}件)", colName, catVal, aCnt));
+                        }
+                        ColumnDiffItem df = AddDiff(item, colName, "カテゴリ分布", "区分値: " + catVal,
                             bCnt.ToString("#,##0") + "件", aCnt.ToString("#,##0") + "件",
-                            FormatSignedInt(aCnt - bCnt) + "件", "通常");
+                            FormatSignedInt(aCnt - bCnt) + "件" + extra, sev);
+                        TrackColDiff(diffsByCol, colName, df);
                     }
                 }
             }
 
-            // 3.4 Numeric statistics comparison (05_数値統計・ヒストグラム)
+            // 3.4 Numeric statistics comparison (Snapshot or Sheet 05)
             HashSet<string> numCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string nc in at.NumericStats.Keys) numCols.Add(nc);
             foreach (string nc in bt.NumericStats.Keys) numCols.Add(nc);
@@ -4854,16 +7681,22 @@ namespace AuroraAnalyzer
                 if (bn == null || an == null) continue;
 
                 bool numChanged = false;
+                int prevCnt = item.ColumnDiffs.Count;
+                if (bn.HasSum && an.HasSum && !NumbersNearlyEqual(bn.Sum, an.Sum, 0.005))
+                {
+                    numChanged = true;
+                    AddDiff(item, colName, "数値統計", "合計値(SUM)", bn.Sum.ToString("#,##0.##"), an.Sum.ToString("#,##0.##"), FormatSignedDouble(an.Sum - bn.Sum, "0.##"), "通常");
+                }
                 if (!NumbersNearlyEqual(bn.Min, an.Min, 0.005))
                 {
                     numChanged = true;
-                    if (item.RowDelta > 0 && an.Min > bn.Min + 0.005) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && an.Min > bn.Min + 0.005) { hasInPlaceMutation = true; inPlaceColSet.Add(colName); }
                     AddDiff(item, colName, "数値統計", "最小値", bn.Min.ToString("#,##0.##"), an.Min.ToString("#,##0.##"), FormatSignedDouble(an.Min - bn.Min, "0.##"), "通常");
                 }
                 if (!NumbersNearlyEqual(bn.Max, an.Max, 0.005))
                 {
                     numChanged = true;
-                    if (item.RowDelta > 0 && an.Max < bn.Max - 0.005) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && an.Max < bn.Max - 0.005) { hasInPlaceMutation = true; inPlaceColSet.Add(colName); }
                     AddDiff(item, colName, "数値統計", "最大値", bn.Max.ToString("#,##0.##"), an.Max.ToString("#,##0.##"), FormatSignedDouble(an.Max - bn.Max, "0.##"), "通常");
                 }
                 if (!NumbersNearlyEqual(bn.Mean, an.Mean, 0.005))
@@ -4914,14 +7747,17 @@ namespace AuroraAnalyzer
                 if (bn.HasNegativeRate && an.HasNegativeRate && !NumbersNearlyEqual(bn.NegativeRate, an.NegativeRate, 1e-6))
                 {
                     numChanged = true;
-                    AddDiff(item, colName, "数値統計", "負値率", bn.NegativeRate.ToString("0.0%"), an.NegativeRate.ToString("0.0%"), FormatSignedPercent(an.NegativeRate - bn.NegativeRate), "通常");
+                    string nSev = (an.NegativeRate > bn.NegativeRate + 0.01) ? "注意" : "通常";
+                    AddDiff(item, colName, "数値統計", "負値率", bn.NegativeRate.ToString("0.0%"), an.NegativeRate.ToString("0.0%"), FormatSignedPercent(an.NegativeRate - bn.NegativeRate), nSev);
                 }
                 if (!NumbersNearlyEqual(bn.OutlierRate, an.OutlierRate, 1e-6))
                 {
                     numChanged = true;
-                    AddDiff(item, colName, "数値統計", "外れ値率", bn.OutlierRate.ToString("0.0%"), an.OutlierRate.ToString("0.0%"), FormatSignedPercent(an.OutlierRate - bn.OutlierRate), "通常");
+                    string oSev = (an.OutlierRate >= 0.05 && an.OutlierRate > bn.OutlierRate + 0.01) ? "注意" : "通常";
+                    AddDiff(item, colName, "数値統計", "外れ値率", bn.OutlierRate.ToString("0.0%"), an.OutlierRate.ToString("0.0%"), FormatSignedPercent(an.OutlierRate - bn.OutlierRate), oSev);
                 }
 
+                for (int di = prevCnt; di < item.ColumnDiffs.Count; di++) TrackColDiff(diffsByCol, colName, item.ColumnDiffs[di]);
                 if (numChanged)
                 {
                     hasIntrinsicTableChange = true;
@@ -4929,7 +7765,7 @@ namespace AuroraAnalyzer
                 }
             }
 
-            // 3.5 DateTime statistics comparison (06_時系列分析)
+            // 3.5 DateTime statistics comparison (Snapshot or Sheet 06)
             HashSet<string> dtCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (string dc in at.DateTimeStats.Keys) dtCols.Add(dc);
             foreach (string dc in bt.DateTimeStats.Keys) dtCols.Add(dc);
@@ -4943,16 +7779,17 @@ namespace AuroraAnalyzer
                 if (bd == null || ad == null) continue;
 
                 bool dtChanged = false;
+                int prevCnt = item.ColumnDiffs.Count;
                 if (!string.Equals(bd.MinDate, ad.MinDate, StringComparison.Ordinal))
                 {
                     dtChanged = true;
-                    if (item.RowDelta > 0 && string.CompareOrdinal(ad.MinDate, bd.MinDate) > 0) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && string.CompareOrdinal(ad.MinDate, bd.MinDate) > 0) { hasInPlaceMutation = true; inPlaceColSet.Add(colName); }
                     AddDiff(item, colName, "時系列・日時", "最古日時", bd.MinDate, ad.MinDate, "最古日時変化", "通常");
                 }
                 if (!string.Equals(bd.MaxDate, ad.MaxDate, StringComparison.Ordinal))
                 {
                     dtChanged = true;
-                    if (item.RowDelta > 0 && string.CompareOrdinal(ad.MaxDate, bd.MaxDate) < 0) hasInPlaceMutation = true;
+                    if (item.RowDelta > 0 && string.CompareOrdinal(ad.MaxDate, bd.MaxDate) < 0) { hasInPlaceMutation = true; inPlaceColSet.Add(colName); }
                     AddDiff(item, colName, "時系列・日時", "最新日時", bd.MaxDate, ad.MaxDate, "最新日時更新", "通常");
                 }
                 if (!string.Equals(bd.PeakDay, ad.PeakDay, StringComparison.Ordinal) || bd.PeakDayCount != ad.PeakDayCount)
@@ -4963,6 +7800,7 @@ namespace AuroraAnalyzer
                         string.Format("{0} ({1:#,##0}件)", ad.PeakDay, ad.PeakDayCount),
                         FormatSignedInt(ad.PeakDayCount - bd.PeakDayCount) + "件", "通常");
                 }
+                for (int di = prevCnt; di < item.ColumnDiffs.Count; di++) TrackColDiff(diffsByCol, colName, item.ColumnDiffs[di]);
                 if (dtChanged)
                 {
                     hasIntrinsicTableChange = true;
@@ -4970,10 +7808,28 @@ namespace AuroraAnalyzer
                 }
             }
 
+            // If table-level RowMultisetHash changed with zero column diffs (pure cross-column row swap!), record explicit evidence
+            if (item.ContentHashChanged && item.ColumnDiffs.Count == 0 && item.RowDelta == 0)
+            {
+                hasInPlaceMutation = true;
+                AddDiff(item, "-", "内容ハッシュ", "行マルチセットハッシュ",
+                    bt.RowMultisetHash.Substring(0, 12) + "...", at.RowMultisetHash.Substring(0, 12) + "...",
+                    "各列の集計は一致するが、行単位の列値組合せが変化 (行間値入替を検出)", "注意");
+            }
+
             // 3.6 Final Classification
             item.ChangedColumnCount = changedColSet.Count;
             item.HasInPlaceMutation = hasInPlaceMutation;
             List<string> sortedChangedCols = changedColSet.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+            List<string> unchangedCols = new List<string>();
+            foreach (string cn in orderedColNames)
+            {
+                if (!changedColSet.Contains(cn) && bt.Columns.ContainsKey(cn) && at.Columns.ContainsKey(cn))
+                {
+                    unchangedCols.Add(cn);
+                }
+            }
+            item.UnchangedColumnCount = unchangedCols.Count;
             if (sortedChangedCols.Count > 6)
             {
                 item.ChangedColumnsSummary = string.Join(", ", sortedChangedCols.Take(6).ToArray()) + string.Format(" 他{0}列", sortedChangedCols.Count - 6);
@@ -4987,6 +7843,23 @@ namespace AuroraAnalyzer
                 item.ChangedColumnsSummary = "-";
             }
 
+            if (unchangedCols.Count == 0)
+            {
+                item.UnchangedColumnsSummary = "-";
+            }
+            else if (sortedChangedCols.Count == 0)
+            {
+                item.UnchangedColumnsSummary = string.Format("全{0}列変更なし", unchangedCols.Count);
+            }
+            else if (unchangedCols.Count > 6)
+            {
+                item.UnchangedColumnsSummary = string.Join(", ", unchangedCols.Take(6).ToArray()) + string.Format(" 他{0}列", unchangedCols.Count - 6);
+            }
+            else
+            {
+                item.UnchangedColumnsSummary = string.Join(", ", unchangedCols.ToArray());
+            }
+
             if (item.RowDelta > 0)
             {
                 item.IsAdded = true;
@@ -4996,7 +7869,7 @@ namespace AuroraAnalyzer
                     item.ChangeGroup = "追加・更新";
                     item.AddedType = "レコード追加・更新";
                     item.IsUpdated = true;
-                    item.ChangeDetail = string.Format("レコード追加 ({0}件) ＋ 既存値/構造更新 ({1}列)", FormatSignedInt(item.RowDelta), item.ChangedColumnCount);
+                    item.ChangeDetail = string.Format("レコード追加 ({0}件) ＋ 既存値/構造更新 ({1}列変更 / {2}列不変)", FormatSignedInt(item.RowDelta), item.ChangedColumnCount, item.UnchangedColumnCount);
                 }
                 else
                 {
@@ -5006,6 +7879,7 @@ namespace AuroraAnalyzer
                     item.ChangeDetail = string.Format("レコード追加 ({0}件 / CSV {1}KB)", FormatSignedInt(item.RowDelta), FormatSignedDouble(item.SizeDeltaKB, "0.00"));
                 }
                 summaryParts.Add(string.Format("レコード {0}件 ({1:#,##0}→{2:#,##0})", FormatSignedInt(item.RowDelta), bt.RowCount, at.RowCount));
+                if (item.HasRowChurn && (item.UpdatedRows > 0 || item.DeletedRows > 0)) summaryParts.Add(item.ChurnSummary);
                 if (hasSchemaChange)
                 {
                     summaryParts.Add(string.Format("列数 {0}列", FormatSignedInt(item.ColDelta)));
@@ -5023,6 +7897,7 @@ namespace AuroraAnalyzer
                 item.IsUpdated = true;
                 item.ChangeDetail = string.Format("レコード減少 ({0}件 / {1:#,##0}→{2:#,##0})", FormatSignedInt(item.RowDelta), bt.RowCount, at.RowCount);
                 summaryParts.Add(string.Format("レコード減少 {0}件 ({1:#,##0}→{2:#,##0})", FormatSignedInt(item.RowDelta), bt.RowCount, at.RowCount));
+                if (item.HasRowChurn && (item.InsertedRows > 0 || item.UpdatedRows > 0)) summaryParts.Add(item.ChurnSummary);
                 if (item.ChangedColumnCount > 0) summaryParts.Add("変化カラム: " + item.ChangedColumnsSummary);
                 alertParts.Add(at.RowCount == 0 ? "全レコード消失(0件化)" : string.Format("レコード減少({0}件)", FormatSignedInt(item.RowDelta)));
             }
@@ -5033,19 +7908,22 @@ namespace AuroraAnalyzer
                 item.IsUpdated = true;
                 if (hasSchemaChange)
                 {
-                    item.ChangeDetail = string.Format("件数変動なし / スキーマ・統計更新 ({0}列)", item.ChangedColumnCount);
+                    item.ChangeDetail = string.Format("件数変動なし / スキーマ・統計更新 ({0}列変更 / {1}列不変)", item.ChangedColumnCount, item.UnchangedColumnCount);
                     alertParts.Add("スキーマ変更あり");
+                }
+                else if (item.HasRowChurn && (item.InsertedRows > 0 || item.DeletedRows > 0))
+                {
+                    item.ChangeDetail = string.Format("件数変動なし / 行入替・更新検出 ({0})", item.ChurnSummary);
                 }
                 else if (item.ChangedColumnCount > 0)
                 {
-                    item.ChangeDetail = string.Format("件数変動なし / データ更新検出 ({0}列変化)", item.ChangedColumnCount);
+                    item.ChangeDetail = string.Format("件数変動なし / データ更新検出 ({0}列変更 / {1}列不変)", item.ChangedColumnCount, item.UnchangedColumnCount);
                 }
                 else
                 {
-                    item.ChangeDetail = "件数変動なし / テーブル指標変化";
+                    item.ChangeDetail = "件数変動なし / テーブル指標・行組合せ変化";
                 }
                 if (item.ChangedColumnCount > 0) summaryParts.Add("変化カラム: " + item.ChangedColumnsSummary);
-                // Append up to 3 concrete column diff highlights
                 int shown = 0;
                 foreach (ColumnDiffItem d in item.ColumnDiffs)
                 {
@@ -5061,7 +7939,16 @@ namespace AuroraAnalyzer
                 item.ChangeGroup = "変更なし";
                 item.IsUnchanged = true;
                 item.ChangeDetail = "変更なし";
-                item.DiffSummary = "開始前後でレコード数・サイズ・全カラム統計・分布・数値・日時統計に差分なし";
+                item.DiffSummary = bothHaveRowHash
+                    ? "開始前後でレコード数・サイズ・全カラム統計・分布・数値・日時統計・行内容ハッシュすべて完全一致"
+                    : "開始前後でレコード数・サイズ・全カラム統計・分布・数値・日時統計に差分なし";
+                if (!item.HasRowChurn && at.RowCount >= 0)
+                {
+                    item.HasRowChurn = true;
+                    item.RowChurnExact = true;
+                    item.UnchangedRows = at.RowCount;
+                    item.ChurnSummary = string.Format("無変更 {0:#,##0}件", at.RowCount);
+                }
             }
 
             if (summaryParts.Count > 0)
@@ -5082,7 +7969,746 @@ namespace AuroraAnalyzer
                 item.AlertNote = "正常";
             }
 
+            // 3.7 Build complete per-column comparison matrix (BOTH Changed AND Unchanged columns!)
+            foreach (string colName in orderedColNames)
+            {
+                SnapshotColumn bc = null;
+                SnapshotColumn ac = null;
+                bt.Columns.TryGetValue(colName, out bc);
+                at.Columns.TryGetValue(colName, out ac);
+
+                ColumnComparisonItem cc = new ColumnComparisonItem();
+                cc.TableName = item.TableName;
+                cc.ColumnName = ac != null ? ac.ColumnName : bc.ColumnName;
+                cc.ColumnIndex = ac != null ? ac.ColumnIndex : bc.ColumnIndex;
+                cc.TableStatus = item.PrimaryStatus;
+
+                List<ColumnDiffItem> cDiffs = null;
+                diffsByCol.TryGetValue(cc.ColumnName, out cDiffs);
+                cc.DiffCount = cDiffs != null ? cDiffs.Count : 0;
+
+                if (bc == null && ac != null)
+                {
+                    cc.ColumnStatus = "追加（新規カラム）";
+                    cc.IsChanged = true;
+                    cc.AfterType = ac.InferredType;
+                    cc.TypeDisplay = "なし → " + ac.InferredType;
+                    cc.DdlKeyDisplay = FormatDdlKeyDisplay(ac);
+                    cc.AfterNonNull = ac.NonNullCount > 0 ? ac.NonNullCount : Math.Max(0L, ac.TotalRows - ac.NullCount);
+                    cc.NonNullDelta = cc.AfterNonNull;
+                    cc.AfterNullCount = ac.NullCount;
+                    cc.NullCountDelta = ac.NullCount;
+                    cc.NullChangeDisplay = string.Format("0 → {0:#,##0}", ac.NullCount);
+                    cc.AfterDistinct = ac.DistinctCount;
+                    cc.DistinctDelta = ac.DistinctCount;
+                    cc.DistinctChangeDisplay = string.Format("0 → {0:#,##0}", ac.DistinctCount);
+                    cc.ByteLenDisplay = string.Format("平均 {0:0.0} / 最大 {1:#,##0} B", ac.AvgByteLen, ac.MaxByteLen);
+                    cc.MinValDisplay = string.IsNullOrEmpty(ac.MinValueText) ? "-" : ac.MinValueText;
+                    cc.MaxValDisplay = string.IsNullOrEmpty(ac.MaxValueText) ? "-" : ac.MaxValueText;
+                    cc.Top1Display = string.IsNullOrEmpty(ac.Top1Value) ? "-" : ac.Top1Value;
+                    cc.ContentHashStatus = !string.IsNullOrEmpty(ac.ContentHash) ? "追加" : "未取得(旧形式)";
+                    cc.ChangeSummary = "テスト開始後に新規カラム追加";
+                    cc.Severity = "注意";
+                }
+                else if (bc != null && ac == null)
+                {
+                    cc.ColumnStatus = "削除（カラム消失）";
+                    cc.IsChanged = true;
+                    cc.BeforeType = bc.InferredType;
+                    cc.TypeDisplay = bc.InferredType + " → 削除";
+                    cc.DdlKeyDisplay = FormatDdlKeyDisplay(bc);
+                    cc.BeforeNonNull = bc.NonNullCount > 0 ? bc.NonNullCount : Math.Max(0L, bc.TotalRows - bc.NullCount);
+                    cc.NonNullDelta = -cc.BeforeNonNull;
+                    cc.BeforeNullCount = bc.NullCount;
+                    cc.NullCountDelta = -bc.NullCount;
+                    cc.NullChangeDisplay = string.Format("{0:#,##0} → 0", bc.NullCount);
+                    cc.BeforeDistinct = bc.DistinctCount;
+                    cc.DistinctDelta = -bc.DistinctCount;
+                    cc.DistinctChangeDisplay = string.Format("{0:#,##0} → 0", bc.DistinctCount);
+                    cc.ByteLenDisplay = string.Format("平均 {0:0.0} / 最大 {1:#,##0} B", bc.AvgByteLen, bc.MaxByteLen);
+                    cc.MinValDisplay = string.IsNullOrEmpty(bc.MinValueText) ? "-" : bc.MinValueText;
+                    cc.MaxValDisplay = string.IsNullOrEmpty(bc.MaxValueText) ? "-" : bc.MaxValueText;
+                    cc.Top1Display = string.IsNullOrEmpty(bc.Top1Value) ? "-" : bc.Top1Value;
+                    cc.ContentHashStatus = !string.IsNullOrEmpty(bc.ContentHash) ? "削除" : "未取得(旧形式)";
+                    cc.ChangeSummary = "テスト開始後にカラム削除・消失";
+                    cc.Severity = "警告";
+                }
+                else
+                {
+                    bool isColChanged = changedColSet.Contains(ac.ColumnName);
+                    bool isColSchema = schemaChangedColSet.Contains(ac.ColumnName);
+                    bool isColInPlace = inPlaceColSet.Contains(ac.ColumnName);
+                    bool bothH = !string.IsNullOrEmpty(bc.ContentHash) && !string.IsNullOrEmpty(ac.ContentHash);
+                    bool hashChanged = bothH && !string.Equals(bc.ContentHash, ac.ContentHash, StringComparison.Ordinal);
+
+                    cc.BeforeType = bc.InferredType;
+                    cc.AfterType = ac.InferredType;
+                    cc.TypeDisplay = FormatBeforeAfterText(bc.InferredType, ac.InferredType);
+                    cc.DdlKeyDisplay = FormatBeforeAfterText(FormatDdlKeyDisplay(bc), FormatDdlKeyDisplay(ac));
+                    cc.BeforeNonNull = bc.NonNullCount > 0 ? bc.NonNullCount : Math.Max(0L, bc.TotalRows - bc.NullCount);
+                    cc.AfterNonNull = ac.NonNullCount > 0 ? ac.NonNullCount : Math.Max(0L, ac.TotalRows - ac.NullCount);
+                    cc.NonNullDelta = cc.AfterNonNull - cc.BeforeNonNull;
+                    cc.BeforeNullCount = bc.NullCount;
+                    cc.AfterNullCount = ac.NullCount;
+                    cc.NullCountDelta = ac.NullCount - bc.NullCount;
+                    cc.NullChangeDisplay = bc.NullCount == ac.NullCount
+                        ? bc.NullCount.ToString("#,##0")
+                        : string.Format("{0:#,##0} → {1:#,##0} ({2})", bc.NullCount, ac.NullCount, FormatSignedInt(cc.NullCountDelta));
+                    cc.BeforeDistinct = bc.DistinctCount;
+                    cc.AfterDistinct = ac.DistinctCount;
+                    cc.DistinctDelta = ac.DistinctCount - bc.DistinctCount;
+                    cc.DistinctChangeDisplay = bc.DistinctCount == ac.DistinctCount
+                        ? bc.DistinctCount.ToString("#,##0")
+                        : string.Format("{0:#,##0} → {1:#,##0} ({2})", bc.DistinctCount, ac.DistinctCount, FormatSignedInt(cc.DistinctDelta));
+                    cc.ByteLenDisplay = (NumbersNearlyEqual(bc.AvgByteLen, ac.AvgByteLen, 0.05) && bc.MaxByteLen == ac.MaxByteLen)
+                        ? string.Format("平均 {0:0.0} / 最大 {1:#,##0} B", ac.AvgByteLen, ac.MaxByteLen)
+                        : string.Format("平均 {0:0.0}→{1:0.0} / 最大 {2:#,##0}→{3:#,##0} B", bc.AvgByteLen, ac.AvgByteLen, bc.MaxByteLen, ac.MaxByteLen);
+                    cc.MinValDisplay = FormatBeforeAfterText(bc.MinValueText, ac.MinValueText);
+                    cc.MaxValDisplay = FormatBeforeAfterText(bc.MaxValueText, ac.MaxValueText);
+                    cc.Top1Display = Top1ValuesEqual(bc.Top1Value, ac.Top1Value)
+                        ? (string.IsNullOrEmpty(ac.Top1Value) ? "-" : ac.Top1Value)
+                        : FormatBeforeAfterText(bc.Top1Value, ac.Top1Value);
+                    cc.ContentHashStatus = bothH ? (hashChanged ? "変化" : "一致") : "未取得(旧形式)";
+
+                    SnapshotNumericStats bnStat = null, anStat = null;
+                    if (bt.NumericStats.TryGetValue(ac.ColumnName, out bnStat) && at.NumericStats.TryGetValue(ac.ColumnName, out anStat) && bnStat.HasSum && anStat.HasSum)
+                    {
+                        double sumD = anStat.Sum - bnStat.Sum;
+                        cc.NumericSumDeltaDisplay = NumbersNearlyEqual(bnStat.Sum, anStat.Sum, 0.005) ? "0" : FormatSignedDouble(sumD, "0.##");
+                    }
+
+                    if (isColChanged)
+                    {
+                        cc.IsChanged = true;
+                        bool hasDataDiff = hashChanged || (cDiffs != null && cDiffs.Any(x => x.Category != "DDLスキーマ"));
+                        if (isColSchema && hasDataDiff) cc.ColumnStatus = "変更あり（スキーマ・データ）";
+                        else if (isColSchema) cc.ColumnStatus = "変更あり（スキーマ変更）";
+                        else if (item.RowDelta == 0 || isColInPlace || item.RowDelta < 0) cc.ColumnStatus = "変更あり（データ更新）";
+                        else cc.ColumnStatus = "変更あり（追加・統計変化）";
+
+                        string maxSev = "通常";
+                        List<string> cSumParts = new List<string>();
+                        if (cDiffs != null)
+                        {
+                            for (int di = 0; di < cDiffs.Count; di++)
+                            {
+                                if (cDiffs[di].Severity == "警告") maxSev = "警告";
+                                else if (cDiffs[di].Severity == "注意" && maxSev != "警告") maxSev = "注意";
+                                if (di < 3) cSumParts.Add(string.Format("{0}: {1}", cDiffs[di].MetricName, cDiffs[di].DeltaSummary));
+                            }
+                            if (cDiffs.Count > 3) cSumParts.Add(string.Format("他{0}指標", cDiffs.Count - 3));
+                        }
+                        if (cSumParts.Count == 0 && hashChanged) cSumParts.Add("値マルチセットハッシュ変化 (レコード追加/更新)");
+                        cc.Severity = maxSev;
+                        cc.ChangeSummary = string.Join(" / ", cSumParts.ToArray());
+                    }
+                    else
+                    {
+                        cc.IsUnchanged = true;
+                        cc.ColumnStatus = "変更なし";
+                        cc.Severity = "変化なし";
+                        cc.ChangeSummary = bothH ? "型・統計・値ハッシュすべて完全一致" : "型・全統計指標に変化なし";
+                    }
+                }
+                item.ColumnComparisons.Add(cc);
+            }
+
             return item;
+        }
+
+        private static List<SnapshotColumn> GetOrderedColumns(SnapshotTable st)
+        {
+            if (st == null) return new List<SnapshotColumn>();
+            if (st.ColumnList != null && st.ColumnList.Count > 0) return st.ColumnList;
+            return st.Columns.Values.OrderBy(c => c.ColumnIndex).ThenBy(c => c.ColumnName, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static void TrackColDiff(Dictionary<string, List<ColumnDiffItem>> map, string colName, ColumnDiffItem diff)
+        {
+            List<ColumnDiffItem> list;
+            if (!map.TryGetValue(colName, out list))
+            {
+                list = new List<ColumnDiffItem>();
+                map[colName] = list;
+            }
+            list.Add(diff);
+        }
+
+        private static void AddDbSchemaDiff(AnalysisComparisonResult res, string tbl, string objType, string objName, string changeType, string beforeDef, string afterDef, string sev, string note)
+        {
+            if (res == null) return;
+            DbSchemaDiffItem d = new DbSchemaDiffItem();
+            d.TableName = tbl;
+            d.ObjectType = objType;
+            d.ObjectName = objName;
+            d.ChangeType = changeType;
+            d.BeforeDef = beforeDef ?? "-";
+            d.AfterDef = afterDef ?? "-";
+            d.Severity = sev ?? "注意";
+            d.Note = note ?? "";
+            res.DbSchemaDiffs.Add(d);
+        }
+
+        private static void CompareTableIndexes(DbTableMetadata bm, DbTableMetadata am, TableComparisonItem item, AnalysisComparisonResult res,
+            ref bool hasIntrinsicTableChange, ref bool hasSchemaChange, ref bool hasInPlaceMutation)
+        {
+            Dictionary<string, DbIndexMetadata> bIdx = new Dictionary<string, DbIndexMetadata>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, DbIndexMetadata> aIdx = new Dictionary<string, DbIndexMetadata>(StringComparer.OrdinalIgnoreCase);
+            foreach (DbIndexMetadata im in bm.Indexes) bIdx[im.IndexName] = im;
+            foreach (DbIndexMetadata im in am.Indexes) aIdx[im.IndexName] = im;
+
+            HashSet<string> allNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in aIdx.Keys) allNames.Add(k);
+            foreach (string k in bIdx.Keys) allNames.Add(k);
+
+            foreach (string idxName in allNames)
+            {
+                DbIndexMetadata bi = null, ai = null;
+                bIdx.TryGetValue(idxName, out bi);
+                aIdx.TryGetValue(idxName, out ai);
+                if (bi == null && ai != null)
+                {
+                    hasIntrinsicTableChange = true; hasSchemaChange = true; hasInPlaceMutation = true;
+                    string def = string.Format("{0} ({1}) [{2}]", ai.Columns, ai.NonUnique ? "INDEX" : "UNIQUE", ai.IndexType);
+                    AddDiff(item, "-", "インデックス", "INDEX追加: " + ai.IndexName, "なし", def, "インデックス追加", "注意");
+                    AddDbSchemaDiff(res, item.TableName, "インデックス", ai.IndexName, "追加", "-", def, "注意", "テスト後にインデックス追加");
+                }
+                else if (bi != null && ai == null)
+                {
+                    hasIntrinsicTableChange = true; hasSchemaChange = true; hasInPlaceMutation = true;
+                    string def = string.Format("{0} ({1}) [{2}]", bi.Columns, bi.NonUnique ? "INDEX" : "UNIQUE", bi.IndexType);
+                    AddDiff(item, "-", "インデックス", "INDEX削除: " + bi.IndexName, def, "なし", "インデックス削除", "警告");
+                    AddDbSchemaDiff(res, item.TableName, "インデックス", bi.IndexName, "削除", def, "-", "警告", "テスト後にインデックス削除 (クエリ計画劣化注意)");
+                }
+                else if (bi != null && ai != null)
+                {
+                    if (!string.Equals(bi.Columns, ai.Columns, StringComparison.OrdinalIgnoreCase) || bi.NonUnique != ai.NonUnique)
+                    {
+                        hasIntrinsicTableChange = true; hasSchemaChange = true; hasInPlaceMutation = true;
+                        string bDef = string.Format("{0} ({1})", bi.Columns, bi.NonUnique ? "INDEX" : "UNIQUE");
+                        string aDef = string.Format("{0} ({1})", ai.Columns, ai.NonUnique ? "INDEX" : "UNIQUE");
+                        AddDiff(item, "-", "インデックス", "INDEX構成変更: " + ai.IndexName, bDef, aDef, "インデックス定義変更", "警告");
+                        AddDbSchemaDiff(res, item.TableName, "インデックス", ai.IndexName, "変更", bDef, aDef, "警告", "インデックス列構成変更");
+                    }
+                    else if (bi.Cardinality != ai.Cardinality && Math.Abs(ai.Cardinality - bi.Cardinality) >= Math.Max(10L, bi.Cardinality / 5))
+                    {
+                        AddDiff(item, "-", "インデックス", "INDEXカーディナリティ: " + ai.IndexName,
+                            bi.Cardinality.ToString("#,##0"), ai.Cardinality.ToString("#,##0"),
+                            FormatSignedInt(ai.Cardinality - bi.Cardinality), "通常");
+                    }
+                }
+            }
+        }
+
+        private static void CompareTableDeclaredFks(DbTableMetadata bm, DbTableMetadata am, TableComparisonItem item, AnalysisComparisonResult res,
+            ref bool hasIntrinsicTableChange, ref bool hasSchemaChange, ref bool hasInPlaceMutation)
+        {
+            Dictionary<string, DbForeignKeyMetadata> bFk = new Dictionary<string, DbForeignKeyMetadata>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, DbForeignKeyMetadata> aFk = new Dictionary<string, DbForeignKeyMetadata>(StringComparer.OrdinalIgnoreCase);
+            foreach (DbForeignKeyMetadata f in bm.DeclaredFks) bFk[f.ConstraintName + ":" + f.ColumnName] = f;
+            foreach (DbForeignKeyMetadata f in am.DeclaredFks) aFk[f.ConstraintName + ":" + f.ColumnName] = f;
+
+            HashSet<string> allKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in aFk.Keys) allKeys.Add(k);
+            foreach (string k in bFk.Keys) allKeys.Add(k);
+
+            foreach (string fkKey in allKeys)
+            {
+                DbForeignKeyMetadata bf = null, af = null;
+                bFk.TryGetValue(fkKey, out bf);
+                aFk.TryGetValue(fkKey, out af);
+                if (bf == null && af != null)
+                {
+                    hasIntrinsicTableChange = true; hasSchemaChange = true; hasInPlaceMutation = true;
+                    string def = string.Format("{0} → {1}.{2}", af.ColumnName, af.ReferencedTableName, af.ReferencedColumnName);
+                    AddDiff(item, af.ColumnName, "外部キー", "FK制約追加: " + af.ConstraintName, "なし", def, "外部キー追加", "注意");
+                    AddDbSchemaDiff(res, item.TableName, "外部キー制約", af.ConstraintName, "追加", "-", def, "注意", "外部キー制約追加");
+                }
+                else if (bf != null && af == null)
+                {
+                    hasIntrinsicTableChange = true; hasSchemaChange = true; hasInPlaceMutation = true;
+                    string def = string.Format("{0} → {1}.{2}", bf.ColumnName, bf.ReferencedTableName, bf.ReferencedColumnName);
+                    AddDiff(item, bf.ColumnName, "外部キー", "FK制約削除: " + bf.ConstraintName, def, "なし", "外部キー削除", "警告");
+                    AddDbSchemaDiff(res, item.TableName, "外部キー制約", bf.ConstraintName, "削除", def, "-", "警告", "外部キー制約削除");
+                }
+            }
+        }
+
+        private static int SeverityRank(string sev)
+        {
+            if (sev == "高") return 3;
+            if (sev == "中") return 2;
+            if (sev == "低") return 1;
+            return 0;
+        }
+
+        private static void CompareWarnings(AnalysisWorkbookSnapshot before, AnalysisWorkbookSnapshot after, AnalysisComparisonResult res)
+        {
+            if (before.Warnings.Count == 0 && after.Warnings.Count == 0) return;
+            if (before.HasEmbeddedSnapshot != after.HasEmbeddedSnapshot && (before.Warnings.Count == 0 || after.Warnings.Count == 0)) return;
+
+            Dictionary<string, SnapshotWarning> bMap = new Dictionary<string, SnapshotWarning>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, SnapshotWarning> aMap = new Dictionary<string, SnapshotWarning>(StringComparer.OrdinalIgnoreCase);
+            foreach (SnapshotWarning w in before.Warnings) bMap[w.Category + "|" + w.TableName + "|" + w.ColumnName] = w;
+            foreach (SnapshotWarning w in after.Warnings) aMap[w.Category + "|" + w.TableName + "|" + w.ColumnName] = w;
+
+            HashSet<string> keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in aMap.Keys) keys.Add(k);
+            foreach (string k in bMap.Keys) keys.Add(k);
+
+            foreach (string k in keys)
+            {
+                SnapshotWarning bw = null, aw = null;
+                bMap.TryGetValue(k, out bw);
+                aMap.TryGetValue(k, out aw);
+
+                WarningComparisonItem wi = new WarningComparisonItem();
+                if (bw == null && aw != null)
+                {
+                    wi.Status = "新規発生";
+                    wi.Severity = aw.Severity;
+                    wi.Category = aw.Category;
+                    wi.TableName = aw.TableName;
+                    wi.ColumnName = aw.ColumnName;
+                    wi.BeforeMetric = "なし";
+                    wi.AfterMetric = aw.MetricValue;
+                    wi.PerfImpact = aw.PerfImpact;
+                    wi.Recommendation = aw.Recommendation;
+                    wi.IsAlert = true;
+                    res.NewWarningCount++;
+                }
+                else if (bw != null && aw == null)
+                {
+                    wi.Status = "解消";
+                    wi.Severity = bw.Severity;
+                    wi.Category = bw.Category;
+                    wi.TableName = bw.TableName;
+                    wi.ColumnName = bw.ColumnName;
+                    wi.BeforeMetric = bw.MetricValue;
+                    wi.AfterMetric = "解消";
+                    wi.PerfImpact = bw.PerfImpact;
+                    wi.Recommendation = "テスト後に解消済み";
+                    res.ResolvedWarningCount++;
+                }
+                else
+                {
+                    int bRank = SeverityRank(bw.Severity);
+                    int aRank = SeverityRank(aw.Severity);
+                    wi.Severity = aw.Severity;
+                    wi.Category = aw.Category;
+                    wi.TableName = aw.TableName;
+                    wi.ColumnName = aw.ColumnName;
+                    wi.BeforeMetric = bw.MetricValue;
+                    wi.AfterMetric = aw.MetricValue;
+                    wi.PerfImpact = aw.PerfImpact;
+                    wi.Recommendation = aw.Recommendation;
+                    if (aRank > bRank)
+                    {
+                        wi.Status = "悪化";
+                        wi.IsAlert = true;
+                        res.WorsenedWarningCount++;
+                    }
+                    else if (aRank < bRank)
+                    {
+                        wi.Status = "改善";
+                        res.OngoingWarningCount++;
+                    }
+                    else if (!string.Equals(bw.MetricValue, aw.MetricValue, StringComparison.Ordinal))
+                    {
+                        wi.Status = "継続 (指標変化)";
+                        wi.IsAlert = (aw.Severity == "高");
+                        res.OngoingWarningCount++;
+                    }
+                    else
+                    {
+                        wi.Status = "継続";
+                        res.OngoingWarningCount++;
+                    }
+                }
+                res.WarningComparisons.Add(wi);
+            }
+
+            res.WarningComparisons = res.WarningComparisons
+                .OrderBy(w => w.Status == "新規発生" ? 0 : (w.Status == "悪化" ? 1 : (w.Status.StartsWith("継続") ? 2 : (w.Status == "改善" ? 3 : 4))))
+                .ThenByDescending(w => SeverityRank(w.Severity))
+                .ThenBy(w => w.TableName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static void CompareRelationships(AnalysisWorkbookSnapshot before, AnalysisWorkbookSnapshot after, AnalysisComparisonResult res)
+        {
+            if (before.Relationships.Count == 0 && after.Relationships.Count == 0) return;
+            if (before.HasEmbeddedSnapshot != after.HasEmbeddedSnapshot && (before.Relationships.Count == 0 || after.Relationships.Count == 0)) return;
+
+            Dictionary<string, SnapshotRelationship> bMap = new Dictionary<string, SnapshotRelationship>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, SnapshotRelationship> aMap = new Dictionary<string, SnapshotRelationship>(StringComparer.OrdinalIgnoreCase);
+            foreach (SnapshotRelationship r in before.Relationships)
+            {
+                string rk = r.ParentTable + "." + r.ParentColumn + " → " + r.ChildTable + "." + r.ChildColumn;
+                bMap[rk] = r;
+                res.BeforeTotalOrphanRows += r.OrphanRows;
+            }
+            foreach (SnapshotRelationship r in after.Relationships)
+            {
+                string rk = r.ParentTable + "." + r.ParentColumn + " → " + r.ChildTable + "." + r.ChildColumn;
+                aMap[rk] = r;
+                res.AfterTotalOrphanRows += r.OrphanRows;
+            }
+            res.OrphanRowDelta = res.AfterTotalOrphanRows - res.BeforeTotalOrphanRows;
+
+            HashSet<string> keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in aMap.Keys) keys.Add(k);
+            foreach (string k in bMap.Keys) keys.Add(k);
+
+            foreach (string rk in keys)
+            {
+                SnapshotRelationship br = null, ar = null;
+                bMap.TryGetValue(rk, out br);
+                aMap.TryGetValue(rk, out ar);
+
+                RelationshipComparisonItem item = new RelationshipComparisonItem();
+                item.RelationKey = rk;
+                if (br == null && ar != null)
+                {
+                    item.Status = ar.OrphanRows > 0 ? "悪化（要注意）" : "新規検出";
+                    item.ParentTable = ar.ParentTable; item.ParentColumn = ar.ParentColumn;
+                    item.ChildTable = ar.ChildTable; item.ChildColumn = ar.ChildColumn;
+                    item.AfterMatchRate = ar.MatchRate; item.MatchRateDelta = ar.MatchRate;
+                    item.AfterOrphanRows = ar.OrphanRows; item.OrphanDelta = ar.OrphanRows;
+                    item.AfterFanOutAvg = ar.FanOutAvg; item.AfterFanOutP95 = ar.FanOutP95;
+                    item.AfterFanOutMax = ar.FanOutMax; item.FanOutMaxDelta = ar.FanOutMax;
+                    item.AfterRisk = ar.RiskLevel;
+                    item.Note = ar.Note;
+                    item.HasAlert = ar.OrphanRows > 0 || ar.RiskLevel.StartsWith("高リスク");
+                }
+                else if (br != null && ar == null)
+                {
+                    item.Status = "消失";
+                    item.ParentTable = br.ParentTable; item.ParentColumn = br.ParentColumn;
+                    item.ChildTable = br.ChildTable; item.ChildColumn = br.ChildColumn;
+                    item.BeforeMatchRate = br.MatchRate; item.MatchRateDelta = -br.MatchRate;
+                    item.BeforeOrphanRows = br.OrphanRows; item.OrphanDelta = -br.OrphanRows;
+                    item.BeforeFanOutAvg = br.FanOutAvg; item.BeforeFanOutP95 = br.FanOutP95;
+                    item.BeforeFanOutMax = br.FanOutMax; item.FanOutMaxDelta = -br.FanOutMax;
+                    item.BeforeRisk = br.RiskLevel;
+                    item.AfterRisk = "未検出";
+                    item.Note = "テスト開始後にFKリレーション未検出";
+                    item.HasAlert = true;
+                }
+                else
+                {
+                    item.ParentTable = ar.ParentTable; item.ParentColumn = ar.ParentColumn;
+                    item.ChildTable = ar.ChildTable; item.ChildColumn = ar.ChildColumn;
+                    item.BeforeMatchRate = br.MatchRate; item.AfterMatchRate = ar.MatchRate; item.MatchRateDelta = ar.MatchRate - br.MatchRate;
+                    item.BeforeOrphanRows = br.OrphanRows; item.AfterOrphanRows = ar.OrphanRows; item.OrphanDelta = ar.OrphanRows - br.OrphanRows;
+                    item.BeforeFanOutAvg = br.FanOutAvg; item.AfterFanOutAvg = ar.FanOutAvg;
+                    item.BeforeFanOutP95 = br.FanOutP95; item.AfterFanOutP95 = ar.FanOutP95;
+                    item.BeforeFanOutMax = br.FanOutMax; item.AfterFanOutMax = ar.FanOutMax; item.FanOutMaxDelta = ar.FanOutMax - br.FanOutMax;
+                    item.BeforeRisk = br.RiskLevel; item.AfterRisk = ar.RiskLevel;
+
+                    bool worsened = item.OrphanDelta > 0 ||
+                                    item.MatchRateDelta < -0.005 ||
+                                    (ar.RiskLevel.StartsWith("高リスク") && !br.RiskLevel.StartsWith("高リスク")) ||
+                                    (item.FanOutMaxDelta >= Math.Max(50L, br.FanOutMax));
+                    bool improved = item.OrphanDelta < 0 || (!ar.RiskLevel.StartsWith("高リスク") && br.RiskLevel.StartsWith("高リスク"));
+                    bool anyDiff = item.OrphanDelta != 0 || !NumbersNearlyEqual(br.MatchRate, ar.MatchRate, 1e-4) ||
+                                   item.FanOutMaxDelta != 0 || !NumbersNearlyEqual(br.FanOutAvg, ar.FanOutAvg, 0.05) ||
+                                   !string.Equals(br.RiskLevel, ar.RiskLevel, StringComparison.Ordinal);
+
+                    if (worsened)
+                    {
+                        item.Status = "悪化（要注意）";
+                        item.HasAlert = true;
+                    }
+                    else if (improved)
+                    {
+                        item.Status = "改善";
+                    }
+                    else if (anyDiff)
+                    {
+                        item.Status = "変化あり";
+                    }
+                    else
+                    {
+                        item.Status = "変化なし";
+                    }
+                    List<string> nParts = new List<string>();
+                    if (item.OrphanDelta > 0) nParts.Add(string.Format("孤立FK +{0:#,##0}件増加 (参照整合性破壊注意)", item.OrphanDelta));
+                    else if (item.OrphanDelta < 0) nParts.Add(string.Format("孤立FK {0:#,##0}件減少", item.OrphanDelta));
+                    if (item.FanOutMaxDelta != 0) nParts.Add(string.Format("最大ファンアウト {0:#,##0}→{1:#,##0} ({2})", br.FanOutMax, ar.FanOutMax, FormatSignedInt(item.FanOutMaxDelta)));
+                    if (!string.IsNullOrEmpty(ar.MaxFanOutKey) && ar.MaxFanOutKey != br.MaxFanOutKey) nParts.Add("最大親キー変化:" + ar.MaxFanOutKey);
+                    item.Note = nParts.Count > 0 ? string.Join(" / ", nParts.ToArray()) : (string.IsNullOrEmpty(ar.Note) ? "変化なし" : ar.Note);
+                }
+                res.RelationshipComparisons.Add(item);
+            }
+
+            res.RelationshipComparisons = res.RelationshipComparisons
+                .OrderBy(r => r.HasAlert ? 0 : (r.Status == "変化なし" ? 2 : 1))
+                .ThenByDescending(r => Math.Abs(r.OrphanDelta))
+                .ThenByDescending(r => Math.Abs(r.FanOutMaxDelta))
+                .ToList();
+        }
+
+        private static int JMeterSuitRank(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            if (s.StartsWith("最適")) return 3;
+            if (s.StartsWith("良好")) return 2;
+            return 1;
+        }
+
+        private static void CompareJMeterCandidates(AnalysisWorkbookSnapshot before, AnalysisWorkbookSnapshot after, AnalysisComparisonResult res)
+        {
+            if (before.JMeterCandidates.Count == 0 && after.JMeterCandidates.Count == 0) return;
+            if (before.HasEmbeddedSnapshot != after.HasEmbeddedSnapshot && (before.JMeterCandidates.Count == 0 || after.JMeterCandidates.Count == 0)) return;
+
+            Dictionary<string, SnapshotJMeterCandidate> bMap = new Dictionary<string, SnapshotJMeterCandidate>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, SnapshotJMeterCandidate> aMap = new Dictionary<string, SnapshotJMeterCandidate>(StringComparer.OrdinalIgnoreCase);
+            foreach (SnapshotJMeterCandidate j in before.JMeterCandidates) bMap[j.TableName + "." + j.KeyColumn] = j;
+            foreach (SnapshotJMeterCandidate j in after.JMeterCandidates) aMap[j.TableName + "." + j.KeyColumn] = j;
+
+            HashSet<string> keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string k in aMap.Keys) keys.Add(k);
+            foreach (string k in bMap.Keys) keys.Add(k);
+
+            foreach (string k in keys)
+            {
+                SnapshotJMeterCandidate bj = null, aj = null;
+                bMap.TryGetValue(k, out bj);
+                aMap.TryGetValue(k, out aj);
+
+                JMeterComparisonItem ji = new JMeterComparisonItem();
+                if (bj == null && aj != null)
+                {
+                    ji.Status = "新規候補";
+                    ji.TableName = aj.TableName; ji.KeyColumn = aj.KeyColumn; ji.DataType = aj.DataType;
+                    ji.AfterUnique = aj.UniqueCount; ji.UniqueDelta = aj.UniqueCount;
+                    ji.AfterSuitability = aj.Suitability; ji.RecommendedUsage = aj.RecommendedUsage;
+                }
+                else if (bj != null && aj == null)
+                {
+                    ji.Status = "消失";
+                    ji.TableName = bj.TableName; ji.KeyColumn = bj.KeyColumn; ji.DataType = bj.DataType;
+                    ji.BeforeUnique = bj.UniqueCount; ji.UniqueDelta = -bj.UniqueCount;
+                    ji.BeforeSuitability = bj.Suitability; ji.AfterSuitability = "候補外";
+                    ji.RecommendedUsage = "キー数減少またはテーブル消失により候補外";
+                    ji.HasAlert = true;
+                }
+                else
+                {
+                    ji.TableName = aj.TableName; ji.KeyColumn = aj.KeyColumn; ji.DataType = aj.DataType;
+                    ji.BeforeUnique = bj.UniqueCount; ji.AfterUnique = aj.UniqueCount; ji.UniqueDelta = aj.UniqueCount - bj.UniqueCount;
+                    ji.BeforeSuitability = bj.Suitability; ji.AfterSuitability = aj.Suitability;
+                    ji.RecommendedUsage = aj.RecommendedUsage;
+                    int bRank = JMeterSuitRank(bj.Suitability);
+                    int aRank = JMeterSuitRank(aj.Suitability);
+                    if (aRank < bRank) { ji.Status = "悪化（要注意）"; ji.HasAlert = true; }
+                    else if (aRank > bRank) { ji.Status = "改善"; }
+                    else if (ji.UniqueDelta > 0) { ji.Status = "キー増加"; }
+                    else if (ji.UniqueDelta < 0) { ji.Status = "キー減少"; ji.HasAlert = true; }
+                    else { ji.Status = "変化なし"; }
+                }
+                res.JMeterComparisons.Add(ji);
+            }
+
+            res.JMeterComparisons = res.JMeterComparisons
+                .OrderBy(j => j.HasAlert ? 0 : (j.Status == "変化なし" ? 2 : 1))
+                .ThenByDescending(j => Math.Abs(j.UniqueDelta))
+                .ThenBy(j => j.TableName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static void CompareTimeSeries(AnalysisWorkbookSnapshot before, AnalysisWorkbookSnapshot after, AnalysisComparisonResult res)
+        {
+            // Compare monthly, recent daily, and hourly activity across matching datetime columns that actually changed
+            foreach (SnapshotTable at in after.TableList)
+            {
+                SnapshotTable bt = null;
+                before.Tables.TryGetValue(at.TableName, out bt);
+                foreach (KeyValuePair<string, SnapshotDateTimeStats> kv in at.DateTimeStats)
+                {
+                    SnapshotDateTimeStats ad = kv.Value;
+                    if (!ad.HasTimeSeriesDist) continue;
+                    SnapshotDateTimeStats bd = null;
+                    if (bt != null) bt.DateTimeStats.TryGetValue(kv.Key, out bd);
+                    if (bd != null && !bd.HasTimeSeriesDist) continue;
+
+                    string tc = at.TableName + "." + kv.Key;
+
+                    // Monthly deltas
+                    HashSet<string> months = new HashSet<string>(StringComparer.Ordinal);
+                    if (bd != null) foreach (string m in bd.MonthlyCounts.Keys) months.Add(m);
+                    foreach (string m in ad.MonthlyCounts.Keys) months.Add(m);
+                    foreach (string m in months.OrderBy(x => x, StringComparer.Ordinal))
+                    {
+                        long bc = (bd != null && bd.MonthlyCounts.ContainsKey(m)) ? bd.MonthlyCounts[m] : 0L;
+                        long ac = ad.MonthlyCounts.ContainsKey(m) ? ad.MonthlyCounts[m] : 0L;
+                        if (bc != ac)
+                        {
+                            res.TimeSeriesDeltas.Add(MakeTsDelta("月別", tc, m, bc, ac));
+                        }
+                    }
+
+                    // Recent Daily deltas
+                    HashSet<string> days = new HashSet<string>(StringComparer.Ordinal);
+                    if (bd != null) foreach (string d in bd.RecentDailyCounts.Keys) days.Add(d);
+                    foreach (string d in ad.RecentDailyCounts.Keys) days.Add(d);
+                    foreach (string d in days.OrderBy(x => x, StringComparer.Ordinal))
+                    {
+                        long bc = (bd != null && bd.RecentDailyCounts.ContainsKey(d)) ? bd.RecentDailyCounts[d] : 0L;
+                        long ac = ad.RecentDailyCounts.ContainsKey(d) ? ad.RecentDailyCounts[d] : 0L;
+                        if (bc != ac)
+                        {
+                            res.TimeSeriesDeltas.Add(MakeTsDelta("日別", tc, d, bc, ac));
+                        }
+                    }
+
+                    // Hourly deltas (00:00..23:00)
+                    if (ad.HasTimeComponent)
+                    {
+                        for (int h = 0; h < 24; h++)
+                        {
+                            long bc = (bd != null && bd.HourlyCounts != null && bd.HourlyCounts.Length == 24) ? bd.HourlyCounts[h] : 0L;
+                            long ac = (ad.HourlyCounts != null && ad.HourlyCounts.Length == 24) ? ad.HourlyCounts[h] : 0L;
+                            if (bc != ac)
+                            {
+                                res.TimeSeriesDeltas.Add(MakeTsDelta("時間帯別", tc, string.Format(CultureInfo.InvariantCulture, "{0:00}:00台", h), bc, ac));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Cap excessive time-series rows cleanly while preserving top deltas
+            if (res.TimeSeriesDeltas.Count > 250)
+            {
+                res.TimeSeriesDeltas = res.TimeSeriesDeltas
+                    .OrderByDescending(x => Math.Abs(x.DeltaCount))
+                    .Take(250)
+                    .OrderBy(x => x.Granularity, StringComparer.Ordinal)
+                    .ThenBy(x => x.TableColumn, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(x => x.PeriodLabel, StringComparer.Ordinal)
+                    .ToList();
+            }
+        }
+
+        private static TimeSeriesDeltaItem MakeTsDelta(string gran, string tc, string period, long bc, long ac)
+        {
+            TimeSeriesDeltaItem ti = new TimeSeriesDeltaItem();
+            ti.Granularity = gran;
+            ti.TableColumn = tc;
+            ti.PeriodLabel = period;
+            ti.BeforeCount = bc;
+            ti.AfterCount = ac;
+            ti.DeltaCount = ac - bc;
+            if (bc > 0)
+            {
+                ti.HasGrowthRate = true;
+                ti.GrowthRate = (double)ti.DeltaCount / bc;
+            }
+            return ti;
+        }
+
+        private static void CompareServerMetrics(AnalysisWorkbookSnapshot before, AnalysisWorkbookSnapshot after, AnalysisComparisonResult res)
+        {
+            if (before.DbServer == null || !before.DbServer.HasStatus || after.DbServer == null || !after.DbServer.HasStatus) return;
+            res.HasDbServerStatus = true;
+
+            Dictionary<string, long> bs = before.DbServer.StatusCounters;
+            Dictionary<string, long> as_ = after.DbServer.StatusCounters;
+
+            long bUp = 0, aUp = 0;
+            bool hasUp = bs.TryGetValue("Uptime", out bUp) && as_.TryGetValue("Uptime", out aUp);
+            long upDelta = hasUp ? (aUp - bUp) : 0L;
+            if (hasUp && upDelta < 0)
+            {
+                res.DbRestartDetected = true;
+            }
+            else if (hasUp && upDelta > 0)
+            {
+                res.ServerUptimeDeltaSeconds = upDelta;
+            }
+            double denomSec = (upDelta > 0) ? (double)upDelta : (res.HasElapsedTime && res.ElapsedSeconds > 0 ? res.ElapsedSeconds : 0.0);
+
+            // Helper local logic via static method
+            AddSrvCounter(res, bs, as_, "稼働・スループット", "サーバー稼働時間 (Uptime)", "Uptime", "秒", denomSec, false, res.DbRestartDetected ? "警告" : "通常",
+                res.DbRestartDetected ? "テスト期間中にDB再起動/フェイルオーバー発生の可能性あり！" : "テスト前後間のDB稼働時間増分");
+            AddSrvCounter(res, bs, as_, "稼働・スループット", "総クエリ数 (Questions)", "Questions", "回", denomSec, true, "通常", "テスト期間中の総実行クエリ数・平均QPS");
+            AddSrvCounter(res, bs, as_, "SQL種別", "SELECT実行数 (Com_select)", "Com_select", "回", denomSec, true, "通常", "読取クエリ実行数 (開始前スキャン分含む)");
+            AddSrvCounter(res, bs, as_, "SQL種別", "INSERT実行数 (Com_insert)", "Com_insert", "回", denomSec, true, "通常", "新規挿入クエリ数");
+            AddSrvCounter(res, bs, as_, "SQL種別", "UPDATE実行数 (Com_update)", "Com_update", "回", denomSec, true, "通常", "既存更新クエリ数");
+            AddSrvCounter(res, bs, as_, "SQL種別", "DELETE実行数 (Com_delete)", "Com_delete", "回", denomSec, true, "通常", "削除クエリ数");
+            AddSrvCounter(res, bs, as_, "SQL種別", "COMMIT実行数 (Com_commit)", "Com_commit", "回", denomSec, true, "通常", "コミット回数");
+            AddSrvCounter(res, bs, as_, "SQL種別", "ROLLBACK実行数 (Com_rollback)", "Com_rollback", "回", denomSec, true, "AUTO_WARN_POS", "ロールバック発生回数 (エラー/デッドロック/リトライ指標)");
+            AddSrvCounter(res, bs, as_, "クエリ効率", "スロークエリ数 (Slow_queries)", "Slow_queries", "件", denomSec, true, "AUTO_ALERT_POS", "スロークエリ発生件数 (性能ボトルネック指標)");
+            AddSrvCounter(res, bs, as_, "InnoDB行操作", "InnoDB読取行数 (Innodb_rows_read)", "Innodb_rows_read", "行", denomSec, true, "通常", "InnoDBエンジン層での総読取行数");
+            AddSrvCounter(res, bs, as_, "InnoDB行操作", "InnoDB挿入行数 (Innodb_rows_inserted)", "Innodb_rows_inserted", "行", denomSec, true, "通常", "InnoDB層での総挿入行数");
+            AddSrvCounter(res, bs, as_, "InnoDB行操作", "InnoDB更新行数 (Innodb_rows_updated)", "Innodb_rows_updated", "行", denomSec, true, "通常", "InnoDB層での総更新行数");
+            AddSrvCounter(res, bs, as_, "InnoDB行操作", "InnoDB削除行数 (Innodb_rows_deleted)", "Innodb_rows_deleted", "行", denomSec, true, "通常", "InnoDB層での総削除行数");
+            AddSrvCounter(res, bs, as_, "ロック競合", "行ロック待機回数 (Innodb_row_lock_waits)", "Innodb_row_lock_waits", "回", denomSec, true, "AUTO_ALERT_POS", "同時更新による行ロック競合の発生回数");
+            AddSrvCounter(res, bs, as_, "ロック競合", "行ロック待機累計時間 (Innodb_row_lock_time)", "Innodb_row_lock_time", "ms", denomSec, false, "AUTO_WARN_POS", "行ロック待機の合計時間(ms)");
+            AddSrvCounter(res, bs, as_, "Buffer Pool / I/O", "Buffer Pool論理読込 (read_requests)", "Innodb_buffer_pool_read_requests", "回", denomSec, true, "通常", "メモリキャッシュ論理読込回数");
+            AddSrvCounter(res, bs, as_, "Buffer Pool / I/O", "Buffer Pool物理読込 (reads)", "Innodb_buffer_pool_reads", "回", denomSec, true, "AUTO_WARN_POS", "ディスク/ストレージ層への物理読込回数");
+            AddSrvCounter(res, bs, as_, "Buffer Pool / I/O", "InnoDB Redoログ書込量 (os_log_written)", "Innodb_os_log_written", "B", denomSec, true, "通常", "書込トランザクションによるRedoログ発生量");
+            AddSrvCounter(res, bs, as_, "クエリ効率", "ディスク一時テーブル (Created_tmp_disk_tables)", "Created_tmp_disk_tables", "回", denomSec, true, "AUTO_WARN_POS", "メモリ超過によるディスク一時テーブル作成回数");
+            AddSrvCounter(res, bs, as_, "クエリ効率", "INDEX未使用結合 (Select_full_join)", "Select_full_join", "回", denomSec, true, "AUTO_ALERT_POS", "インデックスを使用しないフルテーブルJOIN回数");
+            AddSrvCounter(res, bs, as_, "クエリ効率", "ソートマージ発生 (Sort_merge_passes)", "Sort_merge_passes", "回", denomSec, true, "AUTO_WARN_POS", "sort_buffer_size超過によるソートマージ回数");
+            AddSrvCounter(res, bs, as_, "接続・ネットワーク", "最大同時接続数 (Max_used_connections)", "Max_used_connections", "接続", 0.0, false, "通常", "サーバー起動来の最大同時接続ピーク値");
+            AddSrvCounter(res, bs, as_, "接続・ネットワーク", "異常切断クライアント (Aborted_clients)", "Aborted_clients", "回", denomSec, false, "AUTO_WARN_POS", "クライアント異常切断回数");
+            AddSrvCounter(res, bs, as_, "接続・ネットワーク", "受信バイト数 (Bytes_received)", "Bytes_received", "B", denomSec, true, "通常", "DBサーバー受信トラフィック");
+            AddSrvCounter(res, bs, as_, "接続・ネットワーク", "送信バイト数 (Bytes_sent)", "Bytes_sent", "B", denomSec, true, "通常", "DBサーバー送信トラフィック");
+
+            // Derived metric: Buffer Pool Hit Ratio during test window
+            long bReq, aReq, bPh, aPh;
+            if (!res.DbRestartDetected &&
+                bs.TryGetValue("Innodb_buffer_pool_read_requests", out bReq) && as_.TryGetValue("Innodb_buffer_pool_read_requests", out aReq) &&
+                bs.TryGetValue("Innodb_buffer_pool_reads", out bPh) && as_.TryGetValue("Innodb_buffer_pool_reads", out aPh))
+            {
+                long dReq = aReq - bReq;
+                long dPh = aPh - bPh;
+                if (dReq > 0)
+                {
+                    double hitRate = Math.Max(0.0, Math.Min(1.0, 1.0 - ((double)dPh / (double)dReq)));
+                    ServerMetricComparisonItem hr = new ServerMetricComparisonItem();
+                    hr.Category = "Buffer Pool / I/O";
+                    hr.MetricName = "テスト期間 Buffer Poolヒット率 (算出)";
+                    hr.Unit = "%";
+                    hr.DisplayBefore = "-";
+                    hr.DisplayAfter = (hitRate * 100.0).ToString("0.00", CultureInfo.InvariantCulture) + "%";
+                    hr.DisplayDelta = string.Format("物理読込 {0:#,##0} / 論理 {1:#,##0}", dPh, dReq);
+                    hr.RatePerSecDisplay = "-";
+                    hr.Severity = hitRate < 0.99 ? "警告" : (hitRate < 0.995 ? "注意" : "通常");
+                    hr.Note = hitRate < 0.99 ? "ヒット率99%未満: ACU/Buffer Pool不足またはフルスキャン発生の可能性" : "良好なBuffer Poolキャッシュ効率";
+                    res.ServerMetricComparisons.Add(hr);
+                }
+            }
+        }
+
+        private static void AddSrvCounter(AnalysisComparisonResult res, Dictionary<string, long> bs, Dictionary<string, long> as_,
+            string cat, string name, string key, string unit, double denomSec, bool showRate, string sevMode, string note)
+        {
+            long bv, av;
+            if (!bs.TryGetValue(key, out bv) || !as_.TryGetValue(key, out av)) return;
+            long dv = av - bv;
+            ServerMetricComparisonItem item = new ServerMetricComparisonItem();
+            item.Category = cat;
+            item.MetricName = name;
+            item.Unit = unit;
+            item.BeforeValue = bv;
+            item.AfterValue = av;
+            item.DeltaValue = dv;
+            item.DisplayBefore = bv.ToString("#,##0", CultureInfo.InvariantCulture) + " " + unit;
+            item.DisplayAfter = av.ToString("#,##0", CultureInfo.InvariantCulture) + " " + unit;
+            item.DisplayDelta = FormatSignedInt(dv) + " " + unit;
+            if (showRate && denomSec > 0.0 && dv >= 0 && !res.DbRestartDetected)
+            {
+                item.RatePerSecDisplay = (dv / denomSec).ToString("#,##0.00", CultureInfo.InvariantCulture) + " " + unit + "/秒";
+            }
+            if (sevMode == "AUTO_ALERT_POS") item.Severity = dv > 0 ? "警告" : "通常";
+            else if (sevMode == "AUTO_WARN_POS") item.Severity = dv > 0 ? "注意" : "通常";
+            else item.Severity = sevMode;
+            item.Note = note;
+            res.ServerMetricComparisons.Add(item);
         }
 
         private static void BuildComparisonInsights(AnalysisComparisonResult res)
@@ -5091,28 +8717,68 @@ namespace AuroraAnalyzer
             {
                 res.Insights.Add("【同一ファイル比較】テスト開始前・開始後に同一パスが指定されたため、全テーブルが「変更なし」と判定されています。");
             }
+            if (res.ClockReversed)
+            {
+                res.Insights.Add(string.Format(
+                    "【要注意：分析日時の逆転】開始前ファイル ({0}) より開始後ファイル ({1}) の方が古い日時です。比較対象の指定順序が逆になっていないか確認してください。",
+                    res.BeforeAnalyzedAt, res.AfterAnalyzedAt));
+            }
+            if (res.DbRestartDetected)
+            {
+                res.Insights.Add("【要注意：DBサーバー再起動/フェイルオーバー検出】MySQLのUptimeが開始前より減少しています。テスト期間中にAuroraライター再起動またはフェイルオーバーが発生した可能性があります。");
+            }
+
+            string elapsedNote = res.HasElapsedTime
+                ? string.Format(" / 計測間隔 {0} (平均増減 {1} 件/分, InnoDB {2} KB/分)",
+                    res.ElapsedDisplay, FormatSignedDouble(res.TotalRowsPerMinute, "0.0"), FormatSignedDouble(res.TotalInnoDbKBPerMinute, "0.0"))
+                : "";
+            res.Insights.Add(string.Format(
+                "【比較方式・照合精度】{0}{1}。全 {2} テーブル（変更あり {3} / 変更なし {4}）・全 {5} カラム（変更あり {6} / 変更なし {7}）を照合しました。",
+                res.PrecisionLabel, elapsedNote,
+                res.TotalUniqueTableCount, res.ChangedTableCount, res.UnchangedTableCount,
+                res.TotalUniqueColumnCount, res.ChangedColumnTotal, res.UnchangedColumnTotal));
 
             string growthTxt = res.HasTotalRowGrowthRate
                 ? string.Format(" ({0})", FormatSignedPercent(res.TotalRowGrowthRate))
                 : "";
+            string physTxt = res.HasDbPhysicalMeta
+                ? string.Format("、実InnoDB Data {0} KB / Index {1} KB (断片化空き {2} KB)",
+                    FormatSignedDouble(res.TotalDataLengthDeltaKB, "0.0"), FormatSignedDouble(res.TotalIndexLengthDeltaKB, "0.0"), FormatSignedDouble(res.TotalDataFreeDeltaKB, "0.0"))
+                : "";
+            string acuTxt = res.HasAcuComparison
+                ? string.Format("、推定最低ACU {0:0.0}→{1:0.0} ACU (10倍時 {2:0.0}→{3:0.0} ACU)",
+                    res.BeforeEstMinAcuCurrent, res.AfterEstMinAcuCurrent, res.BeforeEstMinAcu10x, res.AfterEstMinAcu10x)
+                : "";
             res.Insights.Add(string.Format(
-                "【全体サマリー】比較対象 {0} テーブル（開始前 {1} → 開始後 {2}）。総レコード数 {3:#,##0} → {4:#,##0} 件（増減 {5} 件{6}）、推定InnoDB容量 {7:#,##0.0} → {8:#,##0.0} KB（増減 {9} KB）。",
+                "【全体規模・容量推移】比較対象 {0} テーブル（開始前 {1} → 開始後 {2}）。総レコード数 {3:#,##0} → {4:#,##0} 件（増減 {5} 件{6}）、推定InnoDB容量 {7:#,##0.0} → {8:#,##0.0} KB（増減 {9} KB）{10}{11}。",
                 res.TotalUniqueTableCount, res.BeforeTableCount, res.AfterTableCount,
                 res.BeforeTotalRows, res.AfterTotalRows, FormatSignedInt(res.TotalRowDelta), growthTxt,
-                res.BeforeTotalInnoDbKB, res.AfterTotalInnoDbKB, FormatSignedDouble(res.TotalInnoDbDeltaKB, "0.0")));
+                res.BeforeTotalInnoDbKB, res.AfterTotalInnoDbKB, FormatSignedDouble(res.TotalInnoDbDeltaKB, "0.0"),
+                physTxt, acuTxt));
 
             res.Insights.Add(string.Format(
-                "【変更内訳】追加あり {0} テーブル（新規テーブル {1} / レコード増加 {2} / 追加・更新併用 {3}）、更新あり {4} テーブル（データ更新 {5} / レコード減少 {6} / 追加・更新併用 {3}）、削除・消失 {7} テーブル、変更なし {8} テーブル。",
+                "【テーブル変更内訳】追加あり {0} テーブル（新規テーブル {1} / レコード増加 {2} / 追加・更新併用 {3}）、更新あり {4} テーブル（データ更新 {5} / レコード減少 {6} / 追加・更新併用 {3}）、削除・消失 {7} テーブル、変更なし {8} テーブル。",
                 res.AddedSheetCount, res.NewTableCount, res.RowAddedOnlyCount, res.AddedAndUpdatedCount,
                 res.UpdatedSheetCount, res.UpdatedOnlyCount, res.RowDecreasedCount,
                 res.DeletedTableCount, res.UnchangedTableCount));
 
+            if (res.HasAnyRowChurn)
+            {
+                res.Insights.Add(string.Format(
+                    "【行レベル変動内訳 ({0} / 対象 {1} テーブル)】挿入 +{2:#,##0} 行 / 既存更新 {3:#,##0} 行 / 削除 -{4:#,##0} 行 / 無変更 {5:#,##0} 行。純増減だけでは見えない同時INSERT+UPDATE+DELETEの実挙動を確認できます。",
+                    res.RowChurnAllExact ? "PK完全一致計測" : "PK計測＋Bottom-K推定", res.RowChurnCoveredTables,
+                    res.TotalInsertedRows, res.TotalUpdatedRows, res.TotalDeletedRows, res.TotalUnchangedRows));
+            }
+
             if (res.AddedTables.Count > 0)
             {
                 TableComparisonItem topAdd = res.AddedTables.OrderByDescending(t => t.RowDelta).First();
+                string aiNote = topAdd.HasAutoIncrement && topAdd.AutoIncrementGap > 0
+                    ? string.Format(" / AUTO_INCREMENTギャップ {0:#,##0}件 (ROLLBACK等)", topAdd.AutoIncrementGap)
+                    : "";
                 res.Insights.Add(string.Format(
-                    "【最大レコード増加テーブル】`{0}` が最大増加（{1} 件: {2:#,##0} → {3:#,##0} 件, InnoDB増減 {4} KB）。JMeter 性能試験の主要 INSERT 負荷先として、AUTO_INCREMENT / INDEX 肥大化および Buffer Pool 消費推移を確認してください。",
-                    topAdd.TableName, FormatSignedInt(topAdd.RowDelta), topAdd.BeforeRows, topAdd.AfterRows, FormatSignedDouble(topAdd.InnoDbDeltaKB, "0.0")));
+                    "【最大レコード増加テーブル】`{0}` が最大増加（{1} 件: {2:#,##0} → {3:#,##0} 件, InnoDB増減 {4} KB{5}）。JMeter 性能試験の主要 INSERT 負荷先として、AUTO_INCREMENT / INDEX 肥大化および Buffer Pool 消費推移を確認してください。",
+                    topAdd.TableName, FormatSignedInt(topAdd.RowDelta), topAdd.BeforeRows, topAdd.AfterRows, FormatSignedDouble(topAdd.InnoDbDeltaKB, "0.0"), aiNote));
             }
 
             List<TableComparisonItem> inPlaceUpdated = res.UpdatedTables.Where(t => t.PrimaryStatus == "更新（データ更新）" || t.PrimaryStatus == "追加・更新").ToList();
@@ -5127,19 +8793,73 @@ namespace AuroraAnalyzer
             if (res.DeletedTableCount > 0 || res.RowDecreasedCount > 0)
             {
                 res.Insights.Add(string.Format(
-                    "【要注意：削除・減少検出】テーブル消失 {0} 件、レコード減少 {1} 件が検出されました。テストシナリオ上の意図的な DELETE / パージ処理か、データ欠損・エクスポート漏れかを必ず確認してください。",
+                    "【要注意：削除・減少検出】テーブル消失 {0} 件、レコード減少 {1} 件が検出されました。テストシナリオ上の意図的な DELETE / パージ処理か、データ欠損・取得漏れかを必ず確認してください。",
                     res.DeletedTableCount, res.RowDecreasedCount));
+            }
+
+            if (res.NewWarningCount > 0 || res.WorsenedWarningCount > 0 || res.ResolvedWarningCount > 0)
+            {
+                string prefix = (res.NewWarningCount > 0 || res.WorsenedWarningCount > 0) ? "【要注意：性能リスク・警告の変化】" : "【性能リスク・警告の推移】";
+                res.Insights.Add(string.Format(
+                    "{0}テスト後に警告が 新規発生 {1} 件 / 悪化 {2} 件 / 解消 {3} 件 / 継続 {4} 件 です。詳細はシート「08_性能・DB・時系列・品質変化」を確認してください。",
+                    prefix, res.NewWarningCount, res.WorsenedWarningCount, res.ResolvedWarningCount, res.OngoingWarningCount));
+            }
+
+            if (res.OrphanRowDelta > 0)
+            {
+                res.Insights.Add(string.Format(
+                    "【要注意：参照整合性(孤立FK)悪化】テスト前後でFK孤立子レコードが +{0:#,##0} 行増加しました（{1:#,##0} → {2:#,##0} 行）。トランザクション境界や削除順序の不具合がないか確認してください。",
+                    res.OrphanRowDelta, res.BeforeTotalOrphanRows, res.AfterTotalOrphanRows));
+            }
+
+            if (res.DbSchemaDiffs.Count > 0)
+            {
+                res.Insights.Add(string.Format(
+                    "【要注意：DBスキーマ/DDL・インデックス変化】テスト前後でDDL/INDEX/FK定義の差分を {0} 件検出しました。テスト中のマイグレーションや意図しないスキーマ差異がないか確認してください。",
+                    res.DbSchemaDiffs.Count));
+            }
+
+            if (res.HasDbServerStatus)
+            {
+                ServerMetricComparisonItem q = res.ServerMetricComparisons.FirstOrDefault(x => x.MetricName.IndexOf("Questions", StringComparison.Ordinal) >= 0);
+                ServerMetricComparisonItem slow = res.ServerMetricComparisons.FirstOrDefault(x => x.MetricName.IndexOf("Slow_queries", StringComparison.Ordinal) >= 0);
+                ServerMetricComparisonItem lck = res.ServerMetricComparisons.FirstOrDefault(x => x.MetricName.IndexOf("Innodb_row_lock_waits", StringComparison.Ordinal) >= 0);
+                ServerMetricComparisonItem rb = res.ServerMetricComparisons.FirstOrDefault(x => x.MetricName.IndexOf("Com_rollback", StringComparison.Ordinal) >= 0);
+                List<string> sParts = new List<string>();
+                if (q != null) sParts.Add("クエリ " + q.DisplayDelta + (q.RatePerSecDisplay != "-" ? (" (" + q.RatePerSecDisplay + ")") : ""));
+                if (slow != null) sParts.Add("SlowQuery " + slow.DisplayDelta);
+                if (lck != null) sParts.Add("行ロック待機 " + lck.DisplayDelta);
+                if (rb != null) sParts.Add("ROLLBACK " + rb.DisplayDelta);
+                if (sParts.Count > 0)
+                {
+                    bool srvWarn = (slow != null && slow.DeltaValue > 0) || (lck != null && lck.DeltaValue > 0) || (rb != null && rb.DeltaValue > 0);
+                    res.Insights.Add((srvWarn ? "【要注意：Aurora/MySQLサーバー負荷差分】" : "【Aurora/MySQLサーバー負荷差分】") + string.Join(" / ", sParts.ToArray()) + "。");
+                }
+            }
+
+            if (res.TimeSeriesDeltas.Count > 0)
+            {
+                TimeSeriesDeltaItem topHr = res.TimeSeriesDeltas.Where(x => x.Granularity == "時間帯別" && x.DeltaCount > 0).OrderByDescending(x => x.DeltaCount).FirstOrDefault();
+                TimeSeriesDeltaItem topDay = res.TimeSeriesDeltas.Where(x => x.Granularity == "日別" && x.DeltaCount > 0).OrderByDescending(x => x.DeltaCount).FirstOrDefault();
+                List<string> tsParts = new List<string>();
+                if (topDay != null) tsParts.Add(string.Format("最大増加日 {0} ({1}: +{2:#,##0}件)", topDay.PeriodLabel, topDay.TableColumn, topDay.DeltaCount));
+                if (topHr != null) tsParts.Add(string.Format("最大増加時間帯 {0} ({1}: +{2:#,##0}件)", topHr.PeriodLabel, topHr.TableColumn, topHr.DeltaCount));
+                if (tsParts.Count > 0)
+                {
+                    res.Insights.Add("【時系列アクティビティ集中】" + string.Join(" / ", tsParts.ToArray()) + "。テスト実行時間帯のデータ偏りを確認できます。");
+                }
             }
 
             if (res.UnchangedTableCount > 0)
             {
+                string basis = res.UsedFullSnapshot ? "行・カラムの値マルチセットハッシュおよび全統計" : "分析ファイル内の統計プロファイル";
                 res.Insights.Add(string.Format(
-                    "【変更なしテーブル】{0} テーブルはテスト前後で統計・件数・分布に差分がなく、参照専用（マスタ系または未使用テーブル）と推定されます。テストシナリオで更新想定のテーブルが含まれていないかご確認ください。※本比較は分析ファイル内の統計プロファイル差分に基づきます。",
-                    res.UnchangedTableCount));
+                    "【変更なしテーブル・カラム】{0} テーブル（および全テーブル中 {1} カラム）はテスト前後で{2}が完全一致しており、参照専用（マスタ系または未更新領域）と判定されました。テストシナリオで更新想定の対象が含まれていないかご確認ください。",
+                    res.UnchangedTableCount, res.UnchangedColumnTotal, basis));
             }
         }
 
-        private static void AddDiff(TableComparisonItem item, string colName, string cat, string metric, string beforeVal, string afterVal, string delta, string sev)
+        private static ColumnDiffItem AddDiff(TableComparisonItem item, string colName, string cat, string metric, string beforeVal, string afterVal, string delta, string sev)
         {
             ColumnDiffItem d = new ColumnDiffItem();
             d.TableName = item.TableName;
@@ -5151,13 +8871,14 @@ namespace AuroraAnalyzer
             d.DeltaSummary = delta ?? "";
             d.Severity = sev ?? "通常";
             item.ColumnDiffs.Add(d);
+            return d;
         }
 
         private static bool NumbersNearlyEqual(double a, double b, double absTol)
         {
             double diff = Math.Abs(a - b);
             double relTol = 1e-9 * Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(b)));
-            return diff <= Math.Max(absTol, relTol);
+            return diff <= (absTol + relTol);
         }
 
         private static bool TryParseComparableDate(string s, out DateTime dt)
@@ -5543,9 +9264,25 @@ namespace AuroraAnalyzer
         {
             snap.Subtitle = subtitle.Trim();
             Match mAt = Regex.Match(subtitle, @"分析日時:\s*([^|]+)");
-            if (mAt.Success) snap.AnalyzedAtText = mAt.Groups[1].Value.Trim();
+            if (mAt.Success)
+            {
+                snap.AnalyzedAtText = mAt.Groups[1].Value.Trim();
+                DateTime parsedDt;
+                if (TryParseComparableDate(snap.AnalyzedAtText, out parsedDt)) snap.AnalyzedAt = parsedDt;
+            }
             Match mDir = Regex.Match(subtitle, @"(?:対象フォルダ|接続先DB):\s*([^|]+)");
             if (mDir.Success) snap.InputFolder = mDir.Groups[1].Value.Trim();
+            if (subtitle.IndexOf("DB直接分析", StringComparison.Ordinal) >= 0)
+            {
+                snap.IsDirectDb = true;
+                snap.SourceMode = "DirectDB";
+            }
+            else if (string.IsNullOrEmpty(snap.SourceMode))
+            {
+                snap.SourceMode = "CSV";
+            }
+            Match mLbl = Regex.Match(subtitle, @"A5M2登録DB:\s*([^|]+)");
+            if (mLbl.Success) snap.DbLabel = mLbl.Groups[1].Value.Trim();
         }
 
         private static int FindHeaderRow(List<Dictionary<int, string>> rows, string col1Expected, string col2Expected, out Dictionary<string, int> colMap)
@@ -5637,12 +9374,16 @@ namespace AuroraAnalyzer
             int iCols = GetColIdx(map, "列数");
             int iSize = GetColIdx(map, "CSVサイズ(KB)", "CSV換算サイズ(KB)", "データサイズ(KB)");
             int iSizeShare = GetColIdx(map, "容量構成比");
+            int iMinLen = GetColIdx(map, "最小行長(B)");
             int iAvgLen = GetColIdx(map, "平均行長(B)");
             int iMaxLen = GetColIdx(map, "最大行長(B)");
             int iInno = GetColIdx(map, "推定InnoDB(KB)");
+            int iInnoPg = GetColIdx(map, "推定InnoDBページ数");
             int iNull = GetColIdx(map, "平均NULL率");
             int iPk = GetColIdx(map, "PK/UK候補");
             int iDt = GetColIdx(map, "日時カラム");
+            int iJm = GetColIdx(map, "JMeter並列適性");
+            int iWarnCnt = GetColIdx(map, "警告数");
             int iWarn = GetColIdx(map, "警告・注意点");
 
             for (int r = hdrIdx + 1; r < rows.Count; r++)
@@ -5663,12 +9404,16 @@ namespace AuroraAnalyzer
                 st.ColumnCount = (int)ParseLong(GetCell(row, iCols));
                 st.FileSizeKB = ParseDouble(GetCell(row, iSize));
                 st.SizeShare = ParseDouble(GetCell(row, iSizeShare));
+                if (iMinLen > 0) st.MinRowBytes = ParseLong(GetCell(row, iMinLen));
                 st.AvgRowBytes = ParseDouble(GetCell(row, iAvgLen));
                 st.MaxRowBytes = ParseLong(GetCell(row, iMaxLen));
                 st.EstInnoDbKB = ParseDouble(GetCell(row, iInno));
+                if (iInnoPg > 0) st.EstInnoDbPages = ParseLong(GetCell(row, iInnoPg));
                 st.AvgNullRate = ParseDouble(GetCell(row, iNull));
                 st.CandidatePks = NormalizeDash(GetCell(row, iPk));
                 st.DateColumns = NormalizeDash(GetCell(row, iDt));
+                if (iJm > 0) st.JMeterReadiness = GetCell(row, iJm).Trim();
+                if (iWarnCnt > 0) st.WarningCount = (int)ParseLong(GetCell(row, iWarnCnt));
                 string warnRaw = GetCell(row, iWarn).Trim();
                 st.WarningSummary = (warnRaw == "正常" || warnRaw == "-") ? "" : warnRaw;
 
@@ -5688,24 +9433,32 @@ namespace AuroraAnalyzer
 
             int iTbl = GetColIdx(map, "テーブル名");
             int iCol = GetColIdx(map, "カラム名");
+            int iOrd = GetColIdx(map, "列順");
             int iType = GetColIdx(map, "推定データ型");
+            int iRole = GetColIdx(map, "キー・役割");
             int iTot = GetColIdx(map, "総行数");
+            int iNn = GetColIdx(map, "有効件数");
             int iNull = GetColIdx(map, "NULL件数");
             int iNullR = GetColIdx(map, "NULL率");
             int iDist = GetColIdx(map, "ユニーク数");
             int iCard = GetColIdx(map, "ユニーク率");
             int iSel = GetColIdx(map, "INDEX選択性評価");
+            int iMinB = GetColIdx(map, "最小長(B)");
             int iAvgB = GetColIdx(map, "平均長(B)");
             int iP95B = GetColIdx(map, "P95長(B)");
             int iMaxB = GetColIdx(map, "最大長(B)");
             int iTop1 = GetColIdx(map, "最頻値(Top1)");
+            int iTop1C = GetColIdx(map, "Top1件数");
             int iTop1S = GetColIdx(map, "Top1占有率");
             int iTop3S = GetColIdx(map, "Top3占有率");
+            int iTop5S = GetColIdx(map, "Top5占有率");
             int iGini = GetColIdx(map, "ジニ係数");
+            int iEnt = GetColIdx(map, "正規化エントロピー");
             int iSkew = GetColIdx(map, "偏りリスク");
             int iMinVal = GetColIdx(map, "最小値 / 最古日時");
             int iMaxVal = GetColIdx(map, "最大値 / 最新日時");
             int iTopDist = GetColIdx(map, "上位値分布 (Top5)");
+            int iDetail = GetColIdx(map, "型別詳細統計 (数値・日時・文字特性)");
             int iAlert = GetColIdx(map, "警告・注意点");
 
             for (int r = hdrIdx + 1; r < rows.Count; r++)
@@ -5722,13 +9475,17 @@ namespace AuroraAnalyzer
                 SnapshotColumn sc = new SnapshotColumn();
                 sc.TableName = tblName;
                 sc.ColumnName = colName;
+                sc.ColumnIndex = iOrd > 0 ? Math.Max(0, (int)ParseLong(GetCell(row, iOrd)) - 1) : st.ColumnList.Count;
                 sc.InferredType = GetCell(row, iType).Trim();
+                if (iRole > 0) sc.KeyRole = GetCell(row, iRole).Trim();
                 sc.TotalRows = ParseLong(GetCell(row, iTot));
                 sc.NullCount = ParseLong(GetCell(row, iNull));
+                sc.NonNullCount = iNn > 0 ? ParseLong(GetCell(row, iNn)) : Math.Max(0L, sc.TotalRows - sc.NullCount);
                 sc.NullRate = ParseDouble(GetCell(row, iNullR));
                 sc.DistinctCount = ParseLong(GetCell(row, iDist));
                 sc.CardinalityRate = ParseDouble(GetCell(row, iCard));
                 sc.SelectivityRating = GetCell(row, iSel).Trim();
+                if (iMinB > 0) sc.MinByteLen = ParseLong(GetCell(row, iMinB));
                 sc.AvgByteLen = ParseDouble(GetCell(row, iAvgB));
                 sc.P95ByteLen = ParseLong(GetCell(row, iP95B));
                 sc.MaxByteLen = ParseLong(GetCell(row, iMaxB));
@@ -5742,9 +9499,12 @@ namespace AuroraAnalyzer
                     rawTop1 = NormalizeDateTop1(rawTop1, true);
                 }
                 sc.Top1Value = rawTop1;
+                if (iTop1C > 0) sc.Top1Count = ParseLong(GetCell(row, iTop1C));
                 sc.Top1Share = ParseDouble(GetCell(row, iTop1S));
                 sc.Top3Share = ParseDouble(GetCell(row, iTop3S));
+                if (iTop5S > 0) sc.Top5Share = ParseDouble(GetCell(row, iTop5S));
                 sc.GiniCoefficient = ParseDouble(GetCell(row, iGini));
+                if (iEnt > 0) { sc.NormalizedEntropy = ParseDouble(GetCell(row, iEnt)); sc.HasNormalizedEntropy = true; }
                 sc.SkewRisk = GetCell(row, iSkew).Trim();
                 if (iMinVal > 0)
                 {
@@ -5764,10 +9524,15 @@ namespace AuroraAnalyzer
                 {
                     ParseTopDistSummary(GetCell(row, iTopDist), sc.TopDistCounts);
                 }
+                if (iDetail > 0)
+                {
+                    sc.DetailStatsSummary = GetCell(row, iDetail).Trim();
+                }
                 string aRaw = GetCell(row, iAlert).Trim();
                 sc.AlertNote = (aRaw == "正常" || aRaw == "-") ? "" : aRaw;
 
                 st.Columns[sc.ColumnName] = sc;
+                st.ColumnList.Add(sc);
             }
         }
 
@@ -5904,6 +9669,91 @@ namespace AuroraAnalyzer
                 ds.PeakBurstRatio = ParseDouble(GetCell(row, iPkR));
 
                 st.DateTimeStats[colName] = ds;
+            }
+        }
+
+        private static void ParseRelationshipsSheet(AnalysisWorkbookSnapshot snap, List<Dictionary<int, string>> rows)
+        {
+            Dictionary<string, int> map;
+            int hdrIdx = FindHeaderRow(rows, "親テーブル.PK", "子テーブル.FK", out map);
+            if (hdrIdx < 0) return;
+
+            int iP = GetColIdx(map, "親テーブル.PK");
+            int iC = GetColIdx(map, "子テーブル.FK");
+            int iPd = GetColIdx(map, "親キー数");
+            int iCn = GetColIdx(map, "子有効行数");
+            int iMr = GetColIdx(map, "参照一致率");
+            int iOr = GetColIdx(map, "孤立行数");
+            int iFmin = GetColIdx(map, "最小(子/親)");
+            int iFavg = GetColIdx(map, "平均(子/親)");
+            int iFp50 = GetColIdx(map, "P50(子/親)");
+            int iFp95 = GetColIdx(map, "P95(子/親)");
+            int iFp99 = GetColIdx(map, "P99(子/親)");
+            int iFmax = GetColIdx(map, "最大(子/親)");
+            int iRisk = GetColIdx(map, "リスク評価");
+            int iNote = GetColIdx(map, "所見・スーパーユーザー情報");
+
+            for (int r = hdrIdx + 1; r < rows.Count; r++)
+            {
+                Dictionary<int, string> row = rows[r];
+                if (IsRowEmptyOrPlaceholder(row)) break;
+                string pStr = GetCell(row, iP).Trim();
+                string cStr = GetCell(row, iC).Trim();
+                if (string.IsNullOrEmpty(pStr) || string.IsNullOrEmpty(cStr)) break;
+
+                string[] pp = pStr.Split('.');
+                string[] cp = cStr.Split('.');
+                if (pp.Length < 2 || cp.Length < 2) continue;
+                SnapshotRelationship sr = new SnapshotRelationship();
+                sr.ParentTable = pp[0]; sr.ParentColumn = pp[1];
+                sr.ChildTable = cp[0]; sr.ChildColumn = cp[1];
+                sr.ParentDistinctCount = ParseLong(GetCell(row, iPd));
+                sr.ChildNonNullRows = ParseLong(GetCell(row, iCn));
+                sr.MatchRate = ParseDouble(GetCell(row, iMr));
+                sr.OrphanRows = ParseLong(GetCell(row, iOr));
+                sr.FanOutMin = ParseLong(GetCell(row, iFmin));
+                sr.FanOutAvg = ParseDouble(GetCell(row, iFavg));
+                sr.FanOutP50 = ParseDouble(GetCell(row, iFp50));
+                sr.FanOutP95 = ParseDouble(GetCell(row, iFp95));
+                sr.FanOutP99 = ParseDouble(GetCell(row, iFp99));
+                sr.FanOutMax = ParseLong(GetCell(row, iFmax));
+                sr.RiskLevel = GetCell(row, iRisk).Trim();
+                sr.Note = GetCell(row, iNote).Trim();
+                snap.Relationships.Add(sr);
+            }
+        }
+
+        private static void ParseWarningsSheet(AnalysisWorkbookSnapshot snap, List<Dictionary<int, string>> rows)
+        {
+            Dictionary<string, int> map;
+            int hdrIdx = FindHeaderRow(rows, "重要度", "カテゴリ", out map);
+            if (hdrIdx < 0) return;
+
+            int iSev = GetColIdx(map, "重要度");
+            int iCat = GetColIdx(map, "カテゴリ");
+            int iTbl = GetColIdx(map, "テーブル名");
+            int iCol = GetColIdx(map, "カラム名");
+            int iMet = GetColIdx(map, "検出値・指標");
+            int iImp = GetColIdx(map, "Aurora / 性能試験への影響");
+            int iRec = GetColIdx(map, "推奨アクション");
+
+            for (int r = hdrIdx + 1; r < rows.Count; r++)
+            {
+                Dictionary<int, string> row = rows[r];
+                if (IsRowEmptyOrPlaceholder(row)) break;
+                string sev = GetCell(row, iSev).Trim();
+                string cat = GetCell(row, iCat).Trim();
+                if (string.IsNullOrEmpty(sev) || string.IsNullOrEmpty(cat)) break;
+
+                SnapshotWarning sw = new SnapshotWarning();
+                sw.Severity = sev;
+                sw.Category = cat;
+                sw.TableName = GetCell(row, iTbl).Trim();
+                sw.ColumnName = GetCell(row, iCol).Trim();
+                sw.MetricValue = GetCell(row, iMet).Trim();
+                sw.PerfImpact = GetCell(row, iImp).Trim();
+                sw.Recommendation = GetCell(row, iRec).Trim();
+                snap.Warnings.Add(sw);
             }
         }
     }
@@ -6947,6 +10797,212 @@ function Invoke-AuroraBulkCsvExport {
     }
 }
 
+function Get-AuroraDirectDbMetadata {
+    param(
+        [Parameter(Mandatory = $true)]$Client,
+        [AuroraAnalyzer.OperationCancelState]$CancelState = $null,
+        [scriptblock]$LogCallback = $null,
+        [scriptblock]$PumpCallback = $null
+    )
+
+    $srvMeta = New-Object AuroraAnalyzer.DbServerMetadata
+    $tblMetaMap = New-Object 'System.Collections.Generic.Dictionary[string, AuroraAnalyzer.DbTableMetadata]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $colMetaMap = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.Dictionary[string, AuroraAnalyzer.DbColumnMetadata]]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    function Invoke-OptionalMetaQuery([string]$Sql) {
+        if ($null -ne $CancelState) { $CancelState.ThrowIfCancelled() }
+        try {
+            $qh = [AuroraAnalyzer.BackgroundTaskLauncher]::StartExecuteQuery($Client, $Sql, $CancelState)
+            return (Wait-BackgroundTask -Handle $qh -PumpCallback $PumpCallback -CancelState $CancelState)
+        }
+        catch [System.OperationCanceledException] { throw }
+        catch { return $null }
+    }
+
+    function Get-ColIndexMap($QueryResult) {
+        $m = @{}
+        if ($null -eq $QueryResult -or $null -eq $QueryResult.Columns) { return $m }
+        for ($i = 0; $i -lt $QueryResult.Columns.Count; $i++) {
+            $cn = $QueryResult.Columns[$i].Name
+            if (-not [string]::IsNullOrEmpty($cn)) { $m[$cn.ToUpperInvariant()] = $i }
+        }
+        return $m
+    }
+
+    function Get-RowStr([string[]]$Row, $Map, [string]$Col) {
+        $k = $Col.ToUpperInvariant()
+        if (-not $Map.ContainsKey($k)) { return '' }
+        $idx = [int]$Map[$k]
+        if ($idx -lt 0 -or $idx -ge $Row.Length -or $null -eq $Row[$idx]) { return '' }
+        return [string]$Row[$idx]
+    }
+
+    function Get-RowLong([string[]]$Row, $Map, [string]$Col) {
+        $s = Get-RowStr $Row $Map $Col
+        $v = 0L
+        if (-not [string]::IsNullOrWhiteSpace($s) -and [long]::TryParse($s.Trim(), [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$v)) {
+            return $v
+        }
+        return 0L
+    }
+
+    # 1. Capture SHOW GLOBAL STATUS FIRST (before SELECT * scans) for clean test workload delta
+    $statusSql = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime','Questions','Queries','Com_select','Com_insert','Com_update','Com_delete','Com_replace','Com_commit','Com_rollback','Slow_queries','Innodb_rows_read','Innodb_rows_inserted','Innodb_rows_updated','Innodb_rows_deleted','Innodb_row_lock_waits','Innodb_row_lock_time','Innodb_row_lock_time_max','Innodb_buffer_pool_read_requests','Innodb_buffer_pool_reads','Innodb_buffer_pool_pages_data','Innodb_buffer_pool_pages_dirty','Innodb_buffer_pool_pages_total','Innodb_data_reads','Innodb_data_writes','Innodb_os_log_written','Created_tmp_tables','Created_tmp_disk_tables','Select_full_join','Select_scan','Sort_merge_passes','Threads_connected','Threads_running','Max_used_connections','Aborted_connects','Aborted_clients','Bytes_received','Bytes_sent','Handler_read_key','Handler_read_rnd_next')"
+    $stRes = Invoke-OptionalMetaQuery $statusSql
+    if ($null -ne $stRes -and $stRes.Columns.Count -ge 2 -and $stRes.Columns[0].Name -ieq 'Variable_name' -and $stRes.Columns[1].Name -ieq 'Value') {
+        foreach ($r in $stRes.Rows) {
+            if ($r.Length -lt 2 -or [string]::IsNullOrWhiteSpace($r[0])) { continue }
+            $lv = 0L
+            if ([long]::TryParse($r[1], [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$lv)) {
+                $srvMeta.StatusCounters[$r[0].Trim()] = $lv
+            }
+        }
+        if ($srvMeta.StatusCounters.Count -gt 0) { $srvMeta.HasStatus = $true }
+    }
+
+    # 2. Server & Aurora environment variables
+    $varSql = "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('version','version_comment','aurora_version','innodb_buffer_pool_size','max_connections','transaction_isolation','innodb_page_size','character_set_server','time_zone')"
+    $varRes = Invoke-OptionalMetaQuery $varSql
+    if ($null -ne $varRes -and $varRes.Columns.Count -ge 2 -and $varRes.Columns[0].Name -ieq 'Variable_name' -and $varRes.Columns[1].Name -ieq 'Value') {
+        foreach ($r in $varRes.Rows) {
+            if ($r.Length -lt 2 -or [string]::IsNullOrWhiteSpace($r[0])) { continue }
+            $srvMeta.Variables[$r[0].Trim()] = if ($null -ne $r[1]) { $r[1].Trim() } else { '' }
+        }
+        if ($srvMeta.Variables.Count -gt 0) { $srvMeta.HasVariables = $true }
+    }
+
+    # 3. information_schema.TABLES (physical InnoDB DATA/INDEX/FREE sizes, AUTO_INCREMENT, UPDATE_TIME)
+    $tblSql = "SELECT TABLE_NAME, ENGINE, ROW_FORMAT, TABLE_ROWS, AVG_ROW_LENGTH, DATA_LENGTH, INDEX_LENGTH, DATA_FREE, AUTO_INCREMENT, CREATE_TIME, UPDATE_TIME, TABLE_COLLATION, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME"
+    $tblRes = Invoke-OptionalMetaQuery $tblSql
+    $tMap = Get-ColIndexMap $tblRes
+    if ($tMap.ContainsKey('TABLE_NAME') -and $tMap.ContainsKey('ENGINE') -and $tMap.ContainsKey('DATA_LENGTH')) {
+        foreach ($r in $tblRes.Rows) {
+            $tn = (Get-RowStr $r $tMap 'TABLE_NAME').Trim()
+            if ([string]::IsNullOrEmpty($tn)) { continue }
+            $tm = New-Object AuroraAnalyzer.DbTableMetadata
+            $tm.HasMetadata    = $true
+            $tm.Engine         = Get-RowStr $r $tMap 'ENGINE'
+            $tm.RowFormat      = Get-RowStr $r $tMap 'ROW_FORMAT'
+            $tm.EstTableRows   = Get-RowLong $r $tMap 'TABLE_ROWS'
+            $tm.AvgRowLength   = Get-RowLong $r $tMap 'AVG_ROW_LENGTH'
+            $tm.DataLength     = Get-RowLong $r $tMap 'DATA_LENGTH'
+            $tm.IndexLength    = Get-RowLong $r $tMap 'INDEX_LENGTH'
+            $tm.DataFree       = Get-RowLong $r $tMap 'DATA_FREE'
+            $aiRaw = Get-RowStr $r $tMap 'AUTO_INCREMENT'
+            $aiVal = 0L
+            if (-not [string]::IsNullOrWhiteSpace($aiRaw) -and [long]::TryParse($aiRaw.Trim(), [System.Globalization.NumberStyles]::Integer, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$aiVal)) {
+                $tm.HasAutoIncrement = $true
+                $tm.AutoIncrement    = $aiVal
+            }
+            $tm.CreateTime     = Get-RowStr $r $tMap 'CREATE_TIME'
+            $tm.UpdateTime     = Get-RowStr $r $tMap 'UPDATE_TIME'
+            $tm.TableCollation = Get-RowStr $r $tMap 'TABLE_COLLATION'
+            $tm.TableComment   = Get-RowStr $r $tMap 'TABLE_COMMENT'
+            $tblMetaMap[$tn] = $tm
+        }
+    }
+
+    # 4. information_schema.COLUMNS (exact DDL types, nullability, PK/UK/MUL keys, defaults, extra)
+    $colSql = "SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA, CHARACTER_SET_NAME, COLLATION_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
+    $colRes = Invoke-OptionalMetaQuery $colSql
+    $cMap = Get-ColIndexMap $colRes
+    if ($cMap.ContainsKey('TABLE_NAME') -and $cMap.ContainsKey('COLUMN_NAME') -and $cMap.ContainsKey('COLUMN_TYPE')) {
+        foreach ($r in $colRes.Rows) {
+            $tn = (Get-RowStr $r $cMap 'TABLE_NAME').Trim()
+            $cn = (Get-RowStr $r $cMap 'COLUMN_NAME').Trim()
+            if ([string]::IsNullOrEmpty($tn) -or [string]::IsNullOrEmpty($cn)) { continue }
+            $perTbl = $null
+            if (-not $colMetaMap.TryGetValue($tn, [ref]$perTbl)) {
+                $perTbl = New-Object 'System.Collections.Generic.Dictionary[string, AuroraAnalyzer.DbColumnMetadata]' ([System.StringComparer]::OrdinalIgnoreCase)
+                $colMetaMap[$tn] = $perTbl
+            }
+            $cm = New-Object AuroraAnalyzer.DbColumnMetadata
+            $cm.ColumnName       = $cn
+            $cm.OrdinalPosition  = [int](Get-RowLong $r $cMap 'ORDINAL_POSITION')
+            $cm.ColumnType       = Get-RowStr $r $cMap 'COLUMN_TYPE'
+            $cm.IsNullable       = Get-RowStr $r $cMap 'IS_NULLABLE'
+            $cm.ColumnKey        = Get-RowStr $r $cMap 'COLUMN_KEY'
+            $cm.ColumnDefault    = Get-RowStr $r $cMap 'COLUMN_DEFAULT'
+            $cm.Extra            = Get-RowStr $r $cMap 'EXTRA'
+            $cm.CharacterSetName = Get-RowStr $r $cMap 'CHARACTER_SET_NAME'
+            $cm.CollationName    = Get-RowStr $r $cMap 'COLLATION_NAME'
+            $cm.ColumnComment    = Get-RowStr $r $cMap 'COLUMN_COMMENT'
+            $perTbl[$cn] = $cm
+        }
+    }
+
+    # 5. information_schema.STATISTICS (index definitions & optimizer cardinality)
+    $idxSql = "SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, CARDINALITY, INDEX_TYPE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+    $idxRes = Invoke-OptionalMetaQuery $idxSql
+    $iMap = Get-ColIndexMap $idxRes
+    if ($iMap.ContainsKey('TABLE_NAME') -and $iMap.ContainsKey('INDEX_NAME') -and $iMap.ContainsKey('COLUMN_NAME')) {
+        $idxAgg = @{}
+        foreach ($r in $idxRes.Rows) {
+            $tn = (Get-RowStr $r $iMap 'TABLE_NAME').Trim()
+            $in = (Get-RowStr $r $iMap 'INDEX_NAME').Trim()
+            $cn = (Get-RowStr $r $iMap 'COLUMN_NAME').Trim()
+            if ([string]::IsNullOrEmpty($tn) -or [string]::IsNullOrEmpty($in)) { continue }
+            $k = "$tn`0$in"
+            if (-not $idxAgg.ContainsKey($k)) {
+                $idxAgg[$k] = @{
+                    TableName   = $tn
+                    IndexName   = $in
+                    NonUnique   = ((Get-RowLong $r $iMap 'NON_UNIQUE') -ne 0)
+                    IndexType   = Get-RowStr $r $iMap 'INDEX_TYPE'
+                    Cols        = (New-Object System.Collections.Generic.List[string])
+                    Cardinality = Get-RowLong $r $iMap 'CARDINALITY'
+                }
+            }
+            $idxAgg[$k].Cols.Add($cn)
+            $cardVal = Get-RowLong $r $iMap 'CARDINALITY'
+            if ($cardVal -gt $idxAgg[$k].Cardinality) { $idxAgg[$k].Cardinality = $cardVal }
+        }
+        foreach ($item in $idxAgg.Values) {
+            $tm = $null
+            if (-not $tblMetaMap.TryGetValue($item.TableName, [ref]$tm)) {
+                $tm = New-Object AuroraAnalyzer.DbTableMetadata
+                $tblMetaMap[$item.TableName] = $tm
+            }
+            $im = New-Object AuroraAnalyzer.DbIndexMetadata
+            $im.IndexName   = $item.IndexName
+            $im.NonUnique   = [bool]$item.NonUnique
+            $im.IndexType   = $item.IndexType
+            $im.Columns     = ($item.Cols.ToArray() -join ', ')
+            $im.Cardinality = [long]$item.Cardinality
+            $tm.Indexes.Add($im)
+        }
+    }
+
+    # 6. information_schema.KEY_COLUMN_USAGE (declared foreign key constraints)
+    $fkSql = "SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION"
+    $fkRes = Invoke-OptionalMetaQuery $fkSql
+    $fMap = Get-ColIndexMap $fkRes
+    if ($fMap.ContainsKey('CONSTRAINT_NAME') -and $fMap.ContainsKey('TABLE_NAME') -and $fMap.ContainsKey('REFERENCED_TABLE_NAME')) {
+        foreach ($r in $fkRes.Rows) {
+            $tn = (Get-RowStr $r $fMap 'TABLE_NAME').Trim()
+            $refT = (Get-RowStr $r $fMap 'REFERENCED_TABLE_NAME').Trim()
+            if ([string]::IsNullOrEmpty($tn) -or [string]::IsNullOrEmpty($refT)) { continue }
+            $tm = $null
+            if (-not $tblMetaMap.TryGetValue($tn, [ref]$tm)) {
+                $tm = New-Object AuroraAnalyzer.DbTableMetadata
+                $tblMetaMap[$tn] = $tm
+            }
+            $fkm = New-Object AuroraAnalyzer.DbForeignKeyMetadata
+            $fkm.ConstraintName       = Get-RowStr $r $fMap 'CONSTRAINT_NAME'
+            $fkm.ColumnName           = Get-RowStr $r $fMap 'COLUMN_NAME'
+            $fkm.ReferencedTableName  = $refT
+            $fkm.ReferencedColumnName = Get-RowStr $r $fMap 'REFERENCED_COLUMN_NAME'
+            $tm.DeclaredFks.Add($fkm)
+        }
+    }
+
+    return @{
+        ServerMeta    = $srvMeta
+        TableMetaMap  = $tblMetaMap
+        ColumnMetaMap = $colMetaMap
+    }
+}
+
 function Invoke-AuroraDirectAnalysis {
     param(
         [Parameter(Mandatory = $true)][hashtable]$ConnConfig,
@@ -6974,15 +11030,22 @@ function Invoke-AuroraDirectAnalysis {
         $sessionConn = Open-AuroraReadOnlySession -ConnConfig $ConnConfig -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
         $client = $sessionConn.Client
 
+        $dbMeta = Get-AuroraDirectDbMetadata -Client $client -CancelState $CancelState -LogCallback $LogCallback -PumpCallback $PumpCallback
+
         $tableNames = @(Get-AuroraBaseTables -Client $client -IncludeTables $IncludeTables -ExcludeTables $ExcludeTables -CancelState $CancelState -LogCallback $LogCallback -PumpCallback $PumpCallback)
         if ($tableNames.Count -eq 0) {
             throw "対象データベース '$($ConnConfig.Database)' に分析対象のBASE TABLEが見つかりませんでした。"
         }
 
-        Write-DirectLog ("DB直接分析対象テーブル数: {0} 件 (CSV出力なし・ストリーミング解析)" -f $tableNames.Count) 25
+        $metaParts = New-Object System.Collections.Generic.List[string]
+        if ($dbMeta.TableMetaMap.Count -gt 0) { $metaParts.Add("物理容量/DDL $($dbMeta.TableMetaMap.Count)表") }
+        if ($dbMeta.ServerMeta.HasStatus) { $metaParts.Add("サーバー状態 $($dbMeta.ServerMeta.StatusCounters.Count)指標") }
+        $metaSuffix = if ($metaParts.Count -gt 0) { " / DBメタ取得: " + ($metaParts -join ', ') } else { '' }
+        Write-DirectLog ("DB直接分析対象テーブル数: {0} 件 (CSV出力なし・ストリーミング解析{1})" -f $tableNames.Count, $metaSuffix) 25
 
         $sourceDesc = "{0}:{1}/{2}" -f $ConnConfig.ServerName, $sessionConn.EffectivePort, $ConnConfig.Database
         $directSession = New-Object AuroraAnalyzer.DirectAnalysisSession($sourceDesc)
+        $directSession.AttachDbMetadata($dbMeta.ServerMeta, $dbMeta.TableMetaMap, $dbMeta.ColumnMetaMap)
 
         $idx = 0
         foreach ($tbl in $tableNames) {
@@ -7024,7 +11087,7 @@ function Test-WarningCellText {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
     $s = $Text.Trim()
-    if ($s -match '^(正常|なし|通常|0|最適|良好|均衡|変化なし|変更検出|継続警告|-)') { return $false }
+    if ($s -match '^(正常|なし|通常|0|最適|良好|均衡|変化なし|変更なし|変更検出|継続警告|-)') { return $false }
     return ($s -match '^(高|中)$|高リスク|高NULL|要注意|空テーブル|全行NULL|全NULL|偏り|孤立|大容量|外れ値|不一致|定数|件数過小|キー数少|警告|注意|減少|消失|削除|スキーマ')
 }
 
@@ -8805,6 +12868,12 @@ function Export-AnalysisToExcelCom {
         Format-ExcelSheetCommon -Sheet $wsGuide -FreezeRow 5 -Landscape $true
         } # end if ($DetailedAnalysis)
 
+        # Embed lossless full-fidelity snapshot via standard OOXML CustomXMLPart (zero visible sheet clutter)
+        $snapshotXml = [AuroraAnalyzer.AnalysisSnapshotCodec]::SerializeToXml($Analysis, $DbLabel)
+        if (-not [string]::IsNullOrEmpty($snapshotXml)) {
+            [void]$wb.CustomXMLParts.Add($snapshotXml)
+        }
+
         # Activate Summary sheet before save
         $wsSummary.Activate()
         $excel.Calculation = -4105 # xlCalculationAutomatic
@@ -9658,13 +13727,19 @@ function Export-AnalysisToOpenXml {
             try { $sw.Write($text) } finally { $sw.Dispose() }
         }
 
+        $snapshotXml = [AuroraAnalyzer.AnalysisSnapshotCodec]::SerializeToXml($Analysis, $DbLabel)
+        $hasSnapshotXml = -not [string]::IsNullOrEmpty($snapshotXml)
+        $ctCustomXml = if ($hasSnapshotXml) { '<Override PartName="/customXml/itemProps1.xml" ContentType="application/vnd.openxmlformats-officedocument.customXmlProperties+xml"/>' } else { '' }
         $ctExtra = if ($hasChart1) { '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>' } else { '' }
         $sheetCt = ($sheetNames | ForEach-Object -Begin { $i = 0 } -Process { $i++; "<Override PartName=`"/xl/worksheets/sheet$i.xml`" ContentType=`"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml`"/>" }) -join ''
-        Add-ZipText '[Content_Types].xml' ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + $sheetCt + $ctExtra + '</Types>')
+        Add-ZipText '[Content_Types].xml' ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + $sheetCt + $ctExtra + $ctCustomXml + '</Types>')
         Add-ZipText '_rels/.rels' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
 
         $wbSheets = ''
         $wbRels = '<Relationship Id="rIdStyle" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        if ($hasSnapshotXml) {
+            $wbRels += '<Relationship Id="rIdCustomXml1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item1.xml"/>'
+        }
         for ($i = 0; $i -lt $sheetNames.Count; $i++) {
             $idx = $i + 1
             $wbSheets += "<sheet name=`"$(XmlEsc $sheetNames[$i])`" sheetId=`"$idx`" r:id=`"rId$idx`"/>"
@@ -9675,6 +13750,12 @@ function Export-AnalysisToOpenXml {
         Add-ZipText 'xl/workbook.xml' ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + $wbSheets + '</sheets></workbook>')
         Add-ZipText 'xl/_rels/workbook.xml.rels' ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + $wbRels + '</Relationships>')
         Add-ZipText 'xl/styles.xml' $stylesXml
+        if ($hasSnapshotXml) {
+            $cxmlGuid = ('{' + [Guid]::NewGuid().ToString().ToUpperInvariant() + '}')
+            Add-ZipText 'customXml/item1.xml' $snapshotXml
+            Add-ZipText 'customXml/itemProps1.xml' ('<?xml version="1.0" encoding="UTF-8" standalone="no"?><ds:datastoreItem ds:itemID="' + $cxmlGuid + '" xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml"><ds:schemaRefs><ds:schemaRef ds:uri="' + [AuroraAnalyzer.AnalysisSnapshotCodec]::SnapshotNamespace + '"/></ds:schemaRefs></ds:datastoreItem>')
+            Add-ZipText 'customXml/_rels/item1.xml.rels' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps" Target="itemProps1.xml"/></Relationships>'
+        }
 
         if ($hasChart1) {
             $lastRow1 = $summaryLastRow1
@@ -9941,8 +14022,15 @@ function Export-ComparisonToExcelCom {
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
         $excel.ScreenUpdating = $false
-        $excel.SheetsInNewWorkbook = 6
+        $targetCmpSheets = 8
+        $excel.SheetsInNewWorkbook = $targetCmpSheets
         $wb = $excel.Workbooks.Add()
+        while ($wb.Worksheets.Count -lt $targetCmpSheets) {
+            [void]$wb.Worksheets.Add([System.Reflection.Missing]::Value, $wb.Worksheets.Item($wb.Worksheets.Count))
+        }
+        while ($wb.Worksheets.Count -gt $targetCmpSheets) {
+            $wb.Worksheets.Item($wb.Worksheets.Count).Delete()
+        }
         $excel.Calculation = -4135 # xlCalculationManual
 
         $wsSummary   = $wb.Worksheets.Item(1); $wsSummary.Name   = '01_比較サマリー'
@@ -9951,18 +14039,21 @@ function Export-ComparisonToExcelCom {
         $wsAdded     = $wb.Worksheets.Item(4); $wsAdded.Name     = '04_追加のあったテーブル'
         $wsUnchanged = $wb.Worksheets.Item(5); $wsUnchanged.Name = '05_変更のなかったテーブル'
         $wsDiffs     = $wb.Worksheets.Item(6); $wsDiffs.Name     = '06_カラム・統計差分詳細'
+        $wsAllCols   = $wb.Worksheets.Item(7); $wsAllCols.Name   = '07_全カラム比較一覧'
+        $wsPerfDb    = $wb.Worksheets.Item(8); $wsPerfDb.Name    = '08_性能・DB・時系列・品質変化'
 
-        foreach ($s in @($wsSummary, $wsAll, $wsUpdated, $wsAdded, $wsUnchanged, $wsDiffs)) {
+        foreach ($s in @($wsSummary, $wsAll, $wsUpdated, $wsAdded, $wsUnchanged, $wsDiffs, $wsAllCols, $wsPerfDb)) {
             $sheetsToRelease.Add($s)
             Initialize-ExcelSheetStyle -Sheet $s
         }
 
-        $subInfo = "比較日時: {0}  |  開始前: {1}{2}  |  開始後: {3}{4}" -f `
+        $subInfo = "比較日時: {0}  |  開始前: {1}{2}  |  開始後: {3}{4}  |  照合方式: {5}" -f `
             $Comparison.ComparedAt.ToString('yyyy/MM/dd HH:mm:ss'), `
             $Comparison.BeforeFileName, `
             $(if ($Comparison.BeforeAnalyzedAt) { " ($($Comparison.BeforeAnalyzedAt))" } else { '' }), `
             $Comparison.AfterFileName, `
-            $(if ($Comparison.AfterAnalyzedAt) { " ($($Comparison.AfterAnalyzedAt))" } else { '' })
+            $(if ($Comparison.AfterAnalyzedAt) { " ($($Comparison.AfterAnalyzedAt))" } else { '' }), `
+            $Comparison.PrecisionLabel
 
         $navyOle   = ConvertTo-ExcelOleColor $script:THEME.AccentHex
         $textOle   = ConvertTo-ExcelOleColor $script:THEME.TextHex
@@ -9974,58 +14065,87 @@ function Export-ComparisonToExcelCom {
         $zebraOle  = ConvertTo-ExcelOleColor $script:THEME.ZebraHex
         $subBgOle  = ConvertTo-ExcelOleColor $script:THEME.AccentLightHex
 
+        function Write-CmpKpiBand {
+            param($Sheet, [int]$LabelRow, [object[]]$Kpis)
+            $Sheet.Rows.Item($LabelRow).RowHeight = 20
+            $Sheet.Rows.Item($LabelRow + 1).RowHeight = 30
+            foreach ($kpi in $Kpis) {
+                $lblRng = $Sheet.Range($Sheet.Cells.Item($LabelRow, $kpi.Col1), $Sheet.Cells.Item($LabelRow, $kpi.Col2))
+                $lblRng.Merge()
+                [AuroraAnalyzer.ComHelper]::SetValue2($Sheet.Cells.Item($LabelRow, $kpi.Col1), $kpi.Label)
+                $lblRng.Font.Name = $script:THEME.FontName; $lblRng.Font.Size = 8.5; $lblRng.Font.Bold = $true
+                $lblRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $mutedOle }
+                $lblRng.Interior.Color = $cardBgOle
+                $lblRng.HorizontalAlignment = -4108; $lblRng.VerticalAlignment = -4108
+
+                $valRng = $Sheet.Range($Sheet.Cells.Item($LabelRow + 1, $kpi.Col1), $Sheet.Cells.Item($LabelRow + 1, $kpi.Col2))
+                $valRng.Merge()
+                $valRng.NumberFormat = $kpi.Fmt
+                Set-ExcelCellValue -Cell $Sheet.Cells.Item($LabelRow + 1, $kpi.Col1) -Value $kpi.Value
+                $valRng.Font.Name = $script:THEME.FontName
+                $valRng.Font.Size = if ($kpi.ContainsKey('FontSize')) { $kpi.FontSize } else { 13.0 }
+                $valRng.Font.Bold = $true
+                $valRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $navyOle }
+                $valRng.Interior.Color = $cardBgOle
+                $valRng.HorizontalAlignment = -4108; $valRng.VerticalAlignment = -4108
+
+                $box = $Sheet.Range($Sheet.Cells.Item($LabelRow, $kpi.Col1), $Sheet.Cells.Item($LabelRow + 1, $kpi.Col2))
+                $box.Borders.Item(8).LineStyle = 1; $box.Borders.Item(8).Color = if ($kpi.Warn) { $warnOle } else { $navyOle }; $box.Borders.Item(8).Weight = 3
+                foreach ($e in @(7, 9, 10)) { $box.Borders.Item($e).LineStyle = 1; $box.Borders.Item($e).Color = $borderOle; $box.Borders.Item($e).Weight = 2 }
+            }
+        }
+
         # ======================================================================
         #  SHEET 1: 01_比較サマリー
         # ======================================================================
-        Write-CmpLog "シート作成中: 01_比較サマリー..." 52
-        Set-ColumnWidths -Sheet $wsSummary -Widths @(21, 22, 18, 14, 14, 13, 13, 14, 14, 11, 28, 34)
+        Write-CmpLog "シート作成中: 01_比較サマリー..." 48
+        Set-ColumnWidths -Sheet $wsSummary -Widths @(21, 22, 18, 13, 13, 13, 12, 14, 15, 24, 28, 32)
         Set-SheetTitleBanner -Sheet $wsSummary -Title '性能試験 テスト開始前・開始後 分析ファイル比較レポート — 比較サマリー' -Subtitle $subInfo -EndCol 12
 
-        $kpiDefs = @(
-            @{ Col1 = 1;  Col2 = 2;  Label = '比較対象テーブル総数';     Value = [double]$Comparison.TotalUniqueTableCount; Fmt = '#,##0" テーブル"';            Warn = $false },
-            @{ Col1 = 3;  Col2 = 4;  Label = '更新のあったテーブル';     Value = [double]$Comparison.UpdatedSheetCount;     Fmt = '#,##0" テーブル"';            Warn = ($Comparison.RowDecreasedCount -gt 0) },
-            @{ Col1 = 5;  Col2 = 6;  Label = '追加のあったテーブル';     Value = [double]$Comparison.AddedSheetCount;       Fmt = '#,##0" テーブル"';            Warn = $false },
-            @{ Col1 = 7;  Col2 = 8;  Label = '変更のなかったテーブル';   Value = [double]$Comparison.UnchangedTableCount;   Fmt = '#,##0" テーブル"';            Warn = $false },
-            @{ Col1 = 9;  Col2 = 10; Label = '総レコード数増減';         Value = [double]$Comparison.TotalRowDelta;         Fmt = '+#,##0" 件";-#,##0" 件";0" 件"'; Warn = ($Comparison.TotalRowDelta -lt 0) },
-            @{ Col1 = 11; Col2 = 12; Label = '要注意・警告テーブル';     Value = [double]$Comparison.AlertTableCount;       Fmt = '#,##0" テーブル"';            Warn = ($Comparison.AlertTableCount -gt 0) }
+        $kpiRow1 = @(
+            @{ Col1 = 1;  Col2 = 2;  Label = '比較対象テーブル (変更/不変)'; Value = ("全 {0} (変更 {1} / 不変 {2})" -f $Comparison.TotalUniqueTableCount, $Comparison.ChangedTableCount, $Comparison.UnchangedTableCount); Fmt = '@'; Warn = $false; FontSize = 11.5 },
+            @{ Col1 = 3;  Col2 = 4;  Label = '更新あり / 追加ありテーブル';   Value = ("更新 {0} / 追加 {1}" -f $Comparison.UpdatedSheetCount, $Comparison.AddedSheetCount); Fmt = '@'; Warn = ($Comparison.RowDecreasedCount -gt 0 -or $Comparison.DeletedTableCount -gt 0); FontSize = 12.0 },
+            @{ Col1 = 5;  Col2 = 6;  Label = '総レコード数増減';             Value = [double]$Comparison.TotalRowDelta; Fmt = '+#,##0" 件";-#,##0" 件";0" 件"'; Warn = ($Comparison.TotalRowDelta -lt 0); FontSize = 13.5 },
+            @{ Col1 = 7;  Col2 = 8;  Label = '全カラム照合 (変更/不変)';     Value = ("変更 {0} / 不変 {1} (計{2})" -f $Comparison.ChangedColumnTotal, $Comparison.UnchangedColumnTotal, $Comparison.TotalUniqueColumnCount); Fmt = '@'; Warn = ($Comparison.RemovedColumnTotal -gt 0); FontSize = 11.0 },
+            @{ Col1 = 9;  Col2 = 10; Label = '行レベル変動 (挿入/更新/削除)'; Value = $(if ($Comparison.HasAnyRowChurn) { ("+{0:#,##0} / 更新{1:#,##0} / -{2:#,##0}" -f $Comparison.TotalInsertedRows, $Comparison.TotalUpdatedRows, $Comparison.TotalDeletedRows) } else { '統計差分照合' }); Fmt = '@'; Warn = ($Comparison.TotalDeletedRows -gt 0); FontSize = 11.0 },
+            @{ Col1 = 11; Col2 = 12; Label = '要注意・警告テーブル';         Value = [double]$Comparison.AlertTableCount; Fmt = '#,##0" テーブル"'; Warn = ($Comparison.AlertTableCount -gt 0); FontSize = 13.5 }
         )
+        Write-CmpKpiBand -Sheet $wsSummary -LabelRow 4 -Kpis $kpiRow1
+        $wsSummary.Rows.Item(6).RowHeight = 8
 
-        $wsSummary.Rows.Item(4).RowHeight = 20
-        $wsSummary.Rows.Item(5).RowHeight = 32
-        $wsSummary.Rows.Item(6).RowHeight = 10
-        foreach ($kpi in $kpiDefs) {
-            $lblRng = $wsSummary.Range($wsSummary.Cells.Item(4, $kpi.Col1), $wsSummary.Cells.Item(4, $kpi.Col2))
-            $lblRng.Merge()
-            [AuroraAnalyzer.ComHelper]::SetValue2($wsSummary.Cells.Item(4, $kpi.Col1), $kpi.Label)
-            $lblRng.Font.Name = $script:THEME.FontName; $lblRng.Font.Size = 8.5; $lblRng.Font.Bold = $true
-            $lblRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $mutedOle }
-            $lblRng.Interior.Color = $cardBgOle
-            $lblRng.HorizontalAlignment = -4108; $lblRng.VerticalAlignment = -4108
-
-            $valRng = $wsSummary.Range($wsSummary.Cells.Item(5, $kpi.Col1), $wsSummary.Cells.Item(5, $kpi.Col2))
-            $valRng.Merge()
-            $valRng.NumberFormat = $kpi.Fmt
-            Set-ExcelCellValue -Cell $wsSummary.Cells.Item(5, $kpi.Col1) -Value $kpi.Value
-            $valRng.Font.Name = $script:THEME.FontName; $valRng.Font.Size = 14; $valRng.Font.Bold = $true
-            $valRng.Font.Color = if ($kpi.Warn) { $warnOle } else { $navyOle }
-            $valRng.Interior.Color = $cardBgOle
-            $valRng.HorizontalAlignment = -4108; $valRng.VerticalAlignment = -4108
-
-            $box = $wsSummary.Range($wsSummary.Cells.Item(4, $kpi.Col1), $wsSummary.Cells.Item(5, $kpi.Col2))
-            $box.Borders.Item(8).LineStyle = 1; $box.Borders.Item(8).Color = if ($kpi.Warn) { $warnOle } else { $navyOle }; $box.Borders.Item(8).Weight = 3
-            foreach ($e in @(7, 9, 10)) { $box.Borders.Item($e).LineStyle = 1; $box.Borders.Item($e).Color = $borderOle; $box.Borders.Item($e).Weight = 2 }
+        $elapsedVal = if ($Comparison.ClockReversed) { $Comparison.ElapsedDisplay } elseif ($Comparison.HasElapsedTime) { ("{0} ({1}{2:0.0}件/分)" -f $Comparison.ElapsedDisplay, $(if ($Comparison.TotalRowsPerMinute -gt 0) { '+' } else { '' }), $Comparison.TotalRowsPerMinute) } else { '時刻同一 / 未計測' }
+        $innoKpiVal = if ($Comparison.HasDbPhysicalMeta) {
+            ("{0}{1:#,##0.0}KB (実Data{2}{3:#,##0.0}/Idx{4}{5:#,##0.0})" -f $(if ($Comparison.TotalInnoDbDeltaKB -gt 0) { '+' } else { '' }), $Comparison.TotalInnoDbDeltaKB, $(if ($Comparison.TotalDataLengthDeltaKB -gt 0) { '+' } else { '' }), $Comparison.TotalDataLengthDeltaKB, $(if ($Comparison.TotalIndexLengthDeltaKB -gt 0) { '+' } else { '' }), $Comparison.TotalIndexLengthDeltaKB)
+        } else {
+            ("{0}{1:#,##0.0} KB" -f $(if ($Comparison.TotalInnoDbDeltaKB -gt 0) { '+' } else { '' }), $Comparison.TotalInnoDbDeltaKB)
         }
+        $warnDeltaVal = "新規 {0} / 悪化 {1} / 解消 {2}" -f $Comparison.NewWarningCount, $Comparison.WorsenedWarningCount, $Comparison.ResolvedWarningCount
+        $relDeltaVal = if ($Comparison.RelationshipComparisons.Count -gt 0) {
+            "孤立 {0}{1:#,##0}行 (FK {2}件)" -f $(if ($Comparison.OrphanRowDelta -gt 0) { '+' } else { '' }), $Comparison.OrphanRowDelta, $Comparison.RelationshipComparisons.Count
+        } else { 'FK検出なし / 旧形式' }
+        $dbMetaVal = if ($Comparison.DbRestartDetected) { 'DB再起動/FO検出(要注意)' } elseif ($Comparison.HasDbServerStatus) { ("DB負荷 {0}指標 / DDL差分 {1}" -f $Comparison.ServerMetricComparisons.Count, $Comparison.DbSchemaDiffs.Count) } elseif ($Comparison.DbSchemaDiffs.Count -gt 0) { ("DDL/INDEX差分 {0}件" -f $Comparison.DbSchemaDiffs.Count) } else { ("{0}×{1}" -f $Comparison.BeforeSourceMode, $Comparison.AfterSourceMode) }
+
+        $kpiRow2 = @(
+            @{ Col1 = 1;  Col2 = 2;  Label = '計測間隔 / 平均増減速度';     Value = $elapsedVal; Fmt = '@'; Warn = $Comparison.ClockReversed; FontSize = 10.5 },
+            @{ Col1 = 3;  Col2 = 4;  Label = '推定InnoDB / 実DB容量増減';   Value = $innoKpiVal; Fmt = '@'; Warn = $false; FontSize = 10.0 },
+            @{ Col1 = 5;  Col2 = 6;  Label = '性能警告推移 (新規/悪化/解消)'; Value = $warnDeltaVal; Fmt = '@'; Warn = ($Comparison.NewWarningCount -gt 0 -or $Comparison.WorsenedWarningCount -gt 0); FontSize = 11.0 },
+            @{ Col1 = 7;  Col2 = 8;  Label = 'FK孤立行増減 / リレーション'; Value = $relDeltaVal; Fmt = '@'; Warn = ($Comparison.OrphanRowDelta -gt 0); FontSize = 10.5 },
+            @{ Col1 = 9;  Col2 = 10; Label = 'DBサーバー / DDL差分状態';    Value = $dbMetaVal; Fmt = '@'; Warn = ($Comparison.DbRestartDetected -or $Comparison.DbSchemaDiffs.Count -gt 0); FontSize = 10.5 },
+            @{ Col1 = 11; Col2 = 12; Label = '比較照合精度';                Value = $Comparison.PrecisionLabel; Fmt = '@'; Warn = $false; FontSize = 9.5 }
+        )
+        Write-CmpKpiBand -Sheet $wsSummary -LabelRow 7 -Kpis $kpiRow2
+        $wsSummary.Rows.Item(9).RowHeight = 10
 
         # Section 1: Category Breakdown Table (Mutually Exclusive -> Sums to 100%)
-        Set-SectionHeader -Sheet $wsSummary -Row 7 -StartCol 1 -EndCol 12 -Text '1. 変更区分別サマリー (重複なし内訳 / テスト開始前 vs テスト開始後)'
+        Set-SectionHeader -Sheet $wsSummary -Row 10 -StartCol 1 -EndCol 12 -Text '1. 変更区分別サマリー (重複なし内訳 / テスト開始前 vs テスト開始後)'
         $bucketDefs = @(
             @{ Status = '追加（新規テーブル）';   Desc = 'テスト開始前になく、開始後に新規追加されたテーブル' },
             @{ Status = '追加（レコード増加）';   Desc = '既存テーブルでレコード数が増加 (INSERT等)' },
-            @{ Status = '追加・更新';             Desc = 'レコード増加に加え、既存値の更新・スキーマ変更も検出 (更新・追加両シートに掲載)' },
-            @{ Status = '更新（データ更新）';     Desc = 'レコード数変動なしでカラム統計・分布・数値・日時・サイズに変化 (UPDATE等)' },
+            @{ Status = '追加・更新';             Desc = 'レコード増加に加え、既存値の更新・削除・スキーマ変更も検出 (更新・追加両シートに掲載)' },
+            @{ Status = '更新（データ更新）';     Desc = 'レコード数変動なしでカラム値ハッシュ・統計・分布・数値・日時・サイズに変化 (UPDATE/行入替等)' },
             @{ Status = '更新（レコード減少）';   Desc = '既存テーブルでレコード数が減少 (DELETE/パージ等・要注意)' },
             @{ Status = '削除（テーブル消失）';   Desc = 'テスト開始前に存在したが開始後に未検出 (テーブル削除/出力漏れ・要注意)' },
-            @{ Status = '変更なし';               Desc = 'レコード数・サイズ・全カラム統計・分布・数値・日時統計すべて変化なし' }
+            @{ Status = '変更なし';               Desc = 'レコード数・サイズ・全カラム統計・分布・数値・日時統計・内容ハッシュすべて完全一致' }
         )
 
         $totalTbl = [Math]::Max(1, $Comparison.TotalUniqueTableCount)
@@ -10051,15 +14171,15 @@ function Export-ComparisonToExcelCom {
             $mCat[$i, 10] = if ($stName -match '^追加') { '04_追加のあったテーブル' } elseif ($stName -match '^更新') { '03_更新のあったテーブル' } elseif ($stName -match '^削除') { '02_全テーブル / 03_更新' } else { '05_変更のなかったテーブル' }
             $mCat[$i, 11] = $bucketDefs[$i].Desc
         }
-        $catEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow 8 -StartCol 1 `
+        $catDataStart = 12
+        $catEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow 11 -StartCol 1 `
             -Headers @('判定区分', 'テーブル数', '構成比', '開始前レコード数', '開始後レコード数', 'レコード増減', 'CSV増減(KB)', 'InnoDB増減(KB)', '検出差分項目数', '状態', '参照シート', '判定基準・説明') `
             -DataMatrix $mCat -RowCount $bucketDefs.Count `
             -ColumnFormats @{ 1 = '@'; 2 = '#,##0'; 3 = '0.0%'; 4 = '#,##0'; 5 = '#,##0'; 6 = '+#,##0;-#,##0;0'; 7 = '+#,##0.00;-#,##0.00;0.00'; 8 = '+#,##0.0;-#,##0.0;0.0'; 9 = '#,##0'; 10 = '@'; 11 = '@'; 12 = '@' } `
             -CenterCols @(1, 10, 11) -RightCols @(2, 3, 4, 5, 6, 7, 8, 9) -WrapCols @(12)
 
-        # Style breakdown rows by status + signed deltas (strictly neutral monotone backgrounds)
         for ($i = 0; $i -lt $bucketDefs.Count; $i++) {
-            $rIdx = 9 + $i
+            $rIdx = $catDataStart + $i
             $stName = $bucketDefs[$i].Status
             $c1 = $wsSummary.Cells.Item($rIdx, 1)
             if ($stName -match '(削除|減少)') {
@@ -10068,19 +14188,11 @@ function Export-ComparisonToExcelCom {
                     $c10 = $wsSummary.Cells.Item($rIdx, 10)
                     $c10.Font.Color = $warnOle; $c10.Font.Bold = $true; $c10.Interior.Color = $warnBgOle
                 }
-                else {
-                    $c1.Font.Color = $mutedOle
-                }
+                else { $c1.Font.Color = $mutedOle }
             }
-            elseif ($stName -match '^追加') {
-                $c1.Font.Color = $navyOle; $c1.Font.Bold = $true; $c1.Interior.Color = $subBgOle
-            }
-            elseif ($stName -match '^更新') {
-                $c1.Font.Color = $textOle; $c1.Font.Bold = $true; $c1.Interior.Color = $subBgOle
-            }
-            else {
-                $c1.Font.Color = $mutedOle
-            }
+            elseif ($stName -match '^追加') { $c1.Font.Color = $navyOle; $c1.Font.Bold = $true; $c1.Interior.Color = $subBgOle }
+            elseif ($stName -match '^更新') { $c1.Font.Color = $textOle; $c1.Font.Bold = $true; $c1.Interior.Color = $subBgOle }
+            else { $c1.Font.Color = $mutedOle }
 
             foreach ($dc in @(6, 7, 8)) {
                 $dv = [double]$mCat[$i, ($dc - 1)]
@@ -10099,7 +14211,7 @@ function Export-ComparisonToExcelCom {
 
         # Section 2: Top 15 Changed Tables by Absolute Row Delta / Changed Columns
         $topSecRow = $catTotalRow + 2
-        Set-SectionHeader -Sheet $wsSummary -Row $topSecRow -StartCol 1 -EndCol 12 -Text '2. レコード増減・変更影響度 TOP15 テーブル'
+        Set-SectionHeader -Sheet $wsSummary -Row $topSecRow -StartCol 1 -EndCol 12 -Text '2. 件数推移・変更影響度 TOP15 テーブル (行変動内訳・変更/不変カラム数付き)'
         $topChanged = @($Comparison.AllTables | Where-Object { -not $_.IsUnchanged } | Sort-Object @{ Expression = { [Math]::Abs($_.RowDelta) }; Descending = $true }, @{ Expression = { $_.ChangedColumnCount }; Descending = $true } | Select-Object -First 15)
         $mTopC = New-Object 'object[,]' ([Math]::Max(1, $topChanged.Count)), 12
         for ($i = 0; $i -lt $topChanged.Count; $i++) {
@@ -10111,30 +14223,31 @@ function Export-ComparisonToExcelCom {
             $mTopC[$i, 4]  = [double]$t.AfterRows
             $mTopC[$i, 5]  = [double]$t.RowDelta
             $mTopC[$i, 6]  = if ($t.HasRowGrowthRate) { [double]$t.RowGrowthRate } elseif ($t.AfterRows -gt 0 -and $t.BeforeRows -eq 0) { '新規' } else { '-' }
-            $mTopC[$i, 7]  = [double]$t.SizeDeltaKB
-            $mTopC[$i, 8]  = [double]$t.InnoDbDeltaKB
-            $mTopC[$i, 9]  = [double]$t.ChangedColumnCount
+            $mTopC[$i, 7]  = [double]$t.InnoDbDeltaKB
+            $mTopC[$i, 8]  = ("変更{0} / 不変{1}" -f $t.ChangedColumnCount, $t.UnchangedColumnCount)
+            $mTopC[$i, 9]  = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
             $mTopC[$i, 10] = $t.ChangeDetail
             $mTopC[$i, 11] = $t.AlertNote
         }
         $topEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsSummary -StartRow ($topSecRow + 1) -StartCol 1 `
-            -Headers @('順位', 'テーブル名', '判定区分', '開始前件数', '開始後件数', 'レコード増減', '増減率', 'CSV増減(KB)', 'InnoDB増減(KB)', '変化列数', '変更内訳', '警告・注意点') `
+            -Headers @('順位', 'テーブル名', '判定区分', '開始前件数', '開始後件数', 'レコード増減', '増減率', 'InnoDB増減(KB)', '変更/不変列', '行変動内訳 (挿入/更新/削除)', '変更内訳', '警告・注意点') `
             -DataMatrix $mTopC -RowCount $topChanged.Count `
-            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 4 = '#,##0'; 5 = '#,##0'; 6 = '+#,##0;-#,##0;0'; 7 = '+0.0%;-0.0%;0.0%'; 8 = '+#,##0.00;-#,##0.00;0.00'; 9 = '+#,##0.0;-#,##0.0;0.0'; 10 = '#,##0'; 11 = '@'; 12 = '@' } `
-            -CenterCols @(1, 3, 10) -RightCols @(4, 5, 6, 7, 8, 9) -WrapCols @(11, 12)
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 4 = '#,##0'; 5 = '#,##0'; 6 = '+#,##0;-#,##0;0'; 7 = '+0.0%;-0.0%;0.0%'; 8 = '+#,##0.0;-#,##0.0;0.0'; 9 = '@'; 10 = '@'; 11 = '@'; 12 = '@' } `
+            -CenterCols @(1, 3, 9) -RightCols @(4, 5, 6, 7, 8) -WrapCols @(10, 11, 12)
         if ($topChanged.Count -gt 0) {
-            Set-ComparisonRowStyles -Sheet $wsSummary -StartRow ($topSecRow + 2) -Items $topChanged -StatusCol 3 -AlertCol 12 -SignedDeltaCols @(6, 8, 9) -WrapTextCols @(11, 12) -DataMatrix $mTopC
+            Set-ComparisonRowStyles -Sheet $wsSummary -StartRow ($topSecRow + 2) -Items $topChanged -StatusCol 3 -AlertCol 12 -SignedDeltaCols @(6, 8) -WrapTextCols @(10, 11, 12) -DataMatrix $mTopC
         }
 
-        # Charts on Comparison Summary Sheet
+        # Charts on Comparison Summary Sheet (3 Charts: Category Doughnut, Row Delta Bar, Before vs After Transition Bar!)
         $chartTopRow = $topEnd + 2
         $chartTopPt = $wsSummary.Rows.Item($chartTopRow).Top
-        $chartHeight = 255.0
+        $chartHeight = 250.0
         [void](Add-StyledExcelChart -Sheet $wsSummary -Left 6 -Top $chartTopPt -Width 440 -Height $chartHeight `
             -ChartType -4120 -Title '変更区分別テーブル数構成' `
-            -CategoryAddress 'A9:A15' -ValueAddresses @('B9:B15') `
+            -CategoryAddress "A${catDataStart}:A${catEnd}" -ValueAddresses @("B${catDataStart}:B${catEnd}") `
             -SeriesNames @('テーブル数') -ShowLegend $true -ShowDataLabels $true)
 
+        $chartsBottomPt = $chartTopPt + $chartHeight
         if ($topChanged.Count -ge 1) {
             $barStart = $topSecRow + 2
             $barEnd = $barStart + $topChanged.Count - 1
@@ -10143,10 +14256,19 @@ function Export-ComparisonToExcelCom {
                 -CategoryAddress "B${barStart}:B${barEnd}" -ValueAddresses @("F${barStart}:F${barEnd}") `
                 -SeriesNames @('レコード増減') -SeriesColors @($script:THEME.AccentHex) `
                 -ReverseCategories $true -ShowDataLabels $true -ColorNegativeBurgundy $true)
+
+            $trEnd = $barStart + [Math]::Min(12, $topChanged.Count) - 1
+            $chart2TopPt = $chartTopPt + $chartHeight + 14
+            [void](Add-StyledExcelChart -Sheet $wsSummary -Left 6 -Top $chart2TopPt -Width 934 -Height 245 `
+                -ChartType 57 -Title 'テスト前後 レコード数推移比較 TOP12 (開始前 vs 開始後)' `
+                -CategoryAddress "B${barStart}:B${trEnd}" -ValueAddresses @("D${barStart}:D${trEnd}", "E${barStart}:E${trEnd}") `
+                -SeriesNames @('開始前レコード数', '開始後レコード数') -SeriesColors @('#8C8C8C', $script:THEME.AccentHex) `
+                -ShowLegend $true -ReverseCategories $true -ShowDataLabels $true)
+            $chartsBottomPt = $chart2TopPt + 245
         }
 
         # Section 3: Comparison Insights (placed dynamically below charts)
-        $insRow = Get-RowBelowPoints -Sheet $wsSummary -StartRow ($chartTopRow + 1) -TargetTopPt ($chartTopPt + $chartHeight + 16)
+        $insRow = Get-RowBelowPoints -Sheet $wsSummary -StartRow ($chartTopRow + 1) -TargetTopPt ($chartsBottomPt + 16)
         Set-SectionHeader -Sheet $wsSummary -Row $insRow -StartCol 1 -EndCol 12 -Text '3. テスト前後比較 総合所見・性能試験チェックポイント'
         $insRow++
         foreach ($ins in $Comparison.Insights) {
@@ -10162,7 +14284,7 @@ function Export-ComparisonToExcelCom {
             $rIns.Interior.Color = if ($isWarnIns) { $warnBgOle } else { $zebraOle }
             $rIns.Borders.Item(7).LineStyle = 1; $rIns.Borders.Item(7).Color = if ($isWarnIns) { $warnOle } else { $navyOle }; $rIns.Borders.Item(7).Weight = 3
             $rIns.Borders.Item(9).LineStyle = 1; $rIns.Borders.Item(9).Color = $borderOle; $rIns.Borders.Item(9).Weight = 2
-            $wsSummary.Rows.Item($insRow).RowHeight = Get-EstimatedRowHeight -Texts @($ins) -ColWidths @(190.0) -MinHeight 26.0 -MaxHeight 80.0
+            $wsSummary.Rows.Item($insRow).RowHeight = Get-EstimatedRowHeight -Texts @($ins) -ColWidths @(210.0) -MinHeight 26.0 -MaxHeight 85.0
             $insRow++
         }
 
@@ -10171,12 +14293,12 @@ function Export-ComparisonToExcelCom {
         # ======================================================================
         #  SHEET 2: 02_全テーブル比較一覧
         # ======================================================================
-        Write-CmpLog "シート作成中: 02_全テーブル比較一覧..." 62
-        Set-ColumnWidths -Sheet $wsAll -Widths @(5, 22, 20, 16, 13, 13, 12, 10, 9, 9, 9, 12, 12, 12, 13, 13, 13, 9, 38, 28)
-        Set-SheetTitleBanner -Sheet $wsAll -Title '全テーブル テスト開始前・開始後 比較一覧' -Subtitle $subInfo -EndCol 20
+        Write-CmpLog "シート作成中: 02_全テーブル比較一覧..." 56
+        Set-ColumnWidths -Sheet $wsAll -Widths @(5, 22, 20, 15, 13, 13, 12, 10, 11, 26, 9, 9, 9, 9, 9, 12, 12, 12, 12, 13, 13, 13, 38, 28)
+        Set-SheetTitleBanner -Sheet $wsAll -Title '全テーブル テスト開始前・開始後 比較一覧 (件数推移・行変動・変更/不変列数・ハッシュ照合)' -Subtitle $subInfo -EndCol 24
 
         $allItems = @($Comparison.AllTables)
-        $mAll = New-Object 'object[,]' ([Math]::Max(1, $allItems.Count)), 20
+        $mAll = New-Object 'object[,]' ([Math]::Max(1, $allItems.Count)), 24
         for ($i = 0; $i -lt $allItems.Count; $i++) {
             $t = $allItems[$i]
             $mAll[$i, 0]  = $i + 1
@@ -10187,43 +14309,49 @@ function Export-ComparisonToExcelCom {
             $mAll[$i, 5]  = [double]$t.AfterRows
             $mAll[$i, 6]  = [double]$t.RowDelta
             $mAll[$i, 7]  = if ($t.HasRowGrowthRate) { [double]$t.RowGrowthRate } elseif ($t.AfterRows -gt 0 -and $t.BeforeRows -eq 0) { '新規' } else { '-' }
-            $mAll[$i, 8]  = [double]$t.BeforeCols
-            $mAll[$i, 9]  = [double]$t.AfterCols
-            $mAll[$i, 10] = [double]$t.ColDelta
-            $mAll[$i, 11] = [double]$t.BeforeSizeKB
-            $mAll[$i, 12] = [double]$t.AfterSizeKB
-            $mAll[$i, 13] = [double]$t.SizeDeltaKB
-            $mAll[$i, 14] = [double]$t.BeforeInnoDbKB
-            $mAll[$i, 15] = [double]$t.AfterInnoDbKB
-            $mAll[$i, 16] = [double]$t.InnoDbDeltaKB
-            $mAll[$i, 17] = [double]$t.ChangedColumnCount
-            $mAll[$i, 18] = $t.DiffSummary
-            $mAll[$i, 19] = $t.AlertNote
+            $mAll[$i, 8]  = if ($t.HasVelocity) { [Math]::Round($t.RowsPerMinute, 1) } else { '-' }
+            $mAll[$i, 9]  = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
+            $mAll[$i, 10] = [double]$t.BeforeCols
+            $mAll[$i, 11] = [double]$t.AfterCols
+            $mAll[$i, 12] = [double]$t.ColDelta
+            $mAll[$i, 13] = [double]$t.ChangedColumnCount
+            $mAll[$i, 14] = [double]$t.UnchangedColumnCount
+            $mAll[$i, 15] = $t.ContentHashStatus
+            $mAll[$i, 16] = [double]$t.BeforeSizeKB
+            $mAll[$i, 17] = [double]$t.AfterSizeKB
+            $mAll[$i, 18] = [double]$t.SizeDeltaKB
+            $mAll[$i, 19] = [double]$t.BeforeInnoDbKB
+            $mAll[$i, 20] = [double]$t.AfterInnoDbKB
+            $mAll[$i, 21] = [double]$t.InnoDbDeltaKB
+            $mAll[$i, 22] = $t.DiffSummary
+            $mAll[$i, 23] = $t.AlertNote
         }
         $allEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsAll -StartRow 4 -StartCol 1 `
-            -Headers @('No', 'テーブル名', '判定区分', '推定役割', '開始前レコード数', '開始後レコード数', 'レコード増減', '増減率', '開始前列数', '開始後列数', '列数増減', '開始前CSV(KB)', '開始後CSV(KB)', 'CSV増減(KB)', '開始前InnoDB(KB)', '開始後InnoDB(KB)', 'InnoDB増減(KB)', '変化列数', '主な変更内容・所見', '警告・注意点') `
+            -Headers @('No', 'テーブル名', '判定区分', '推定役割', '開始前レコード数', '開始後レコード数', 'レコード増減', '増減率', '増減速度(件/分)', '行変動内訳 (挿入/更新/削除)', '開始前列数', '開始後列数', '列数増減', '変更列数', '不変列数', '内容ハッシュ', '開始前CSV(KB)', '開始後CSV(KB)', 'CSV増減(KB)', '開始前InnoDB(KB)', '開始後InnoDB(KB)', 'InnoDB増減(KB)', '主な変更内容・所見', '警告・注意点') `
             -DataMatrix $mAll -RowCount $allItems.Count `
-            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 9 = '#,##0'; 10 = '#,##0'; 11 = '+#,##0;-#,##0;0'; 12 = '#,##0.00'; 13 = '#,##0.00'; 14 = '+#,##0.00;-#,##0.00;0.00'; 15 = '#,##0.0'; 16 = '#,##0.0'; 17 = '+#,##0.0;-#,##0.0;0.0'; 18 = '#,##0'; 19 = '@'; 20 = '@' } `
-            -CenterCols @(1, 3, 4, 9, 10, 11, 18) -RightCols @(5, 6, 7, 8, 12, 13, 14, 15, 16, 17) -WrapCols @(19, 20)
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 9 = '+#,##0.0;-#,##0.0;0.0'; 10 = '@'; 11 = '#,##0'; 12 = '#,##0'; 13 = '+#,##0;-#,##0;0'; 14 = '#,##0'; 15 = '#,##0'; 16 = '@'; 17 = '#,##0.00'; 18 = '#,##0.00'; 19 = '+#,##0.00;-#,##0.00;0.00'; 20 = '#,##0.0'; 21 = '#,##0.0'; 22 = '+#,##0.0;-#,##0.0;0.0'; 23 = '@'; 24 = '@' } `
+            -CenterCols @(1, 3, 4, 11, 12, 13, 14, 15, 16) -RightCols @(5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 22) -WrapCols @(10, 23, 24)
         if ($allItems.Count -gt 0) {
-            Set-ComparisonRowStyles -Sheet $wsAll -StartRow 5 -Items $allItems -StatusCol 3 -AlertCol 20 -SignedDeltaCols @(7, 11, 14, 17) -WrapTextCols @(19, 20) -DataMatrix $mAll
+            Set-ComparisonRowStyles -Sheet $wsAll -StartRow 5 -Items $allItems -StatusCol 3 -AlertCol 24 -SignedDeltaCols @(7, 9, 13, 19, 22) -WrapTextCols @(10, 23, 24) -DataMatrix $mAll
             $totGrowth = if ($Comparison.HasTotalRowGrowthRate) { [double]$Comparison.TotalRowGrowthRate } else { '-' }
+            $totVel = if ($Comparison.HasElapsedTime) { [Math]::Round($Comparison.TotalRowsPerMinute, 1) } else { '-' }
+            $totChurn = if ($Comparison.HasAnyRowChurn) { ("+{0:#,##0} / 更新{1:#,##0} / -{2:#,##0}" -f $Comparison.TotalInsertedRows, $Comparison.TotalUpdatedRows, $Comparison.TotalDeletedRows) } else { '-' }
             Write-ComparisonTotalRow -Sheet $wsAll -Row ($allEnd + 1) `
-                -Values @('', '合計', ("計 {0} テーブル" -f $allItems.Count), '', [double]$Comparison.BeforeTotalRows, [double]$Comparison.AfterTotalRows, [double]$Comparison.TotalRowDelta, $totGrowth, '', '', '', [Math]::Round($Comparison.BeforeTotalSizeKB, 2), [Math]::Round($Comparison.AfterTotalSizeKB, 2), [double]$Comparison.TotalSizeDeltaKB, [Math]::Round($Comparison.BeforeTotalInnoDbKB, 1), [Math]::Round($Comparison.AfterTotalInnoDbKB, 1), [double]$Comparison.TotalInnoDbDeltaKB, '', '', '') `
-                -ColumnFormats @{ 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 12 = '#,##0.00'; 13 = '#,##0.00'; 14 = '+#,##0.00;-#,##0.00;0.00'; 15 = '#,##0.0'; 16 = '#,##0.0'; 17 = '+#,##0.0;-#,##0.0;0.0' } `
-                -CenterCols @(3) -RightCols @(5, 6, 7, 8, 12, 13, 14, 15, 16, 17)
+                -Values @('', '合計', ("計 {0} テーブル" -f $allItems.Count), '', [double]$Comparison.BeforeTotalRows, [double]$Comparison.AfterTotalRows, [double]$Comparison.TotalRowDelta, $totGrowth, $totVel, $totChurn, '', '', '', [double]$Comparison.ChangedColumnTotal, [double]$Comparison.UnchangedColumnTotal, '', [Math]::Round($Comparison.BeforeTotalSizeKB, 2), [Math]::Round($Comparison.AfterTotalSizeKB, 2), [double]$Comparison.TotalSizeDeltaKB, [Math]::Round($Comparison.BeforeTotalInnoDbKB, 1), [Math]::Round($Comparison.AfterTotalInnoDbKB, 1), [double]$Comparison.TotalInnoDbDeltaKB, '', '') `
+                -ColumnFormats @{ 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 9 = '+#,##0.0;-#,##0.0;0.0'; 14 = '#,##0'; 15 = '#,##0'; 17 = '#,##0.00'; 18 = '#,##0.00'; 19 = '+#,##0.00;-#,##0.00;0.00'; 20 = '#,##0.0'; 21 = '#,##0.0'; 22 = '+#,##0.0;-#,##0.0;0.0' } `
+                -CenterCols @(3, 14, 15) -RightCols @(5, 6, 7, 8, 9, 17, 18, 19, 20, 21, 22)
         }
-        Format-ExcelSheetCommon -Sheet $wsAll -FreezeRow 4 -AutoFilterRange "A4:T$allEnd" -Landscape $true
+        Format-ExcelSheetCommon -Sheet $wsAll -FreezeRow 4 -AutoFilterRange "A4:X$allEnd" -Landscape $true
 
         # ======================================================================
         #  SHEET 3: 03_更新のあったテーブル
         # ======================================================================
-        Write-CmpLog "シート作成中: 03_更新のあったテーブル..." 72
-        Set-ColumnWidths -Sheet $wsUpdated -Widths @(5, 22, 20, 16, 13, 13, 12, 13, 13, 12, 12, 12, 12, 9, 24, 38, 28)
-        Set-SheetTitleBanner -Sheet $wsUpdated -Title '更新のあったテーブル一覧 (既存データ更新・レコード減少・追加＋更新併用)' -Subtitle $subInfo -EndCol 17
+        Write-CmpLog "シート作成中: 03_更新のあったテーブル..." 64
+        Set-ColumnWidths -Sheet $wsUpdated -Widths @(5, 22, 20, 15, 13, 13, 12, 24, 11, 13, 13, 12, 12, 9, 24, 24, 38, 28)
+        Set-SheetTitleBanner -Sheet $wsUpdated -Title '更新のあったテーブル一覧 (既存データ更新・レコード減少・追加＋更新併用 / 変更・不変カラム明示)' -Subtitle $subInfo -EndCol 18
 
         $updItems = @($Comparison.UpdatedTables)
-        $mUpd = New-Object 'object[,]' ([Math]::Max(1, $updItems.Count)), 17
+        $mUpd = New-Object 'object[,]' ([Math]::Max(1, $updItems.Count)), 18
         for ($i = 0; $i -lt $updItems.Count; $i++) {
             $t = $updItems[$i]
             $mUpd[$i, 0]  = $i + 1
@@ -10233,29 +14361,30 @@ function Export-ComparisonToExcelCom {
             $mUpd[$i, 4]  = [double]$t.BeforeRows
             $mUpd[$i, 5]  = [double]$t.AfterRows
             $mUpd[$i, 6]  = [double]$t.RowDelta
-            $mUpd[$i, 7]  = [double]$t.BeforeAvgRowBytes
-            $mUpd[$i, 8]  = [double]$t.AfterAvgRowBytes
-            $mUpd[$i, 9]  = [double]$t.AvgRowBytesDelta
-            $mUpd[$i, 10] = [double]$t.BeforeSizeKB
-            $mUpd[$i, 11] = [double]$t.AfterSizeKB
+            $mUpd[$i, 7]  = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
+            $mUpd[$i, 8]  = $t.ContentHashStatus
+            $mUpd[$i, 9]  = [double]$t.BeforeAvgRowBytes
+            $mUpd[$i, 10] = [double]$t.AfterAvgRowBytes
+            $mUpd[$i, 11] = [double]$t.AvgRowBytesDelta
             $mUpd[$i, 12] = [double]$t.SizeDeltaKB
             $mUpd[$i, 13] = [double]$t.ChangedColumnCount
             $mUpd[$i, 14] = $t.ChangedColumnsSummary
-            $mUpd[$i, 15] = $t.DiffSummary
-            $mUpd[$i, 16] = $t.AlertNote
+            $mUpd[$i, 15] = $t.UnchangedColumnsSummary
+            $mUpd[$i, 16] = $t.DiffSummary
+            $mUpd[$i, 17] = $t.AlertNote
         }
         $updEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsUpdated -StartRow 4 -StartCol 1 `
-            -Headers @('No', 'テーブル名', '判定区分', '推定役割', '開始前レコード数', '開始後レコード数', 'レコード増減', '開始前平均行長(B)', '開始後平均行長(B)', '平均行長増減(B)', '開始前CSV(KB)', '開始後CSV(KB)', 'CSV増減(KB)', '変化列数', '変更検出カラム', '具体的な変更内容', '警告・注意点') `
+            -Headers @('No', 'テーブル名', '判定区分', '推定役割', '開始前レコード数', '開始後レコード数', 'レコード増減', '行変動内訳 (挿入/更新/削除)', '内容ハッシュ', '開始前平均行長(B)', '開始後平均行長(B)', '平均行長増減(B)', 'CSV増減(KB)', '変化列数', '変更検出カラム', '変更なしカラム', '具体的な変更内容', '警告・注意点') `
             -DataMatrix $mUpd -RowCount $updItems.Count `
-            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '#,##0.0'; 9 = '#,##0.0'; 10 = '+#,##0.0;-#,##0.0;0.0'; 11 = '#,##0.00'; 12 = '#,##0.00'; 13 = '+#,##0.00;-#,##0.00;0.00'; 14 = '#,##0'; 15 = '@'; 16 = '@'; 17 = '@' } `
-            -CenterCols @(1, 3, 4, 14) -RightCols @(5, 6, 7, 8, 9, 10, 11, 12, 13) -WrapCols @(15, 16, 17)
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '@'; 9 = '@'; 10 = '#,##0.0'; 11 = '#,##0.0'; 12 = '+#,##0.0;-#,##0.0;0.0'; 13 = '+#,##0.00;-#,##0.00;0.00'; 14 = '#,##0'; 15 = '@'; 16 = '@'; 17 = '@'; 18 = '@' } `
+            -CenterCols @(1, 3, 4, 9, 14) -RightCols @(5, 6, 7, 10, 11, 12, 13) -WrapCols @(8, 15, 16, 17, 18)
         if ($updItems.Count -gt 0) {
-            Set-ComparisonRowStyles -Sheet $wsUpdated -StartRow 5 -Items $updItems -StatusCol 3 -AlertCol 17 -SignedDeltaCols @(7, 10, 13) -WrapTextCols @(15, 16, 17) -DataMatrix $mUpd
+            Set-ComparisonRowStyles -Sheet $wsUpdated -StartRow 5 -Items $updItems -StatusCol 3 -AlertCol 18 -SignedDeltaCols @(7, 12, 13) -WrapTextCols @(8, 15, 16, 17, 18) -DataMatrix $mUpd
         }
 
         $updNextRow = $updEnd + 2
         if ($Comparison.DeletedTables.Count -gt 0) {
-            Set-SectionHeader -Sheet $wsUpdated -Row $updNextRow -StartCol 1 -EndCol 17 -Text '【要注意】削除・消失テーブル一覧 (テスト開始前に存在し、テスト開始後の分析ファイルに未検出)'
+            Set-SectionHeader -Sheet $wsUpdated -Row $updNextRow -StartCol 1 -EndCol 18 -Text '【要注意】削除・消失テーブル一覧 (テスト開始前に存在し、テスト開始後の分析ファイルに未検出)'
             $delItems = @($Comparison.DeletedTables)
             $mDel = New-Object 'object[,]' $delItems.Count, 8
             for ($i = 0; $i -lt $delItems.Count; $i++) {
@@ -10276,7 +14405,6 @@ function Export-ComparisonToExcelCom {
                 -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '#,##0.00'; 8 = '@' } `
                 -CenterCols @(1, 3, 4, 6) -RightCols @(5, 7) -WrapCols @(8)
             Set-ComparisonRowStyles -Sheet $wsUpdated -StartRow ($delHdrRow + 1) -Items $delItems -StatusCol 3 -AlertCol 8 -WrapTextCols @(8) -DataMatrix $mDel
-            # Merge col 8..11 for the deleted-table warning column so the diagnostic message fits without wrapping narrowly
             $delHdrMerge = $wsUpdated.Range($wsUpdated.Cells.Item($delHdrRow, 8), $wsUpdated.Cells.Item($delHdrRow, 11))
             $delHdrMerge.Merge()
             $delHdrMerge.Interior.Color = $navyOle
@@ -10303,17 +14431,17 @@ function Export-ComparisonToExcelCom {
                 -CategoryAddress "B5:B${uChartEnd}" -ValueAddresses @("N5:N${uChartEnd}") `
                 -SeriesNames @('変更検出カラム数') -SeriesColors @('#4D4D4D') -ReverseCategories $true -ShowDataLabels $true)
         }
-        Format-ExcelSheetCommon -Sheet $wsUpdated -FreezeRow 4 -AutoFilterRange "A4:Q$updEnd" -Landscape $true
+        Format-ExcelSheetCommon -Sheet $wsUpdated -FreezeRow 4 -AutoFilterRange "A4:R$updEnd" -Landscape $true
 
         # ======================================================================
         #  SHEET 4: 04_追加のあったテーブル
         # ======================================================================
-        Write-CmpLog "シート作成中: 04_追加のあったテーブル..." 80
-        Set-ColumnWidths -Sheet $wsAdded -Widths @(5, 22, 18, 16, 13, 13, 13, 10, 7, 12, 12, 12, 13, 18, 38, 28)
-        Set-SheetTitleBanner -Sheet $wsAdded -Title '追加のあったテーブル一覧 (新規テーブル追加 ＆ レコード増加テーブル)' -Subtitle $subInfo -EndCol 16
+        Write-CmpLog "シート作成中: 04_追加のあったテーブル..." 72
+        Set-ColumnWidths -Sheet $wsAdded -Widths @(5, 22, 18, 15, 13, 13, 13, 10, 11, 24, 7, 12, 12, 12, 13, 18, 36, 26)
+        Set-SheetTitleBanner -Sheet $wsAdded -Title '追加のあったテーブル一覧 (新規テーブル追加 ＆ レコード増加テーブル)' -Subtitle $subInfo -EndCol 18
 
         $addItems = @($Comparison.AddedTables)
-        $mAdd = New-Object 'object[,]' ([Math]::Max(1, $addItems.Count)), 16
+        $mAdd = New-Object 'object[,]' ([Math]::Max(1, $addItems.Count)), 18
         $sumAddBefore = 0L; $sumAddAfter = 0L; $sumAddDelta = 0L; $sumAddSizeD = 0.0; $sumAddInnoD = 0.0
         for ($i = 0; $i -lt $addItems.Count; $i++) {
             $t = $addItems[$i]
@@ -10327,28 +14455,30 @@ function Export-ComparisonToExcelCom {
             $mAdd[$i, 5]  = [double]$t.AfterRows
             $mAdd[$i, 6]  = [double]$t.RowDelta
             $mAdd[$i, 7]  = if ($t.HasRowGrowthRate) { [double]$t.RowGrowthRate } elseif ($t.AfterRows -gt 0 -and $t.BeforeRows -eq 0) { '新規' } else { '-' }
-            $mAdd[$i, 8]  = [double]$t.AfterCols
-            $mAdd[$i, 9]  = [double]$t.BeforeSizeKB
-            $mAdd[$i, 10] = [double]$t.AfterSizeKB
-            $mAdd[$i, 11] = [double]$t.SizeDeltaKB
-            $mAdd[$i, 12] = [double]$t.InnoDbDeltaKB
-            $mAdd[$i, 13] = if ([string]::IsNullOrEmpty($t.CandidatePks)) { '-' } else { $t.CandidatePks }
-            $mAdd[$i, 14] = $t.DiffSummary
-            $mAdd[$i, 15] = $t.AlertNote
+            $mAdd[$i, 8]  = if ($t.HasVelocity) { [Math]::Round($t.RowsPerMinute, 1) } else { '-' }
+            $mAdd[$i, 9]  = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
+            $mAdd[$i, 10] = [double]$t.AfterCols
+            $mAdd[$i, 11] = [double]$t.BeforeSizeKB
+            $mAdd[$i, 12] = [double]$t.AfterSizeKB
+            $mAdd[$i, 13] = [double]$t.SizeDeltaKB
+            $mAdd[$i, 14] = [double]$t.InnoDbDeltaKB
+            $mAdd[$i, 15] = if ([string]::IsNullOrEmpty($t.CandidatePks)) { '-' } else { $t.CandidatePks }
+            $mAdd[$i, 16] = $t.DiffSummary
+            $mAdd[$i, 17] = $t.AlertNote
         }
         $addEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsAdded -StartRow 4 -StartCol 1 `
-            -Headers @('No', 'テーブル名', '追加種別', '推定役割', '開始前レコード数', '開始後レコード数', '追加レコード数', '増加率', '列数', '開始前CSV(KB)', '開始後CSV(KB)', 'CSV増加(KB)', 'InnoDB増加(KB)', 'PK/UK候補', '変更サマリー', '警告・注意点') `
+            -Headers @('No', 'テーブル名', '追加種別', '推定役割', '開始前レコード数', '開始後レコード数', '追加レコード数', '増加率', '増加速度(件/分)', '行変動内訳', '列数', '開始前CSV(KB)', '開始後CSV(KB)', 'CSV増加(KB)', 'InnoDB増加(KB)', 'PK/UK候補', '変更サマリー', '警告・注意点') `
             -DataMatrix $mAdd -RowCount $addItems.Count `
-            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 9 = '#,##0'; 10 = '#,##0.00'; 11 = '#,##0.00'; 12 = '+#,##0.00;-#,##0.00;0.00'; 13 = '+#,##0.0;-#,##0.0;0.0'; 14 = '@'; 15 = '@'; 16 = '@' } `
-            -CenterCols @(1, 3, 4, 9) -RightCols @(5, 6, 7, 8, 10, 11, 12, 13) -WrapCols @(15, 16)
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 9 = '+#,##0.0;-#,##0.0;0.0'; 10 = '@'; 11 = '#,##0'; 12 = '#,##0.00'; 13 = '#,##0.00'; 14 = '+#,##0.00;-#,##0.00;0.00'; 15 = '+#,##0.0;-#,##0.0;0.0'; 16 = '@'; 17 = '@'; 18 = '@' } `
+            -CenterCols @(1, 3, 4, 11) -RightCols @(5, 6, 7, 8, 9, 12, 13, 14, 15) -WrapCols @(10, 17, 18)
         $addChartAnchorRow = $addEnd + 2
         if ($addItems.Count -gt 0) {
-            Set-ComparisonRowStyles -Sheet $wsAdded -StartRow 5 -Items $addItems -StatusCol 3 -AlertCol 16 -SignedDeltaCols @(7, 12, 13) -WrapTextCols @(15, 16) -DataMatrix $mAdd
+            Set-ComparisonRowStyles -Sheet $wsAdded -StartRow 5 -Items $addItems -StatusCol 3 -AlertCol 18 -SignedDeltaCols @(7, 9, 14, 15) -WrapTextCols @(10, 17, 18) -DataMatrix $mAdd
             $addTotGrowth = if ($sumAddBefore -gt 0) { [double]($sumAddDelta / $sumAddBefore) } else { '-' }
             Write-ComparisonTotalRow -Sheet $wsAdded -Row ($addEnd + 1) `
-                -Values @('', '合計', ("計 {0} テーブル" -f $addItems.Count), '', [double]$sumAddBefore, [double]$sumAddAfter, [double]$sumAddDelta, $addTotGrowth, '', '', '', [Math]::Round($sumAddSizeD, 2), [Math]::Round($sumAddInnoD, 1), '', '', '') `
-                -ColumnFormats @{ 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 12 = '+#,##0.00;-#,##0.00;0.00'; 13 = '+#,##0.0;-#,##0.0;0.0' } `
-                -CenterCols @(3) -RightCols @(5, 6, 7, 8, 12, 13)
+                -Values @('', '合計', ("計 {0} テーブル" -f $addItems.Count), '', [double]$sumAddBefore, [double]$sumAddAfter, [double]$sumAddDelta, $addTotGrowth, '', '', '', '', '', [Math]::Round($sumAddSizeD, 2), [Math]::Round($sumAddInnoD, 1), '', '', '') `
+                -ColumnFormats @{ 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '+0.0%;-0.0%;0.0%'; 14 = '+#,##0.00;-#,##0.00;0.00'; 15 = '+#,##0.0;-#,##0.0;0.0' } `
+                -CenterCols @(3) -RightCols @(5, 6, 7, 8, 14, 15)
             $addChartAnchorRow = $addEnd + 3
 
             $aChartCnt = [Math]::Min(15, $addItems.Count)
@@ -10359,17 +14489,17 @@ function Export-ComparisonToExcelCom {
                 -CategoryAddress "B5:B${aChartEnd}" -ValueAddresses @("G5:G${aChartEnd}") `
                 -SeriesNames @('追加レコード数') -SeriesColors @($script:THEME.AccentHex) -ReverseCategories $true -ShowDataLabels $true)
         }
-        Format-ExcelSheetCommon -Sheet $wsAdded -FreezeRow 4 -AutoFilterRange "A4:P$addEnd" -Landscape $true
+        Format-ExcelSheetCommon -Sheet $wsAdded -FreezeRow 4 -AutoFilterRange "A4:R$addEnd" -Landscape $true
 
         # ======================================================================
         #  SHEET 5: 05_変更のなかったテーブル
         # ======================================================================
-        Write-CmpLog "シート作成中: 05_変更のなかったテーブル..." 88
-        Set-ColumnWidths -Sheet $wsUnchanged -Widths @(5, 24, 14, 16, 13, 8, 14, 15, 12, 11, 20, 20, 30)
-        Set-SheetTitleBanner -Sheet $wsUnchanged -Title '変更のなかったテーブル一覧 (開始前後で件数・サイズ・統計プロファイル完全一致)' -Subtitle $subInfo -EndCol 13
+        Write-CmpLog "シート作成中: 05_変更のなかったテーブル..." 78
+        Set-ColumnWidths -Sheet $wsUnchanged -Widths @(5, 24, 14, 15, 16, 13, 8, 14, 15, 12, 11, 20, 20, 30)
+        Set-SheetTitleBanner -Sheet $wsUnchanged -Title '変更のなかったテーブル一覧 (開始前後で件数・サイズ・統計・値ハッシュ完全一致)' -Subtitle $subInfo -EndCol 14
 
         $uncItems = @($Comparison.UnchangedTables)
-        $mUnc = New-Object 'object[,]' ([Math]::Max(1, $uncItems.Count)), 13
+        $mUnc = New-Object 'object[,]' ([Math]::Max(1, $uncItems.Count)), 14
         $sumUncRows = 0L; $sumUncSize = 0.0; $sumUncInno = 0.0
         for ($i = 0; $i -lt $uncItems.Count; $i++) {
             $t = $uncItems[$i]
@@ -10378,36 +14508,37 @@ function Export-ComparisonToExcelCom {
             $mUnc[$i, 1]  = $t.TableName
             $mUnc[$i, 2]  = $t.PrimaryStatus
             $mUnc[$i, 3]  = $t.InferredRole
-            $mUnc[$i, 4]  = [double]$t.AfterRows
-            $mUnc[$i, 5]  = [double]$t.AfterCols
-            $mUnc[$i, 6]  = [double]$t.AfterSizeKB
-            $mUnc[$i, 7]  = [double]$t.AfterInnoDbKB
-            $mUnc[$i, 8]  = [double]$t.AfterAvgRowBytes
-            $mUnc[$i, 9]  = [double]$t.AfterAvgNullRate
-            $mUnc[$i, 10] = if ([string]::IsNullOrEmpty($t.CandidatePks)) { '-' } else { $t.CandidatePks }
-            $mUnc[$i, 11] = if ([string]::IsNullOrEmpty($t.DateColumns)) { '-' } else { $t.DateColumns }
-            $mUnc[$i, 12] = $t.AfterWarning
+            $mUnc[$i, 4]  = if ($t.ContentHashStatus -eq '一致') { 'ハッシュ完全一致' } else { '全統計一致' }
+            $mUnc[$i, 5]  = [double]$t.AfterRows
+            $mUnc[$i, 6]  = [double]$t.AfterCols
+            $mUnc[$i, 7]  = [double]$t.AfterSizeKB
+            $mUnc[$i, 8]  = [double]$t.AfterInnoDbKB
+            $mUnc[$i, 9]  = [double]$t.AfterAvgRowBytes
+            $mUnc[$i, 10] = [double]$t.AfterAvgNullRate
+            $mUnc[$i, 11] = if ([string]::IsNullOrEmpty($t.CandidatePks)) { '-' } else { $t.CandidatePks }
+            $mUnc[$i, 12] = if ([string]::IsNullOrEmpty($t.DateColumns)) { '-' } else { $t.DateColumns }
+            $mUnc[$i, 13] = $t.AfterWarning
         }
         $uncEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsUnchanged -StartRow 4 -StartCol 1 `
-            -Headers @('No', 'テーブル名', '判定区分', '推定役割', 'レコード数', '列数', 'CSVサイズ(KB)', '推定InnoDB(KB)', '平均行長(B)', '平均NULL率', 'PK/UK候補', '日時カラム', '既存警告・注意点') `
+            -Headers @('No', 'テーブル名', '判定区分', '推定役割', '照合根拠', 'レコード数', '列数', 'CSVサイズ(KB)', '推定InnoDB(KB)', '平均行長(B)', '平均NULL率', 'PK/UK候補', '日時カラム', '既存警告・注意点') `
             -DataMatrix $mUnc -RowCount $uncItems.Count `
-            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '#,##0.00'; 8 = '#,##0.0'; 9 = '#,##0.0'; 10 = '0.0%'; 11 = '@'; 12 = '@'; 13 = '@' } `
-            -CenterCols @(1, 3, 4, 6) -RightCols @(5, 7, 8, 9, 10) -WrapCols @(11, 12, 13) -WarnCheckCols @(13)
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 5 = '@'; 6 = '#,##0'; 7 = '#,##0'; 8 = '#,##0.00'; 9 = '#,##0.0'; 10 = '#,##0.0'; 11 = '0.0%'; 12 = '@'; 13 = '@'; 14 = '@' } `
+            -CenterCols @(1, 3, 4, 5, 7) -RightCols @(6, 8, 9, 10, 11) -WrapCols @(12, 13, 14) -WarnCheckCols @(14)
         if ($uncItems.Count -gt 0) {
-            Set-ComparisonRowStyles -Sheet $wsUnchanged -StartRow 5 -Items $uncItems -StatusCol 3 -WrapTextCols @(11, 12, 13) -DataMatrix $mUnc
+            Set-ComparisonRowStyles -Sheet $wsUnchanged -StartRow 5 -Items $uncItems -StatusCol 3 -WrapTextCols @(12, 13, 14) -DataMatrix $mUnc
             Write-ComparisonTotalRow -Sheet $wsUnchanged -Row ($uncEnd + 1) `
-                -Values @('', '合計', ("計 {0} テーブル" -f $uncItems.Count), '', [double]$sumUncRows, '', [Math]::Round($sumUncSize, 2), [Math]::Round($sumUncInno, 1), '', '', '', '', '') `
-                -ColumnFormats @{ 5 = '#,##0'; 7 = '#,##0.00'; 8 = '#,##0.0' } `
-                -CenterCols @(3) -RightCols @(5, 7, 8)
+                -Values @('', '合計', ("計 {0} テーブル" -f $uncItems.Count), '', '', [double]$sumUncRows, '', [Math]::Round($sumUncSize, 2), [Math]::Round($sumUncInno, 1), '', '', '', '', '') `
+                -ColumnFormats @{ 6 = '#,##0'; 8 = '#,##0.00'; 9 = '#,##0.0' } `
+                -CenterCols @(3) -RightCols @(6, 8, 9)
         }
-        Format-ExcelSheetCommon -Sheet $wsUnchanged -FreezeRow 4 -AutoFilterRange "A4:M$uncEnd" -Landscape $true
+        Format-ExcelSheetCommon -Sheet $wsUnchanged -FreezeRow 4 -AutoFilterRange "A4:N$uncEnd" -Landscape $true
 
         # ======================================================================
         #  SHEET 6: 06_カラム・統計差分詳細
         # ======================================================================
-        Write-CmpLog "シート作成中: 06_カラム・統計差分詳細..." 94
-        Set-ColumnWidths -Sheet $wsDiffs -Widths @(22, 20, 16, 22, 24, 24, 24, 10)
-        Set-SheetTitleBanner -Sheet $wsDiffs -Title 'カラム・分布・数値・日時 統計差分詳細一覧 (変更検出の根拠データ)' -Subtitle $subInfo -EndCol 8
+        Write-CmpLog "シート作成中: 06_カラム・統計差分詳細..." 83
+        Set-ColumnWidths -Sheet $wsDiffs -Widths @(22, 20, 16, 24, 24, 24, 28, 10)
+        Set-SheetTitleBanner -Sheet $wsDiffs -Title 'カラム・分布・数値・日時・DDL・ハッシュ 統計差分詳細一覧 (変更検出の根拠データ)' -Subtitle $subInfo -EndCol 8
 
         $diffs = @($Comparison.AllColumnDiffs)
         $mDif = New-Object 'object[,]' ([Math]::Max(1, $diffs.Count)), 8
@@ -10444,6 +14575,319 @@ function Export-ComparisonToExcelCom {
             }
         }
         Format-ExcelSheetCommon -Sheet $wsDiffs -FreezeRow 4 -AutoFilterRange "A4:H$difEnd" -Landscape $true
+
+        # ======================================================================
+        #  SHEET 7: 07_全カラム比較一覧 (Changed & Unchanged Column Matrix!)
+        # ======================================================================
+        Write-CmpLog "シート作成中: 07_全カラム比較一覧..." 88
+        Set-ColumnWidths -Sheet $wsAllCols -Widths @(5, 20, 20, 18, 22, 12, 20, 22, 12, 18, 18, 22, 20, 20, 22, 14, 9, 36, 10)
+        Set-SheetTitleBanner -Sheet $wsAllCols -Title '全カラム 変更あり・変更なし 比較マトリクス (オートフィルタで変更あり/変更なしを即座に抽出可能)' -Subtitle $subInfo -EndCol 19
+
+        $colCmps = @($Comparison.AllColumnComparisons)
+        $mColC = New-Object 'object[,]' ([Math]::Max(1, $colCmps.Count)), 19
+        for ($i = 0; $i -lt $colCmps.Count; $i++) {
+            $c = $colCmps[$i]
+            $mColC[$i, 0]  = $i + 1
+            $mColC[$i, 1]  = $c.TableName
+            $mColC[$i, 2]  = $c.ColumnName
+            $mColC[$i, 3]  = $c.TableStatus
+            $mColC[$i, 4]  = $c.ColumnStatus
+            $mColC[$i, 5]  = $c.ContentHashStatus
+            $mColC[$i, 6]  = $c.TypeDisplay
+            $mColC[$i, 7]  = $c.DdlKeyDisplay
+            $mColC[$i, 8]  = [double]$c.NonNullDelta
+            $mColC[$i, 9]  = $c.NullChangeDisplay
+            $mColC[$i, 10] = $c.DistinctChangeDisplay
+            $mColC[$i, 11] = $c.ByteLenDisplay
+            $mColC[$i, 12] = $c.MinValDisplay
+            $mColC[$i, 13] = $c.MaxValDisplay
+            $mColC[$i, 14] = $c.Top1Display
+            $mColC[$i, 15] = $c.NumericSumDeltaDisplay
+            $mColC[$i, 16] = [double]$c.DiffCount
+            $mColC[$i, 17] = $c.ChangeSummary
+            $mColC[$i, 18] = $c.Severity
+        }
+        $colCmpEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsAllCols -StartRow 4 -StartCol 1 `
+            -Headers @('No', 'テーブル名', 'カラム名', 'テーブル判定', 'カラム判定', '内容ハッシュ', '推定データ型 (前→後)', 'DDL型 / キー・役割', '有効件数増減', 'NULL件数 (前→後)', 'ユニーク数 (前→後)', 'バイト長 (平均/最大)', '最小値/最古 (前→後)', '最大値/最新 (前→後)', '最頻値Top1 (前→後)', '数値合計増減', '差分件数', '変更内容サマリー / 無変更根拠', '重要度') `
+            -DataMatrix $mColC -RowCount $colCmps.Count `
+            -ColumnFormats @{ 1 = '#,##0'; 2 = '@'; 3 = '@'; 4 = '@'; 5 = '@'; 6 = '@'; 7 = '@'; 8 = '@'; 9 = '+#,##0;-#,##0;0'; 10 = '@'; 11 = '@'; 12 = '@'; 13 = '@'; 14 = '@'; 15 = '@'; 16 = '@'; 17 = '#,##0'; 18 = '@'; 19 = '@' } `
+            -CenterCols @(1, 4, 5, 6, 17, 19) -RightCols @(9, 16) -WrapCols @(7, 8, 12, 13, 14, 15, 18)
+
+        for ($i = 0; $i -lt $colCmps.Count; $i++) {
+            $rIdx = 5 + $i
+            $c = $colCmps[$i]
+            $cSt = $wsAllCols.Cells.Item($rIdx, 5)
+            if ($c.ColumnStatus -match '削除') {
+                $cSt.Font.Color = $warnOle; $cSt.Font.Bold = $true; $cSt.Interior.Color = $warnBgOle
+            }
+            elseif ($c.ColumnStatus -match '^追加') {
+                $cSt.Font.Color = $navyOle; $cSt.Font.Bold = $true; $cSt.Interior.Color = $subBgOle
+            }
+            elseif ($c.IsChanged) {
+                $cSt.Font.Color = $textOle; $cSt.Font.Bold = $true; $cSt.Interior.Color = $subBgOle
+            }
+            else {
+                $cSt.Font.Color = $mutedOle
+            }
+            if ($c.ContentHashStatus -eq '変化') {
+                $cH = $wsAllCols.Cells.Item($rIdx, 6); $cH.Font.Color = $navyOle; $cH.Font.Bold = $true
+            }
+            elseif ($c.ContentHashStatus -eq '一致') {
+                $wsAllCols.Cells.Item($rIdx, 6).Font.Color = $mutedOle
+            }
+            $cNn = $wsAllCols.Cells.Item($rIdx, 9)
+            if ($c.NonNullDelta -lt 0) { $cNn.Font.Color = $warnOle; $cNn.Font.Bold = $true }
+            elseif ($c.NonNullDelta -gt 0) { $cNn.Font.Color = $navyOle; $cNn.Font.Bold = $true }
+            else { $cNn.Font.Color = $mutedOle }
+
+            $cSev = $wsAllCols.Cells.Item($rIdx, 19)
+            if ($c.Severity -eq '警告' -or $c.Severity -eq '注意') {
+                $cSev.Font.Color = $warnOle; $cSev.Font.Bold = $true; $cSev.Interior.Color = $warnBgOle
+            }
+            else {
+                $cSev.Font.Color = $mutedOle
+            }
+        }
+        if ($colCmps.Count -gt 0) {
+            Write-ComparisonTotalRow -Sheet $wsAllCols -Row ($colCmpEnd + 1) `
+                -Values @('', '合計', ("計 {0} カラム" -f $Comparison.TotalUniqueColumnCount), '', ("変更 {0} 列 / 不変 {1} 列" -f $Comparison.ChangedColumnTotal, $Comparison.UnchangedColumnTotal), '', '', ("追加 {0} / 削除 {1} / DDL変更 {2}" -f $Comparison.AddedColumnTotal, $Comparison.RemovedColumnTotal, $Comparison.SchemaChangedColumnTotal), '', '', '', '', '', '', '', '', [double]$Comparison.AllColumnDiffs.Count, '全テーブルの全カラム照合集計', '') `
+                -ColumnFormats @{ 17 = '#,##0' } -CenterCols @(5, 17) -RightCols @()
+        }
+        Format-ExcelSheetCommon -Sheet $wsAllCols -FreezeRow 4 -AutoFilterRange "A4:S$colCmpEnd" -Landscape $true
+
+        # ======================================================================
+        #  SHEET 8: 08_性能・DB・時系列・品質変化 (Test-Significant Deep Diagnostics)
+        # ======================================================================
+        Write-CmpLog "シート作成中: 08_性能・DB・時系列・品質変化..." 93
+        Set-ColumnWidths -Sheet $wsPerfDb -Widths @(16, 24, 16, 16, 15, 15, 16, 18, 22, 34, 24)
+        Set-SheetTitleBanner -Sheet $wsPerfDb -Title 'テスト有意情報サマリー (性能警告推移・FK整合性・時系列増分・Aurora/MySQL負荷＆物理容量・JMeter適性)' -Subtitle $subInfo -EndCol 11
+
+        $pRow = 4
+        # Section 1: Warnings lifecycle
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text ("1. 性能リスク・警告の推移 (新規発生 {0} / 悪化 {1} / 解消 {2} / 継続 {3})" -f $Comparison.NewWarningCount, $Comparison.WorsenedWarningCount, $Comparison.ResolvedWarningCount, $Comparison.OngoingWarningCount)
+        $pRow++
+        $wCmps = @($Comparison.WarningComparisons)
+        $mW = New-Object 'object[,]' ([Math]::Max(1, $wCmps.Count)), 8
+        for ($i = 0; $i -lt $wCmps.Count; $i++) {
+            $w = $wCmps[$i]
+            $mW[$i, 0] = $w.Status
+            $mW[$i, 1] = $w.Severity
+            $mW[$i, 2] = $w.Category
+            $mW[$i, 3] = $w.TableName
+            $mW[$i, 4] = $w.ColumnName
+            $mW[$i, 5] = $w.BeforeMetric
+            $mW[$i, 6] = $w.AfterMetric
+            $mW[$i, 7] = if ([string]::IsNullOrEmpty($w.PerfImpact)) { $w.Recommendation } else { ("【影響】{0} / 【対策】{1}" -f $w.PerfImpact, $w.Recommendation) }
+        }
+        $wEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('変化状態', '重要度', 'カテゴリ', 'テーブル名', 'カラム名', '開始前指標', '開始後指標', '影響・推奨アクション') `
+            -DataMatrix $mW -RowCount $wCmps.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '@'; 4 = '@'; 5 = '@'; 6 = '@'; 7 = '@'; 8 = '@' } `
+            -CenterCols @(1, 2, 3) -WrapCols @(6, 7, 8)
+        for ($i = 0; $i -lt $wCmps.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            $wc = $wCmps[$i]
+            $c1 = $wsPerfDb.Cells.Item($rr, 1)
+            if ($wc.IsAlert) { $c1.Font.Color = $warnOle; $c1.Font.Bold = $true; $c1.Interior.Color = $warnBgOle }
+            elseif ($wc.Status -eq '解消' -or $wc.Status -eq '改善') { $c1.Font.Color = $navyOle; $c1.Font.Bold = $true; $c1.Interior.Color = $subBgOle }
+            else { $c1.Font.Color = $mutedOle }
+            if ($wc.Severity -eq '高' -and $wc.Status -ne '解消') {
+                $c2 = $wsPerfDb.Cells.Item($rr, 2); $c2.Font.Color = $warnOle; $c2.Font.Bold = $true; $c2.Interior.Color = $warnBgOle
+            }
+        }
+        $pRow = $wEnd + 2
+
+        # Section 2: Relationship & FK Integrity
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text ("2. テーブル間リレーション・FK参照整合性・1:Nファンアウト変化 (孤立行増減: {0}{1:#,##0}行)" -f $(if ($Comparison.OrphanRowDelta -gt 0) { '+' } else { '' }), $Comparison.OrphanRowDelta)
+        $pRow++
+        $rCmps = @($Comparison.RelationshipComparisons)
+        $mR = New-Object 'object[,]' ([Math]::Max(1, $rCmps.Count)), 10
+        for ($i = 0; $i -lt $rCmps.Count; $i++) {
+            $r = $rCmps[$i]
+            $mR[$i, 0] = $r.Status
+            $mR[$i, 1] = $r.RelationKey
+            $mR[$i, 2] = [double]$r.BeforeMatchRate
+            $mR[$i, 3] = [double]$r.AfterMatchRate
+            $mR[$i, 4] = [double]$r.BeforeOrphanRows
+            $mR[$i, 5] = [double]$r.AfterOrphanRows
+            $mR[$i, 6] = [double]$r.OrphanDelta
+            $mR[$i, 7] = ("{0:#,##0} → {1:#,##0}" -f $r.BeforeFanOutMax, $r.AfterFanOutMax)
+            $mR[$i, 8] = ("{0} → {1}" -f $r.BeforeRisk, $r.AfterRisk)
+            $mR[$i, 9] = $r.Note
+        }
+        $rEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('変化状態', 'リレーション (親.PK → 子.FK)', '開始前一致率', '開始後一致率', '開始前孤立行', '開始後孤立行', '孤立行増減', '最大ファンアウト(前→後)', 'リスク変化', '所見') `
+            -DataMatrix $mR -RowCount $rCmps.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '0.0%'; 4 = '0.0%'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '@'; 9 = '@'; 10 = '@' } `
+            -CenterCols @(1, 8, 9) -RightCols @(3, 4, 5, 6, 7) -WrapCols @(2, 9, 10)
+        for ($i = 0; $i -lt $rCmps.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            $rc = $rCmps[$i]
+            if ($rc.HasAlert) {
+                $c1 = $wsPerfDb.Cells.Item($rr, 1); $c1.Font.Color = $warnOle; $c1.Font.Bold = $true; $c1.Interior.Color = $warnBgOle
+            }
+            if ($rc.OrphanDelta -gt 0) {
+                $c7 = $wsPerfDb.Cells.Item($rr, 7); $c7.Font.Color = $warnOle; $c7.Font.Bold = $true; $c7.Interior.Color = $warnBgOle
+            }
+            elseif ($rc.OrphanDelta -lt 0) {
+                $c7 = $wsPerfDb.Cells.Item($rr, 7); $c7.Font.Color = $navyOle; $c7.Font.Bold = $true
+            }
+        }
+        $pRow = $rEnd + 2
+
+        # Section 3: Time-Series Activity Deltas
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text '3. テスト期間中の時系列アクティビティ増分 (月別・日別・時間帯別の件数推移)'
+        $pRow++
+        $tsCmps = @($Comparison.TimeSeriesDeltas | Select-Object -First 80)
+        $mTs = New-Object 'object[,]' ([Math]::Max(1, $tsCmps.Count)), 7
+        for ($i = 0; $i -lt $tsCmps.Count; $i++) {
+            $ts = $tsCmps[$i]
+            $mTs[$i, 0] = $ts.Granularity
+            $mTs[$i, 1] = $ts.TableColumn
+            $mTs[$i, 2] = $ts.PeriodLabel
+            $mTs[$i, 3] = [double]$ts.BeforeCount
+            $mTs[$i, 4] = [double]$ts.AfterCount
+            $mTs[$i, 5] = [double]$ts.DeltaCount
+            $mTs[$i, 6] = if ($ts.HasGrowthRate) { [double]$ts.GrowthRate } else { '新規' }
+        }
+        $tsEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('粒度', '対象テーブル.日時カラム', '期間・時間帯', '開始前件数', '開始後件数', '増減件数', '増減率') `
+            -DataMatrix $mTs -RowCount $tsCmps.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '@'; 4 = '#,##0'; 5 = '#,##0'; 6 = '+#,##0;-#,##0;0'; 7 = '+0.0%;-0.0%;0.0%' } `
+            -CenterCols @(1, 3) -RightCols @(4, 5, 6, 7)
+        for ($i = 0; $i -lt $tsCmps.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            $c6 = $wsPerfDb.Cells.Item($rr, 6)
+            if ($tsCmps[$i].DeltaCount -gt 0) { $c6.Font.Color = $navyOle; $c6.Font.Bold = $true }
+            elseif ($tsCmps[$i].DeltaCount -lt 0) { $c6.Font.Color = $warnOle; $c6.Font.Bold = $true }
+        }
+        $pRow = $tsEnd + 2
+
+        # Section 4A: DirectDB Physical InnoDB Sizes & AUTO_INCREMENT
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text '4A. Aurora / MySQL 実物理容量 (Data/Index/断片化) ＆ AUTO_INCREMENT 推移 (DB直接分析時)'
+        $pRow++
+        $physTbls = @($Comparison.AllTables | Where-Object { $_.HasDbPhysicalMeta })
+        $mPh = New-Object 'object[,]' ([Math]::Max(1, $physTbls.Count)), 11
+        for ($i = 0; $i -lt $physTbls.Count; $i++) {
+            $t = $physTbls[$i]
+            $aiDeltaTxt = if (-not $t.HasAutoIncrement) { '-' } elseif ($t.AutoIncrementGap -gt 0) { ("+{0:#,##0} (ギャップ {1:#,##0}件)" -f $t.AutoIncrementDelta, $t.AutoIncrementGap) } else { ("{0}{1:#,##0}" -f $(if ($t.AutoIncrementDelta -gt 0) { '+' } else { '' }), $t.AutoIncrementDelta) }
+            $mPh[$i, 0]  = $t.TableName
+            $mPh[$i, 1]  = [double]$t.BeforeDataLengthKB
+            $mPh[$i, 2]  = [double]$t.AfterDataLengthKB
+            $mPh[$i, 3]  = [double]$t.DataLengthDeltaKB
+            $mPh[$i, 4]  = [double]$t.BeforeIndexLengthKB
+            $mPh[$i, 5]  = [double]$t.AfterIndexLengthKB
+            $mPh[$i, 6]  = [double]$t.IndexLengthDeltaKB
+            $mPh[$i, 7]  = [double]$t.DataFreeDeltaKB
+            $mPh[$i, 8]  = if ($t.HasAutoIncrement) { [double]$t.BeforeAutoIncrement } else { '-' }
+            $mPh[$i, 9]  = if ($t.HasAutoIncrement) { [double]$t.AfterAutoIncrement } else { '-' }
+            $mPh[$i, 10] = $aiDeltaTxt
+        }
+        $phEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('テーブル名', '実Data前(KB)', '実Data後(KB)', 'Data増減(KB)', '実Index前(KB)', '実Index後(KB)', 'Index増減(KB)', '断片化空き増減(KB)', 'AI開始前', 'AI開始後', 'AUTO_INCREMENT増減/ギャップ') `
+            -DataMatrix $mPh -RowCount $physTbls.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '#,##0.0'; 3 = '#,##0.0'; 4 = '+#,##0.0;-#,##0.0;0.0'; 5 = '#,##0.0'; 6 = '#,##0.0'; 7 = '+#,##0.0;-#,##0.0;0.0'; 8 = '+#,##0.0;-#,##0.0;0.0'; 9 = '#,##0'; 10 = '#,##0'; 11 = '@' } `
+            -CenterCols @(11) -RightCols @(2, 3, 4, 5, 6, 7, 8, 9, 10) -WrapCols @(11)
+        for ($i = 0; $i -lt $physTbls.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            if ($physTbls[$i].AutoIncrementGap -gt 0) {
+                $c11 = $wsPerfDb.Cells.Item($rr, 11); $c11.Font.Color = $warnOle; $c11.Font.Bold = $true; $c11.Interior.Color = $warnBgOle
+            }
+        }
+        $pRow = $phEnd + 2
+
+        # Section 4B: MySQL Server Workload (SHOW GLOBAL STATUS Before vs After)
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text '4B. Aurora / MySQL サーバー負荷統計差分 (SHOW GLOBAL STATUS テスト前後比較)'
+        $pRow++
+        $srvItems = @($Comparison.ServerMetricComparisons)
+        $mSrv = New-Object 'object[,]' ([Math]::Max(1, $srvItems.Count)), 8
+        for ($i = 0; $i -lt $srvItems.Count; $i++) {
+            $sm = $srvItems[$i]
+            $mSrv[$i, 0] = $sm.Category
+            $mSrv[$i, 1] = $sm.MetricName
+            $mSrv[$i, 2] = $sm.DisplayBefore
+            $mSrv[$i, 3] = $sm.DisplayAfter
+            $mSrv[$i, 4] = $sm.DisplayDelta
+            $mSrv[$i, 5] = $sm.RatePerSecDisplay
+            $mSrv[$i, 6] = $sm.Severity
+            $mSrv[$i, 7] = $sm.Note
+        }
+        $srvEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('カテゴリ', 'サーバー指標', '開始前', '開始後', 'テスト期間増分', '平均レート(/秒)', '判定', '性能試験上の意味・所見') `
+            -DataMatrix $mSrv -RowCount $srvItems.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '@'; 4 = '@'; 5 = '@'; 6 = '@'; 7 = '@'; 8 = '@' } `
+            -CenterCols @(1, 7) -RightCols @(3, 4, 5, 6) -WrapCols @(8)
+        for ($i = 0; $i -lt $srvItems.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            if ($srvItems[$i].Severity -eq '警告' -or $srvItems[$i].Severity -eq '注意') {
+                $c7 = $wsPerfDb.Cells.Item($rr, 7); $c7.Font.Color = $warnOle; $c7.Font.Bold = $true; $c7.Interior.Color = $warnBgOle
+            }
+        }
+        $pRow = $srvEnd + 2
+
+        # Section 4C: DDL / Index / Declared FK Schema Diffs
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text '4C. DDLスキーマ・インデックス・外部キー制約 変更一覧 (DB直接分析時)'
+        $pRow++
+        $schItems = @($Comparison.DbSchemaDiffs)
+        $mSch = New-Object 'object[,]' ([Math]::Max(1, $schItems.Count)), 8
+        for ($i = 0; $i -lt $schItems.Count; $i++) {
+            $sd = $schItems[$i]
+            $mSch[$i, 0] = $sd.TableName
+            $mSch[$i, 1] = $sd.ObjectType
+            $mSch[$i, 2] = $sd.ObjectName
+            $mSch[$i, 3] = $sd.ChangeType
+            $mSch[$i, 4] = $sd.BeforeDef
+            $mSch[$i, 5] = $sd.AfterDef
+            $mSch[$i, 6] = $sd.Severity
+            $mSch[$i, 7] = $sd.Note
+        }
+        $schEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('テーブル名', '種別', '対象名', '変更区分', '開始前定義', '開始後定義', '重要度', '備考') `
+            -DataMatrix $mSch -RowCount $schItems.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '@'; 4 = '@'; 5 = '@'; 6 = '@'; 7 = '@'; 8 = '@' } `
+            -CenterCols @(2, 4, 7) -WrapCols @(5, 6, 8)
+        for ($i = 0; $i -lt $schItems.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            if ($schItems[$i].Severity -eq '警告' -or $schItems[$i].Severity -eq '注意') {
+                $c7 = $wsPerfDb.Cells.Item($rr, 7); $c7.Font.Color = $warnOle; $c7.Font.Bold = $true; $c7.Interior.Color = $warnBgOle
+            }
+        }
+        $pRow = $schEnd + 2
+
+        # Section 5: JMeter Readiness Changes
+        Set-SectionHeader -Sheet $wsPerfDb -Row $pRow -StartCol 1 -EndCol 11 -Text '5. JMeter 並列適性・一意キー候補の変化'
+        $pRow++
+        $jmItems = @($Comparison.JMeterComparisons)
+        $mJmC = New-Object 'object[,]' ([Math]::Max(1, $jmItems.Count)), 8
+        for ($i = 0; $i -lt $jmItems.Count; $i++) {
+            $jm = $jmItems[$i]
+            $mJmC[$i, 0] = $jm.Status
+            $mJmC[$i, 1] = $jm.TableName
+            $mJmC[$i, 2] = $jm.KeyColumn
+            $mJmC[$i, 3] = $jm.DataType
+            $mJmC[$i, 4] = [double]$jm.BeforeUnique
+            $mJmC[$i, 5] = [double]$jm.AfterUnique
+            $mJmC[$i, 6] = [double]$jm.UniqueDelta
+            $mJmC[$i, 7] = ("{0} → {1}" -f $jm.BeforeSuitability, $jm.AfterSuitability)
+        }
+        $jmEnd = Write-StyledTable -CheckCancellation $checkReport -Sheet $wsPerfDb -StartRow $pRow -StartCol 1 `
+            -Headers @('変化状態', 'テーブル名', 'キーカラム', 'データ型', '開始前キー数', '開始後キー数', 'キー数増減', 'JMeter並列適性 (前→後)') `
+            -DataMatrix $mJmC -RowCount $jmItems.Count `
+            -ColumnFormats @{ 1 = '@'; 2 = '@'; 3 = '@'; 4 = '@'; 5 = '#,##0'; 6 = '#,##0'; 7 = '+#,##0;-#,##0;0'; 8 = '@' } `
+            -CenterCols @(1, 4) -RightCols @(5, 6, 7) -WrapCols @(8)
+        for ($i = 0; $i -lt $jmItems.Count; $i++) {
+            $rr = $pRow + 1 + $i
+            if ($jmItems[$i].HasAlert) {
+                $c1 = $wsPerfDb.Cells.Item($rr, 1); $c1.Font.Color = $warnOle; $c1.Font.Bold = $true; $c1.Interior.Color = $warnBgOle
+            }
+            if ($jmItems[$i].UniqueDelta -lt 0) {
+                $c7 = $wsPerfDb.Cells.Item($rr, 7); $c7.Font.Color = $warnOle; $c7.Font.Bold = $true
+            }
+            elseif ($jmItems[$i].UniqueDelta -gt 0) {
+                $c7 = $wsPerfDb.Cells.Item($rr, 7); $c7.Font.Color = $navyOle; $c7.Font.Bold = $true
+            }
+        }
+        Format-ExcelSheetCommon -Sheet $wsPerfDb -FreezeRow 0 -Landscape $true
 
         $wsSummary.Activate()
         $excel.Calculation = -4105 # xlCalculationAutomatic
@@ -10663,7 +15107,7 @@ function Export-ComparisonToOpenXml {
                             if ($isZeroSummaryBucket) { $st = if ($isZebra) { 30 } else { 29 } }
                             elseif ($sv -match '(削除|減少)') { $st = 26 }
                             elseif ($sv -match '(追加|新規)') { $st = 27 }
-                            elseif ($sv -match '更新') { $st = 28 }
+                            elseif ($sv -match '更新|変更あり') { $st = 28 }
                             elseif ($sv -match '変更なし') { $st = if ($isZebra) { 30 } else { 29 } }
                         }
                         elseif ($col1 -eq $AlertCol -and (Test-WarningCellText -Text $sv)) {
@@ -10718,21 +15162,154 @@ function Export-ComparisonToOpenXml {
         return $sb.ToString()
     }
 
+    function Build-CmpMultiSectionSheetXml {
+        param(
+            [string]$Title,
+            [string]$Subtitle,
+            [double[]]$ColWidths,
+            [object[]]$Sections
+        )
+        $endL = ColLetterCmp $ColWidths.Count
+        $sb = New-Object System.Text.StringBuilder 32768
+        $merges = New-Object System.Collections.Generic.List[string]
+        [void]$sb.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+        [void]$sb.Append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">')
+        [void]$sb.Append('<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>')
+        [void]$sb.Append('<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>')
+        [void]$sb.Append('<sheetFormatPr defaultRowHeight="22"/>')
+        [void]$sb.Append('<cols>')
+        for ($i = 0; $i -lt $ColWidths.Count; $i++) {
+            [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<col min="{0}" max="{0}" width="{1}" customWidth="1"/>', ($i + 1), $ColWidths[$i])
+        }
+        [void]$sb.Append('</cols><sheetData>')
+
+        [void]$sb.Append('<row r="1" ht="32" customHeight="1">')
+        [void]$sb.AppendFormat('<c r="A1" t="inlineStr" s="1"><is><t>{0}</t></is></c>', (XmlEscCmp $Title))
+        for ($c = 1; $c -lt $ColWidths.Count; $c++) { [void]$sb.AppendFormat('<c r="{0}1" s="1"/>', (ColLetterCmp ($c + 1))) }
+        [void]$sb.Append('</row>')
+        $merges.Add("A1:${endL}1")
+
+        [void]$sb.Append('<row r="2" ht="22" customHeight="1">')
+        [void]$sb.AppendFormat('<c r="A2" t="inlineStr" s="2"><is><t>{0}</t></is></c>', (XmlEscCmp $Subtitle))
+        for ($c = 1; $c -lt $ColWidths.Count; $c++) { [void]$sb.AppendFormat('<c r="{0}2" s="2"/>', (ColLetterCmp ($c + 1))) }
+        [void]$sb.Append('</row>')
+        $merges.Add("A2:${endL}2")
+        [void]$sb.Append('<row r="3" ht="10" customHeight="1"/>')
+
+        $rNum = 4
+        foreach ($sec in $Sections) {
+            # Section banner row
+            [void]$sb.AppendFormat('<row r="{0}" ht="25" customHeight="1">', $rNum)
+            [void]$sb.AppendFormat('<c r="A{0}" t="inlineStr" s="49"><is><t>{1}</t></is></c>', $rNum, (XmlEscCmp $sec.Title))
+            for ($c = 1; $c -lt $ColWidths.Count; $c++) { [void]$sb.AppendFormat('<c r="{0}{1}" s="49"/>', (ColLetterCmp ($c + 1)), $rNum) }
+            [void]$sb.Append('</row>')
+            $merges.Add("A${rNum}:${endL}${rNum}")
+            $rNum++
+
+            $hdrs = @($sec.Headers)
+            $rows = @($sec.Rows)
+            $numSt = if ($sec.ContainsKey('NumStyles')) { $sec.NumStyles } else { @{} }
+            $cCols = @(if ($sec.ContainsKey('CenterCols')) { $sec.CenterCols })
+            $wCols = @(if ($sec.ContainsKey('WrapCols')) { $sec.WrapCols })
+            $sdCols = @(if ($sec.ContainsKey('SignedCols')) { $sec.SignedCols })
+            $invCols = @(if ($sec.ContainsKey('InvertSignedCols')) { $sec.InvertSignedCols })
+            $stCol = if ($sec.ContainsKey('StatusCol')) { [int]$sec.StatusCol } else { 0 }
+            $alCol = if ($sec.ContainsKey('AlertCol')) { [int]$sec.AlertCol } else { 0 }
+
+            [void]$sb.AppendFormat('<row r="{0}" ht="26" customHeight="1">', $rNum)
+            for ($c = 0; $c -lt $hdrs.Count; $c++) {
+                [void]$sb.AppendFormat('<c r="{0}{1}" t="inlineStr" s="3"><is><t>{2}</t></is></c>', (ColLetterCmp ($c + 1)), $rNum, (XmlEscCmp $hdrs[$c]))
+            }
+            [void]$sb.Append('</row>')
+            $rNum++
+
+            if ($rows.Count -eq 0) {
+                $sEndL = ColLetterCmp $hdrs.Count
+                [void]$sb.AppendFormat('<row r="{0}" ht="22" customHeight="1">', $rNum)
+                [void]$sb.AppendFormat('<c r="A{0}" t="inlineStr" s="29"><is><t>該当データなし</t></is></c>', $rNum)
+                for ($c = 1; $c -lt $hdrs.Count; $c++) { [void]$sb.AppendFormat('<c r="{0}{1}" s="29"/>', (ColLetterCmp ($c + 1)), $rNum) }
+                [void]$sb.Append('</row>')
+                $merges.Add("A${rNum}:${sEndL}${rNum}")
+                $rNum += 2
+                continue
+            }
+
+            for ($r = 0; $r -lt $rows.Count; $r++) {
+                $rowVals = $rows[$r]
+                $isZebra = (($r % 2) -eq 1)
+                $ht = 22.0
+                if ($wCols.Count -gt 0) {
+                    $wt = @(); $ww = @()
+                    foreach ($wc in $wCols) {
+                        $wt += [string]$rowVals[$wc - 1]
+                        $ww += if (($wc - 1) -lt $ColWidths.Count) { [double]$ColWidths[$wc - 1] } else { 24.0 }
+                    }
+                    $ht = Get-EstimatedRowHeight -Texts $wt -ColWidths $ww -MinHeight 22.0 -MaxHeight 95.0
+                }
+                [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<row r="{0}" ht="{1:0.#}" customHeight="1">', $rNum, $ht)
+                for ($c = 0; $c -lt $hdrs.Count; $c++) {
+                    $col1 = $c + 1; $ref = (ColLetterCmp $col1) + $rNum; $v = $rowVals[$c]
+                    if ($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) {
+                        $dv = [double]$v
+                        $baseSt = if ($numSt.ContainsKey($col1)) { [int]$numSt[$col1] } else { 6 }
+                        $st = if ($isZebra) { $baseSt + 1 } else { $baseSt }
+                        if ($sdCols -contains $col1) {
+                            $isNegWarn = if ($invCols -contains $col1) { ($dv -gt 1e-9) } else { ($dv -lt -1e-9) }
+                            if ($isNegWarn) {
+                                if ($baseSt -eq 14) { $st = 31 } elseif ($baseSt -eq 16) { $st = 32 } elseif ($baseSt -eq 18) { $st = 33 }
+                            } elseif ([Math]::Abs($dv) -le 1e-9) {
+                                if ($baseSt -eq 14) { $st = if ($isZebra) { 7 } else { 6 } } elseif ($baseSt -eq 16) { $st = if ($isZebra) { 9 } else { 8 } } elseif ($baseSt -eq 18) { $st = if ($isZebra) { 13 } else { 12 } }
+                            }
+                        }
+                        [void]$sb.AppendFormat([System.Globalization.CultureInfo]::InvariantCulture, '<c r="{0}" s="{1}"><v>{2}</v></c>', $ref, $st, $v)
+                    }
+                    else {
+                        $sv = [string]$v
+                        $st = if ($wCols -contains $col1) { if ($isZebra) { 23 } else { 22 } } elseif ($cCols -contains $col1) { if ($isZebra) { 25 } else { 24 } } else { if ($isZebra) { 5 } else { 4 } }
+                        if ($col1 -eq $stCol) {
+                            if ($sv -match '(新規発生|悪化|消失|削除|減少|要注意)') { $st = 26 }
+                            elseif ($sv -match '(解消|改善|新規|増加)') { $st = 27 }
+                            elseif ($sv -match '変化なし|継続|所見') { $st = if ($isZebra) { 30 } else { 29 } }
+                        }
+                        elseif ($col1 -eq $alCol -and ($sv -eq '警告' -or $sv -eq '注意' -or $sv -eq '高' -or $sv -match 'ギャップ')) {
+                            if ($sv -ne '高' -or $stCol -le 0 -or ([string]$rowVals[$stCol - 1]) -ne '解消') {
+                                $st = if ($cCols -contains $col1) { 26 } else { 46 }
+                            }
+                        }
+                        [void]$sb.AppendFormat('<c r="{0}" t="inlineStr" s="{1}"><is><t>{2}</t></is></c>', $ref, $st, (XmlEscCmp $sv))
+                    }
+                }
+                [void]$sb.Append('</row>')
+                $rNum++
+            }
+            $rNum++
+        }
+
+        [void]$sb.Append('</sheetData>')
+        [void]$sb.AppendFormat('<mergeCells count="{0}">', $merges.Count)
+        foreach ($mg in $merges) { [void]$sb.AppendFormat('<mergeCell ref="{0}"/>', $mg) }
+        [void]$sb.Append('</mergeCells>')
+        [void]$sb.Append('<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/>')
+        [void]$sb.Append('<pageSetup orientation="landscape" fitToWidth="1" fitToHeight="0"/>')
+        [void]$sb.Append('</worksheet>')
+        return $sb.ToString()
+    }
+
     $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
     $stagingPath = New-AnalysisStagingPath $OutputPath
-    if ($null -ne $LogCallback) { & $LogCallback '比較Excelレポート生成中 (OpenXML)' 45 }
+    if ($null -ne $LogCallback) { & $LogCallback '比較Excelレポート生成中 (OpenXML / 8シート)' 45 }
 
-    $subInfo = "比較日時: {0} | 開始前: {1} | 開始後: {2}" -f $Comparison.ComparedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Comparison.BeforeFileName, $Comparison.AfterFileName
+    $subInfo = "比較日時: {0} | 開始前: {1} | 開始後: {2} | 照合: {3}" -f $Comparison.ComparedAt.ToString('yyyy/MM/dd HH:mm:ss'), $Comparison.BeforeFileName, $Comparison.AfterFileName, $Comparison.PrecisionLabel
 
     # Sheet 1 rows (Summary breakdown)
     $bucketDefs = @(
         @{ Status = '追加（新規テーブル）'; Desc = 'テスト開始前になく、開始後に新規追加されたテーブル' },
         @{ Status = '追加（レコード増加）'; Desc = '既存テーブルでレコード数が増加 (INSERT等)' },
-        @{ Status = '追加・更新';           Desc = 'レコード増加＋既存値/スキーマ更新を検出 (更新・追加両シートに掲載)' },
-        @{ Status = '更新（データ更新）';   Desc = 'レコード数変動なしでカラム統計・分布・数値・日時・サイズに変化 (UPDATE等)' },
+        @{ Status = '追加・更新';           Desc = 'レコード増加＋既存値/削除/スキーマ更新を検出 (更新・追加両シートに掲載)' },
+        @{ Status = '更新（データ更新）';   Desc = 'レコード数変動なしで値ハッシュ・統計・分布・数値・日時・サイズに変化 (UPDATE等)' },
         @{ Status = '更新（レコード減少）'; Desc = '既存テーブルでレコード数が減少 (DELETE/パージ等・要注意)' },
         @{ Status = '削除（テーブル消失）'; Desc = 'テスト開始前に存在したが開始後に未検出 (要注意)' },
-        @{ Status = '変更なし';             Desc = 'レコード数・サイズ・全カラム統計・分布・数値・日時統計すべて変化なし' }
+        @{ Status = '変更なし';             Desc = 'レコード数・サイズ・全カラム統計・分布・数値・日時統計・内容ハッシュすべて完全一致' }
     )
     $totTbl = [Math]::Max(1, $Comparison.TotalUniqueTableCount)
     $s1Rows = @()
@@ -10744,7 +15321,7 @@ function Export-ComparisonToOpenXml {
         $flag = if ($stName -match '(削除|減少)' -and $matched.Count -gt 0) { '要注意' } elseif ($stName -eq '変更なし') { '変化なし' } elseif ($matched.Count -gt 0) { '変更検出' } else { '-' }
         $s1Rows += , @($stName, [double]$matched.Count, [double]($matched.Count / $totTbl), [double]$bR, [double]$aR, [double]$dR, [Math]::Round($dS, 2), [Math]::Round($dI, 1), [double]$dc, $flag, $bd.Desc)
     }
-    $s1Total = @('合計', [double]$Comparison.TotalUniqueTableCount, 1.0, [double]$Comparison.BeforeTotalRows, [double]$Comparison.AfterTotalRows, [double]$Comparison.TotalRowDelta, [double]$Comparison.TotalSizeDeltaKB, [double]$Comparison.TotalInnoDbDeltaKB, [double]$Comparison.AllColumnDiffs.Count, '', '全比較対象テーブル合計')
+    $s1Total = @('合計', [double]$Comparison.TotalUniqueTableCount, 1.0, [double]$Comparison.BeforeTotalRows, [double]$Comparison.AfterTotalRows, [double]$Comparison.TotalRowDelta, [double]$Comparison.TotalSizeDeltaKB, [double]$Comparison.TotalInnoDbDeltaKB, [double]$Comparison.AllColumnDiffs.Count, '', ("全{0}列 (変更{1}/不変{2}) | {3}" -f $Comparison.TotalUniqueColumnCount, $Comparison.ChangedColumnTotal, $Comparison.UnchangedColumnTotal, $Comparison.PrecisionLabel))
 
     # Sheet 2 rows (All tables)
     $s2Rows = @()
@@ -10752,17 +15329,22 @@ function Export-ComparisonToOpenXml {
     foreach ($t in $Comparison.AllTables) {
         $rk++
         $gr = if ($t.HasRowGrowthRate) { [double]$t.RowGrowthRate } elseif ($t.AfterRows -gt 0 -and $t.BeforeRows -eq 0) { '新規' } else { '-' }
-        $s2Rows += , @($rk, $t.TableName, $t.PrimaryStatus, $t.InferredRole, [double]$t.BeforeRows, [double]$t.AfterRows, [double]$t.RowDelta, $gr, [double]$t.BeforeCols, [double]$t.AfterCols, [double]$t.ColDelta, [double]$t.BeforeSizeKB, [double]$t.AfterSizeKB, [double]$t.SizeDeltaKB, [double]$t.BeforeInnoDbKB, [double]$t.AfterInnoDbKB, [double]$t.InnoDbDeltaKB, [double]$t.ChangedColumnCount, $t.DiffSummary, $t.AlertNote)
+        $vel = if ($t.HasVelocity) { [Math]::Round($t.RowsPerMinute, 1) } else { '-' }
+        $chTxt = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
+        $s2Rows += , @($rk, $t.TableName, $t.PrimaryStatus, $t.InferredRole, [double]$t.BeforeRows, [double]$t.AfterRows, [double]$t.RowDelta, $gr, $vel, $chTxt, [double]$t.BeforeCols, [double]$t.AfterCols, [double]$t.ColDelta, [double]$t.ChangedColumnCount, [double]$t.UnchangedColumnCount, $t.ContentHashStatus, [double]$t.BeforeSizeKB, [double]$t.AfterSizeKB, [double]$t.SizeDeltaKB, [double]$t.BeforeInnoDbKB, [double]$t.AfterInnoDbKB, [double]$t.InnoDbDeltaKB, $t.DiffSummary, $t.AlertNote)
     }
     $totGr = if ($Comparison.HasTotalRowGrowthRate) { [double]$Comparison.TotalRowGrowthRate } else { '-' }
-    $s2Total = @('', '合計', ("計 {0} テーブル" -f $Comparison.AllTables.Count), '', [double]$Comparison.BeforeTotalRows, [double]$Comparison.AfterTotalRows, [double]$Comparison.TotalRowDelta, $totGr, '', '', '', [Math]::Round($Comparison.BeforeTotalSizeKB, 2), [Math]::Round($Comparison.AfterTotalSizeKB, 2), [double]$Comparison.TotalSizeDeltaKB, [Math]::Round($Comparison.BeforeTotalInnoDbKB, 1), [Math]::Round($Comparison.AfterTotalInnoDbKB, 1), [double]$Comparison.TotalInnoDbDeltaKB, '', '', '')
+    $totVel = if ($Comparison.HasElapsedTime) { [Math]::Round($Comparison.TotalRowsPerMinute, 1) } else { '-' }
+    $totChurn = if ($Comparison.HasAnyRowChurn) { ("+{0:#,##0} / 更新{1:#,##0} / -{2:#,##0}" -f $Comparison.TotalInsertedRows, $Comparison.TotalUpdatedRows, $Comparison.TotalDeletedRows) } else { '-' }
+    $s2Total = @('', '合計', ("計 {0} テーブル" -f $Comparison.AllTables.Count), '', [double]$Comparison.BeforeTotalRows, [double]$Comparison.AfterTotalRows, [double]$Comparison.TotalRowDelta, $totGr, $totVel, $totChurn, '', '', '', [double]$Comparison.ChangedColumnTotal, [double]$Comparison.UnchangedColumnTotal, '', [Math]::Round($Comparison.BeforeTotalSizeKB, 2), [Math]::Round($Comparison.AfterTotalSizeKB, 2), [double]$Comparison.TotalSizeDeltaKB, [Math]::Round($Comparison.BeforeTotalInnoDbKB, 1), [Math]::Round($Comparison.AfterTotalInnoDbKB, 1), [double]$Comparison.TotalInnoDbDeltaKB, '', '')
 
     # Sheet 3 rows (Updated tables + deleted warning entries if any)
     $s3Rows = @()
     $rk = 0
     foreach ($t in @($Comparison.UpdatedTables) + @($Comparison.DeletedTables)) {
         $rk++
-        $s3Rows += , @($rk, $t.TableName, $t.PrimaryStatus, $t.InferredRole, [double]$t.BeforeRows, [double]$t.AfterRows, [double]$t.RowDelta, [double]$t.BeforeAvgRowBytes, [double]$t.AfterAvgRowBytes, [double]$t.AvgRowBytesDelta, [double]$t.BeforeSizeKB, [double]$t.AfterSizeKB, [double]$t.SizeDeltaKB, [double]$t.ChangedColumnCount, $t.ChangedColumnsSummary, $t.DiffSummary, $t.AlertNote)
+        $chTxt = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
+        $s3Rows += , @($rk, $t.TableName, $t.PrimaryStatus, $t.InferredRole, [double]$t.BeforeRows, [double]$t.AfterRows, [double]$t.RowDelta, $chTxt, $t.ContentHashStatus, [double]$t.BeforeAvgRowBytes, [double]$t.AfterAvgRowBytes, [double]$t.AvgRowBytesDelta, [double]$t.SizeDeltaKB, [double]$t.ChangedColumnCount, $t.ChangedColumnsSummary, $t.UnchangedColumnsSummary, $t.DiffSummary, $t.AlertNote)
     }
 
     # Sheet 4 rows (Added tables)
@@ -10771,19 +15353,22 @@ function Export-ComparisonToOpenXml {
     foreach ($t in $Comparison.AddedTables) {
         $rk++; $addB += $t.BeforeRows; $addA += $t.AfterRows; $addD += $t.RowDelta; $addSd += $t.SizeDeltaKB; $addId += $t.InnoDbDeltaKB
         $gr = if ($t.HasRowGrowthRate) { [double]$t.RowGrowthRate } elseif ($t.AfterRows -gt 0 -and $t.BeforeRows -eq 0) { '新規' } else { '-' }
-        $s4Rows += , @($rk, $t.TableName, $t.AddedType, $t.InferredRole, [double]$t.BeforeRows, [double]$t.AfterRows, [double]$t.RowDelta, $gr, [double]$t.AfterCols, [double]$t.BeforeSizeKB, [double]$t.AfterSizeKB, [double]$t.SizeDeltaKB, [double]$t.InnoDbDeltaKB, $(if ($t.CandidatePks) { $t.CandidatePks } else { '-' }), $t.DiffSummary, $t.AlertNote)
+        $vel = if ($t.HasVelocity) { [Math]::Round($t.RowsPerMinute, 1) } else { '-' }
+        $chTxt = if ($t.HasRowChurn) { $t.ChurnSummary } else { '-' }
+        $s4Rows += , @($rk, $t.TableName, $t.AddedType, $t.InferredRole, [double]$t.BeforeRows, [double]$t.AfterRows, [double]$t.RowDelta, $gr, $vel, $chTxt, [double]$t.AfterCols, [double]$t.BeforeSizeKB, [double]$t.AfterSizeKB, [double]$t.SizeDeltaKB, [double]$t.InnoDbDeltaKB, $(if ($t.CandidatePks) { $t.CandidatePks } else { '-' }), $t.DiffSummary, $t.AlertNote)
     }
     $addTotGr = if ($addB -gt 0) { [double]($addD / $addB) } else { '-' }
-    $s4Total = @('', '合計', ("計 {0} テーブル" -f $Comparison.AddedTables.Count), '', [double]$addB, [double]$addA, [double]$addD, $addTotGr, '', '', '', [Math]::Round($addSd, 2), [Math]::Round($addId, 1), '', '', '')
+    $s4Total = @('', '合計', ("計 {0} テーブル" -f $Comparison.AddedTables.Count), '', [double]$addB, [double]$addA, [double]$addD, $addTotGr, '', '', '', '', '', [Math]::Round($addSd, 2), [Math]::Round($addId, 1), '', '', '')
 
     # Sheet 5 rows (Unchanged tables)
     $s5Rows = @()
     $rk = 0; $uncR = 0L; $uncS = 0.0; $uncI = 0.0
     foreach ($t in $Comparison.UnchangedTables) {
         $rk++; $uncR += $t.AfterRows; $uncS += $t.AfterSizeKB; $uncI += $t.AfterInnoDbKB
-        $s5Rows += , @($rk, $t.TableName, $t.PrimaryStatus, $t.InferredRole, [double]$t.AfterRows, [double]$t.AfterCols, [double]$t.AfterSizeKB, [double]$t.AfterInnoDbKB, [double]$t.AfterAvgRowBytes, [double]$t.AfterAvgNullRate, $(if ($t.CandidatePks) { $t.CandidatePks } else { '-' }), $(if ($t.DateColumns) { $t.DateColumns } else { '-' }), $t.AfterWarning)
+        $basis = if ($t.ContentHashStatus -eq '一致') { 'ハッシュ完全一致' } else { '全統計一致' }
+        $s5Rows += , @($rk, $t.TableName, $t.PrimaryStatus, $t.InferredRole, $basis, [double]$t.AfterRows, [double]$t.AfterCols, [double]$t.AfterSizeKB, [double]$t.AfterInnoDbKB, [double]$t.AfterAvgRowBytes, [double]$t.AfterAvgNullRate, $(if ($t.CandidatePks) { $t.CandidatePks } else { '-' }), $(if ($t.DateColumns) { $t.DateColumns } else { '-' }), $t.AfterWarning)
     }
-    $s5Total = @('', '合計', ("計 {0} テーブル" -f $Comparison.UnchangedTables.Count), '', [double]$uncR, '', [Math]::Round($uncS, 2), [Math]::Round($uncI, 1), '', '', '', '', '')
+    $s5Total = @('', '合計', ("計 {0} テーブル" -f $Comparison.UnchangedTables.Count), '', '', [double]$uncR, '', [Math]::Round($uncS, 2), [Math]::Round($uncI, 1), '', '', '', '', '')
 
     # Sheet 6 rows (Column/Stat diff details)
     $s6Rows = @()
@@ -10791,18 +15376,80 @@ function Export-ComparisonToOpenXml {
         $s6Rows += , @($d.TableName, $d.ColumnName, $d.Category, $d.MetricName, $d.BeforeValue, $d.AfterValue, $d.DeltaSummary, $d.Severity)
     }
 
+    # Sheet 7 rows (Complete Changed & Unchanged Column Comparison Matrix)
+    $s7Rows = @()
+    $rk = 0
+    foreach ($c in $Comparison.AllColumnComparisons) {
+        $rk++
+        $s7Rows += , @($rk, $c.TableName, $c.ColumnName, $c.TableStatus, $c.ColumnStatus, $c.ContentHashStatus, $c.TypeDisplay, $c.DdlKeyDisplay, [double]$c.NonNullDelta, $c.NullChangeDisplay, $c.DistinctChangeDisplay, $c.ByteLenDisplay, $c.MinValDisplay, $c.MaxValDisplay, $c.Top1Display, $c.NumericSumDeltaDisplay, [double]$c.DiffCount, $c.ChangeSummary, $c.Severity)
+    }
+    $s7Total = @('', '合計', ("計 {0} カラム" -f $Comparison.TotalUniqueColumnCount), '', ("変更 {0} 列 / 不変 {1} 列" -f $Comparison.ChangedColumnTotal, $Comparison.UnchangedColumnTotal), '', '', ("追加 {0} / 削除 {1} / DDL変更 {2}" -f $Comparison.AddedColumnTotal, $Comparison.RemovedColumnTotal, $Comparison.SchemaChangedColumnTotal), '', '', '', '', '', '', '', '', [double]$Comparison.AllColumnDiffs.Count, '全テーブルの全カラム照合集計', '')
+
+    # Sheet 8 sections (Warnings, Relationships, Time-Series, DB Physical/Server/DDL, JMeter, Insights)
+    $s8WarnRows = @()
+    foreach ($w in $Comparison.WarningComparisons) {
+        $act = if ([string]::IsNullOrEmpty($w.PerfImpact)) { $w.Recommendation } else { ("【影響】{0} / 【対策】{1}" -f $w.PerfImpact, $w.Recommendation) }
+        $s8WarnRows += , @($w.Status, $w.Severity, $w.Category, $w.TableName, $w.ColumnName, $w.BeforeMetric, $w.AfterMetric, $act)
+    }
+    $s8RelRows = @()
+    foreach ($r in $Comparison.RelationshipComparisons) {
+        $s8RelRows += , @($r.Status, $r.RelationKey, [double]$r.BeforeMatchRate, [double]$r.AfterMatchRate, [double]$r.BeforeOrphanRows, [double]$r.AfterOrphanRows, [double]$r.OrphanDelta, ("{0:#,##0} → {1:#,##0}" -f $r.BeforeFanOutMax, $r.AfterFanOutMax), ("{0} → {1}" -f $r.BeforeRisk, $r.AfterRisk), $r.Note)
+    }
+    $s8TsRows = @()
+    foreach ($ts in ($Comparison.TimeSeriesDeltas | Select-Object -First 80)) {
+        $gr = if ($ts.HasGrowthRate) { [double]$ts.GrowthRate } else { '新規' }
+        $s8TsRows += , @($ts.Granularity, $ts.TableColumn, $ts.PeriodLabel, [double]$ts.BeforeCount, [double]$ts.AfterCount, [double]$ts.DeltaCount, $gr)
+    }
+    $s8PhysRows = @()
+    foreach ($t in ($Comparison.AllTables | Where-Object { $_.HasDbPhysicalMeta })) {
+        $aiD = if (-not $t.HasAutoIncrement) { '-' } elseif ($t.AutoIncrementGap -gt 0) { ("+{0:#,##0} (ギャップ {1:#,##0}件)" -f $t.AutoIncrementDelta, $t.AutoIncrementGap) } else { ("{0}{1:#,##0}" -f $(if ($t.AutoIncrementDelta -gt 0) { '+' } else { '' }), $t.AutoIncrementDelta) }
+        $s8PhysRows += , @($t.TableName, [double]$t.BeforeDataLengthKB, [double]$t.AfterDataLengthKB, [double]$t.DataLengthDeltaKB, [double]$t.BeforeIndexLengthKB, [double]$t.AfterIndexLengthKB, [double]$t.IndexLengthDeltaKB, [double]$t.DataFreeDeltaKB, $(if ($t.HasAutoIncrement) { [double]$t.BeforeAutoIncrement } else { '-' }), $(if ($t.HasAutoIncrement) { [double]$t.AfterAutoIncrement } else { '-' }), $aiD)
+    }
+    $s8SrvRows = @()
+    foreach ($sm in $Comparison.ServerMetricComparisons) {
+        $s8SrvRows += , @($sm.Category, $sm.MetricName, $sm.DisplayBefore, $sm.DisplayAfter, $sm.DisplayDelta, $sm.RatePerSecDisplay, $sm.Severity, $sm.Note)
+    }
+    $s8SchRows = @()
+    foreach ($sd in $Comparison.DbSchemaDiffs) {
+        $s8SchRows += , @($sd.TableName, $sd.ObjectType, $sd.ObjectName, $sd.ChangeType, $sd.BeforeDef, $sd.AfterDef, $sd.Severity, $sd.Note)
+    }
+    $s8JmRows = @()
+    foreach ($jm in $Comparison.JMeterComparisons) {
+        $s8JmRows += , @($jm.Status, $jm.TableName, $jm.KeyColumn, $jm.DataType, [double]$jm.BeforeUnique, [double]$jm.AfterUnique, [double]$jm.UniqueDelta, ("{0} → {1}" -f $jm.BeforeSuitability, $jm.AfterSuitability))
+    }
+    $s8InsRows = @()
+    $insIdx = 0
+    foreach ($ins in $Comparison.Insights) {
+        $insIdx++
+        $s8InsRows += , @($insIdx, $(if ($ins -match '要注意') { '要注意' } else { '所見' }), $ins)
+    }
+
+    $s8Sections = @(
+        @{ Title = ("1. 性能リスク・警告の推移 (新規 {0} / 悪化 {1} / 解消 {2} / 継続 {3})" -f $Comparison.NewWarningCount, $Comparison.WorsenedWarningCount, $Comparison.ResolvedWarningCount, $Comparison.OngoingWarningCount); Headers = @('変化状態','重要度','カテゴリ','テーブル名','カラム名','開始前指標','開始後指標','影響・推奨アクション'); Rows = $s8WarnRows; CenterCols = @(1,2,3); WrapCols = @(6,7,8); StatusCol = 1; AlertCol = 2 },
+        @{ Title = ("2. テーブル間リレーション・FK整合性・ファンアウト変化 (孤立行増減: {0}{1:#,##0}行)" -f $(if ($Comparison.OrphanRowDelta -gt 0) { '+' } else { '' }), $Comparison.OrphanRowDelta); Headers = @('変化状態','リレーション (親.PK → 子.FK)','開始前一致率','開始後一致率','開始前孤立行','開始後孤立行','孤立行増減','最大ファンアウト(前→後)','リスク変化','所見'); Rows = $s8RelRows; NumStyles = @{3=10;4=10;5=6;6=6;7=14}; SignedCols = @(7); InvertSignedCols = @(7); CenterCols = @(1,8,9); WrapCols = @(2,9,10); StatusCol = 1 },
+        @{ Title = '3. テスト期間中の時系列アクティビティ増分 (月別・日別・時間帯別)'; Headers = @('粒度','対象テーブル.日時カラム','期間・時間帯','開始前件数','開始後件数','増減件数','増減率'); Rows = $s8TsRows; NumStyles = @{4=6;5=6;6=14;7=20}; SignedCols = @(6); CenterCols = @(1,3) },
+        @{ Title = '4A. Aurora / MySQL 実物理容量・断片化・AUTO_INCREMENT 推移 (DB直接分析時)'; Headers = @('テーブル名','実Data前(KB)','実Data後(KB)','Data増減(KB)','実Index前(KB)','実Index後(KB)','Index増減(KB)','断片化空き増減(KB)','AI開始前','AI開始後','AUTO_INCREMENT増減/ギャップ'); Rows = $s8PhysRows; NumStyles = @{2=12;3=12;4=18;5=12;6=12;7=18;8=18;9=6;10=6}; SignedCols = @(4,7,8); CenterCols = @(11); WrapCols = @(11); AlertCol = 11 },
+        @{ Title = '4B. Aurora / MySQL サーバー負荷統計差分 (SHOW GLOBAL STATUS)'; Headers = @('カテゴリ','サーバー指標','開始前','開始後','テスト期間増分','平均レート(/秒)','判定','性能試験上の意味・所見'); Rows = $s8SrvRows; CenterCols = @(1,7); WrapCols = @(8); AlertCol = 7 },
+        @{ Title = '4C. DDLスキーマ・インデックス・外部キー制約 変更一覧 (DB直接分析時)'; Headers = @('テーブル名','種別','対象名','変更区分','開始前定義','開始後定義','重要度','備考'); Rows = $s8SchRows; CenterCols = @(2,4,7); WrapCols = @(5,6,8); AlertCol = 7 },
+        @{ Title = '5. JMeter 並列適性・一意キー候補の変化'; Headers = @('変化状態','テーブル名','キーカラム','データ型','開始前キー数','開始後キー数','キー数増減','JMeter並列適性 (前→後)'); Rows = $s8JmRows; NumStyles = @{5=6;6=6;7=14}; SignedCols = @(7); CenterCols = @(1,4); WrapCols = @(8); StatusCol = 1 },
+        @{ Title = '6. テスト前後比較 総合所見・チェックポイント'; Headers = @('No','区分','総合所見'); Rows = $s8InsRows; NumStyles = @{1=6}; CenterCols = @(1,2); WrapCols = @(3); StatusCol = 2 }
+    )
+
     $sheetNames = @(
         '01_比較サマリー', '02_全テーブル比較一覧', '03_更新のあったテーブル',
-        '04_追加のあったテーブル', '05_変更のなかったテーブル', '06_カラム・統計差分詳細'
+        '04_追加のあったテーブル', '05_変更のなかったテーブル', '06_カラム・統計差分詳細',
+        '07_全カラム比較一覧', '08_性能・DB・時系列・品質変化'
     )
 
     $sheetXmls = @(
-        (Build-CmpSheetXml -Title '性能試験 テスト開始前・開始後 分析ファイル比較レポート — 比較サマリー' -Subtitle $subInfo -Headers @('判定区分','テーブル数','構成比','開始前レコード数','開始後レコード数','レコード増減','CSV増減(KB)','InnoDB増減(KB)','検出差分項目数','状態','判定基準・説明') -Rows $s1Rows -ColWidths @(22,12,10,15,15,14,13,15,14,10,46) -NumColStyles @{2=6;3=10;4=6;5=6;6=14;7=16;8=18;9=6} -StatusCol 1 -AlertCol 10 -SignedDeltaCols @(6,7,8) -CenterCols @(1,10) -WrapCols @(11) -TotalRowValues $s1Total -TotalColStyles @{2=35;3=41;4=35;5=35;6=36;7=38;8=40;9=35} -IncludeChartDrawing $true),
-        (Build-CmpSheetXml -Title '全テーブル テスト開始前・開始後 比較一覧' -Subtitle $subInfo -Headers @('No','テーブル名','判定区分','推定役割','開始前レコード数','開始後レコード数','レコード増減','増減率','開始前列数','開始後列数','列数増減','開始前CSV(KB)','開始後CSV(KB)','CSV増減(KB)','開始前InnoDB(KB)','開始後InnoDB(KB)','InnoDB増減(KB)','変化列数','主な変更内容・所見','警告・注意点') -Rows $s2Rows -ColWidths @(5,22,20,16,13,13,12,10,9,9,9,12,12,12,13,13,13,9,38,28) -NumColStyles @{1=6;5=6;6=6;7=14;8=20;9=6;10=6;11=14;12=8;13=8;14=16;15=12;16=12;17=18;18=6} -StatusCol 3 -AlertCol 20 -SignedDeltaCols @(7,11,14,17) -CenterCols @(1,3,4,9,10,11,18) -WrapCols @(19,20) -TotalRowValues $s2Total -TotalColStyles @{5=35;6=35;7=36;8=47;12=37;13=37;14=38;15=39;16=39;17=40}),
-        (Build-CmpSheetXml -Title '更新のあったテーブル一覧 (既存データ更新・レコード減少・追加＋更新併用)' -Subtitle $subInfo -Headers @('No','テーブル名','判定区分','推定役割','開始前レコード数','開始後レコード数','レコード増減','開始前平均行長(B)','開始後平均行長(B)','平均行長増減(B)','開始前CSV(KB)','開始後CSV(KB)','CSV増減(KB)','変化列数','変更検出カラム','具体的な変更内容','警告・注意点') -Rows $s3Rows -ColWidths @(5,22,20,16,13,13,12,13,13,12,12,12,12,9,24,38,28) -NumColStyles @{1=6;5=6;6=6;7=14;8=12;9=12;10=18;11=8;12=8;13=16;14=6} -StatusCol 3 -AlertCol 17 -SignedDeltaCols @(7,10,13) -CenterCols @(1,3,4,14) -WrapCols @(15,16,17)),
-        (Build-CmpSheetXml -Title '追加のあったテーブル一覧 (新規テーブル追加 ＆ レコード増加テーブル)' -Subtitle $subInfo -Headers @('No','テーブル名','追加種別','推定役割','開始前レコード数','開始後レコード数','追加レコード数','増加率','列数','開始前CSV(KB)','開始後CSV(KB)','CSV増加(KB)','InnoDB増加(KB)','PK/UK候補','変更サマリー','警告・注意点') -Rows $s4Rows -ColWidths @(5,22,18,16,13,13,13,10,7,12,12,12,13,18,38,28) -NumColStyles @{1=6;5=6;6=6;7=14;8=20;9=6;10=8;11=8;12=16;13=18} -StatusCol 3 -AlertCol 16 -SignedDeltaCols @(7,12,13) -CenterCols @(1,3,4,9) -WrapCols @(15,16) -TotalRowValues $s4Total -TotalColStyles @{5=35;6=35;7=36;8=47;12=38;13=40}),
-        (Build-CmpSheetXml -Title '変更のなかったテーブル一覧 (開始前後で件数・サイズ・統計完全一致)' -Subtitle $subInfo -Headers @('No','テーブル名','判定区分','推定役割','レコード数','列数','CSVサイズ(KB)','推定InnoDB(KB)','平均行長(B)','平均NULL率','PK/UK候補','日時カラム','既存警告・注意点') -Rows $s5Rows -ColWidths @(5,24,14,16,13,8,14,15,12,11,20,20,30) -NumColStyles @{1=6;5=6;6=6;7=8;8=12;9=12;10=10} -StatusCol 3 -AlertCol 13 -CenterCols @(1,3,4,6) -WrapCols @(11,12,13) -TotalRowValues $s5Total -TotalColStyles @{5=35;7=37;8=39}),
-        (Build-CmpSheetXml -Title 'カラム・分布・数値・日時 統計差分詳細一覧' -Subtitle $subInfo -Headers @('テーブル名','カラム名','差分カテゴリ','指標名','テスト開始前','テスト開始後','差分・変化内容','重要度') -Rows $s6Rows -ColWidths @(22,20,16,22,24,24,24,10) -AlertCol 8 -CenterCols @(3,8) -WrapCols @(5,6,7))
+        (Build-CmpSheetXml -Title '性能試験 テスト開始前・開始後 分析ファイル比較レポート — 比較サマリー' -Subtitle $subInfo -Headers @('判定区分','テーブル数','構成比','開始前レコード数','開始後レコード数','レコード増減','CSV増減(KB)','InnoDB増減(KB)','検出差分項目数','状態','判定基準・説明') -Rows $s1Rows -ColWidths @(22,12,10,15,15,14,13,15,14,10,48) -NumColStyles @{2=6;3=10;4=6;5=6;6=14;7=16;8=18;9=6} -StatusCol 1 -AlertCol 10 -SignedDeltaCols @(6,7,8) -CenterCols @(1,10) -WrapCols @(11) -TotalRowValues $s1Total -TotalColStyles @{2=35;3=41;4=35;5=35;6=36;7=38;8=40;9=35} -IncludeChartDrawing $true),
+        (Build-CmpSheetXml -Title '全テーブル テスト開始前・開始後 比較一覧' -Subtitle $subInfo -Headers @('No','テーブル名','判定区分','推定役割','開始前レコード数','開始後レコード数','レコード増減','増減率','増減速度(件/分)','行変動内訳 (挿入/更新/削除)','開始前列数','開始後列数','列数増減','変更列数','不変列数','内容ハッシュ','開始前CSV(KB)','開始後CSV(KB)','CSV増減(KB)','開始前InnoDB(KB)','開始後InnoDB(KB)','InnoDB増減(KB)','主な変更内容・所見','警告・注意点') -Rows $s2Rows -ColWidths @(5,22,20,15,13,13,12,10,11,26,9,9,9,9,9,12,12,12,12,13,13,13,38,28) -NumColStyles @{1=6;5=6;6=6;7=14;8=20;9=18;11=6;12=6;13=14;14=6;15=6;17=8;18=8;19=16;20=12;21=12;22=18} -StatusCol 3 -AlertCol 24 -SignedDeltaCols @(7,9,13,19,22) -CenterCols @(1,3,4,11,12,13,14,15,16) -WrapCols @(10,23,24) -TotalRowValues $s2Total -TotalColStyles @{5=35;6=35;7=36;8=47;9=40;14=35;15=35;17=37;18=37;19=38;20=39;21=39;22=40}),
+        (Build-CmpSheetXml -Title '更新のあったテーブル一覧 (既存データ更新・レコード減少・追加＋更新併用)' -Subtitle $subInfo -Headers @('No','テーブル名','判定区分','推定役割','開始前レコード数','開始後レコード数','レコード増減','行変動内訳 (挿入/更新/削除)','内容ハッシュ','開始前平均行長(B)','開始後平均行長(B)','平均行長増減(B)','CSV増減(KB)','変化列数','変更検出カラム','変更なしカラム','具体的な変更内容','警告・注意点') -Rows $s3Rows -ColWidths @(5,22,20,15,13,13,12,24,11,13,13,12,12,9,24,24,38,28) -NumColStyles @{1=6;5=6;6=6;7=14;10=12;11=12;12=18;13=16;14=6} -StatusCol 3 -AlertCol 18 -SignedDeltaCols @(7,12,13) -CenterCols @(1,3,4,9,14) -WrapCols @(8,15,16,17,18)),
+        (Build-CmpSheetXml -Title '追加のあったテーブル一覧 (新規テーブル追加 ＆ レコード増加テーブル)' -Subtitle $subInfo -Headers @('No','テーブル名','追加種別','推定役割','開始前レコード数','開始後レコード数','追加レコード数','増加率','増加速度(件/分)','行変動内訳','列数','開始前CSV(KB)','開始後CSV(KB)','CSV増加(KB)','InnoDB増加(KB)','PK/UK候補','変更サマリー','警告・注意点') -Rows $s4Rows -ColWidths @(5,22,18,15,13,13,13,10,11,24,7,12,12,12,13,18,36,26) -NumColStyles @{1=6;5=6;6=6;7=14;8=20;9=18;11=6;12=8;13=8;14=16;15=18} -StatusCol 3 -AlertCol 18 -SignedDeltaCols @(7,9,14,15) -CenterCols @(1,3,4,11) -WrapCols @(10,17,18) -TotalRowValues $s4Total -TotalColStyles @{5=35;6=35;7=36;8=47;14=38;15=40}),
+        (Build-CmpSheetXml -Title '変更のなかったテーブル一覧 (開始前後で件数・サイズ・統計・値ハッシュ完全一致)' -Subtitle $subInfo -Headers @('No','テーブル名','判定区分','推定役割','照合根拠','レコード数','列数','CSVサイズ(KB)','推定InnoDB(KB)','平均行長(B)','平均NULL率','PK/UK候補','日時カラム','既存警告・注意点') -Rows $s5Rows -ColWidths @(5,24,14,15,16,13,8,14,15,12,11,20,20,30) -NumColStyles @{1=6;6=6;7=6;8=8;9=12;10=12;11=10} -StatusCol 3 -AlertCol 14 -CenterCols @(1,3,4,5,7) -WrapCols @(12,13,14) -TotalRowValues $s5Total -TotalColStyles @{6=35;8=37;9=39}),
+        (Build-CmpSheetXml -Title 'カラム・分布・数値・日時・DDL・ハッシュ 統計差分詳細一覧' -Subtitle $subInfo -Headers @('テーブル名','カラム名','差分カテゴリ','指標名','テスト開始前','テスト開始後','差分・変化内容','重要度') -Rows $s6Rows -ColWidths @(22,20,16,24,24,24,28,10) -AlertCol 8 -CenterCols @(3,8) -WrapCols @(5,6,7)),
+        (Build-CmpSheetXml -Title '全カラム 変更あり・変更なし 比較マトリクス' -Subtitle $subInfo -Headers @('No','テーブル名','カラム名','テーブル判定','カラム判定','内容ハッシュ','推定データ型 (前→後)','DDL型 / キー・役割','有効件数増減','NULL件数 (前→後)','ユニーク数 (前→後)','バイト長 (平均/最大)','最小値/最古 (前→後)','最大値/最新 (前→後)','最頻値Top1 (前→後)','数値合計増減','差分件数','変更内容サマリー / 無変更根拠','重要度') -Rows $s7Rows -ColWidths @(5,20,20,18,22,12,20,22,12,18,18,22,20,20,22,14,9,36,10) -NumColStyles @{1=6;9=14;17=6} -StatusCol 5 -AlertCol 19 -SignedDeltaCols @(9) -CenterCols @(1,4,5,6,17,19) -WrapCols @(7,8,12,13,14,15,18) -TotalRowValues $s7Total -TotalColStyles @{17=35}),
+        (Build-CmpMultiSectionSheetXml -Title 'テスト有意情報サマリー (性能警告推移・FK整合性・時系列増分・Aurora/MySQL負荷＆物理容量・JMeter適性)' -Subtitle $subInfo -ColWidths @(16,24,16,16,15,15,16,18,22,34,24) -Sections $s8Sections)
     )
 
     $stylesXml = @'
@@ -10868,7 +15515,7 @@ function Export-ComparisonToOpenXml {
     </border>
   </borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="49">
+  <cellXfs count="50">
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
     <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf>
     <xf numFmtId="0" fontId="2" fillId="3" borderId="3" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf>
@@ -10918,6 +15565,7 @@ function Export-ComparisonToOpenXml {
     <xf numFmtId="0" fontId="4" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>
     <xf numFmtId="169" fontId="5" fillId="6" borderId="2" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
     <xf numFmtId="169" fontId="4" fillId="6" borderId="2" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+    <xf numFmtId="0" fontId="5" fillId="3" borderId="3" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" indent="1"/></xf>
   </cellXfs>
   <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>
@@ -11062,9 +15710,11 @@ function Invoke-AnalyzerPipeline {
         Log "分析ファイル読込・比較開始: 開始前=$BeforeAnalysisPath / 開始後=$AfterAnalysisPath" 15
         $cmpHandle = [AuroraAnalyzer.BackgroundTaskLauncher]::StartCompareWorkbooks($BeforeAnalysisPath, $AfterAnalysisPath, $CancelState)
         $comparison = Wait-BackgroundTask -Handle $cmpHandle -LogCallback $LogCallback -PumpCallback $PumpCallback -CancelState $CancelState
-        Log ("比較解析完了: 全 {0} テーブル (更新あり {1} / 追加あり {2} / 変更なし {3} / 削除 {4} / 差分項目 {5} 件)" -f `
-            $comparison.TotalUniqueTableCount, $comparison.UpdatedSheetCount, $comparison.AddedSheetCount, `
-            $comparison.UnchangedTableCount, $comparison.DeletedTableCount, $comparison.AllColumnDiffs.Count) 40
+        Log ("比較解析完了 ({0}): 全 {1} テーブル (変更 {2} [更新 {3} / 追加 {4} / 削除 {5}] / 変更なし {6}) | 全 {7} カラム (変更 {8} / 変更なし {9}) | 差分項目 {10} 件" -f `
+            $comparison.PrecisionLabel, $comparison.TotalUniqueTableCount, $comparison.ChangedTableCount, `
+            $comparison.UpdatedSheetCount, $comparison.AddedSheetCount, $comparison.DeletedTableCount, `
+            $comparison.UnchangedTableCount, $comparison.TotalUniqueColumnCount, $comparison.ChangedColumnTotal, `
+            $comparison.UnchangedColumnTotal, $comparison.AllColumnDiffs.Count) 40
 
         if ($null -ne $CancelState) { $CancelState.ThrowIfCancelled() }
         $usedEngine = Export-ComparisonReport -Comparison $comparison -OutputPath $ExcelOutputPath -Engine $Engine -LogCallback $LogCallback -CancelState $CancelState -PumpCallback $PumpCallback
@@ -11420,7 +16070,7 @@ function New-AnalyzerGuiForm {
     $gbCompare.Controls.Add($btnSwapFiles)
 
     $lblCmpInfo = New-Object System.Windows.Forms.Label
-    $lblCmpInfo.Text = "【出力される比較Excelレポート構成 (Meiryo UI / モノトーン基調・ミッドナイトネイビー・バーガンディ)】`r`n・01_比較サマリー: KPIカード、変更区分別サマリー、増減TOP15、グラフ、総合所見`r`n・02_全テーブル比較一覧: 全テーブルのテスト前後レコード数・列数・CSV/InnoDB容量・変更内容一覧`r`n・03_更新のあったテーブル: 既存レコード更新(件数不変)・レコード減少(要注意)・追加＋更新併用テーブル`r`n・04_追加のあったテーブル: 新規追加テーブル ＆ レコード増加テーブル（追加件数グラフ付き）`r`n・05_変更のなかったテーブル: テスト前後で件数・サイズ・全カラム統計に差分のないテーブル`r`n・06_カラム・統計差分詳細: スキーマ・カラム統計・カテゴリ分布・数値統計・日時統計の差分一覧"
+    $lblCmpInfo.Text = "【出力される比較Excelレポート構成 (8シート / CSV未出力のDB直接分析レポート完全対応・CustomXMLハッシュ照合)】`r`n・01_比較サマリー: 12種KPIカード(件数速度・行変動・警告・FK・DB状態)、変更区分サマリー、推移比較グラフ、総合所見`r`n・02_全テーブル比較一覧 / 03_更新 / 04_追加 / 05_変更なし: 増減率・増減速度・行変動内訳(挿入/更新/削除)・変更/不変列数・ハッシュ`r`n・06_カラム・統計差分詳細: ハッシュ・DDL・INDEX・FK・物理容量・AUTO_INCREMENT・数値合計/パーセンタイル・分布・日時差分`r`n・07_全カラム比較一覧: 全テーブルの全カラムを変更あり/変更なしで一覧化 (フィルタ抽出・値ハッシュ照合根拠付き)`r`n・08_性能・DB・時系列・品質変化: 警告推移、FK孤立行/ファンアウト、時間帯増分、MySQLサーバー負荷・物理InnoDB・JMeter適性"
     $lblCmpInfo.Font = $fontSmall; $lblCmpInfo.ForeColor = $cMuted
     $lblCmpInfo.BackColor = $cBg
     $lblCmpInfo.BorderStyle = 'FixedSingle'
@@ -12093,7 +16743,7 @@ function New-AnalyzerGuiForm {
             }
             elseif ($runMode -eq 'CompareAnalysis') {
                 $cmp = $res.Comparison
-                "テスト前後の分析ファイル比較レポートの出力が完了しました。`n`n出力ファイル: $($res.OutputPath)`n比較対象テーブル数: $($cmp.TotalUniqueTableCount) 件`n更新のあったテーブル: $($cmp.UpdatedSheetCount) 件 / 追加のあったテーブル: $($cmp.AddedSheetCount) 件 / 変更なし: $($cmp.UnchangedTableCount) 件`n削除・消失テーブル: $($cmp.DeletedTableCount) 件 / 総レコード増減: $(if ($cmp.TotalRowDelta -gt 0) { '+' } else { '' })$($cmp.TotalRowDelta.ToString('N0')) 件"
+                "テスト前後の分析ファイル比較レポートの出力が完了しました。`n`n出力ファイル: $($res.OutputPath)`n照合方式: $($cmp.PrecisionLabel)`n比較対象テーブル: $($cmp.TotalUniqueTableCount) 件 (変更 $($cmp.ChangedTableCount) [更新 $($cmp.UpdatedSheetCount) / 追加 $($cmp.AddedSheetCount) / 削除 $($cmp.DeletedTableCount)] / 変更なし $($cmp.UnchangedTableCount))`n比較対象カラム: $($cmp.TotalUniqueColumnCount) 列 (変更あり $($cmp.ChangedColumnTotal) 列 / 変更なし $($cmp.UnchangedColumnTotal) 列)`n総レコード増減: $(if ($cmp.TotalRowDelta -gt 0) { '+' } else { '' })$($cmp.TotalRowDelta.ToString('N0')) 件"
             }
             elseif ($runMode -eq 'DirectAnalyze') {
                 "DB直接接続による性能試験用データ分析レポートの出力が完了しました（CSV未出力）。`n`n出力ファイル: $($res.OutputPath)`n出力シート構成: $sheetModeLabel`n対象テーブル数: $($res.Analysis.TableCount) / 総レコード数: $($res.Analysis.TotalRows.ToString('N0')) 件`n検出警告: 高 $($res.Analysis.HighWarningCount) 件 / 合計 $($res.Analysis.TotalWarningCount) 件"
