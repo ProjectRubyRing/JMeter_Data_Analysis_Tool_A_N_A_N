@@ -1622,6 +1622,53 @@ namespace AuroraTestMock
     Assert-True ($edgeEmailCol.InferredType -eq 'メールアドレス') "Dotted email (taro.yamada@example.jp) inferred as メールアドレス (got: $($edgeEmailCol.InferredType))"
     Assert-True ($edgeDateCol.InferredType -eq '日時 (DateTime)') "Single-digit slash datetime (2026/1/5 9:05:00) inferred as 日時 (DateTime) (got: $($edgeDateCol.InferredType))"
 
+    # 9.1b Fast-path parser regressions: padded dates, slash-hour fallback, fractions, UTF-8 bytes, leading zeros, buffer-straddle CSV
+    $fastDir = Join-Path $workDir 'fastpath_csv'
+    New-Item -ItemType Directory -Path $fastDir -Force | Out-Null
+    $yama = [string]([char]0x5C71) + [char]0x7530
+    $fastUtf8 = New-Object System.Text.UTF8Encoding($true)
+    [System.IO.File]::WriteAllLines((Join-Path $fastDir 'fast.csv'), @(
+        'id,code,amount,created_at,label,note',
+        "1,007,2e1,2026-04-01 14:00:00,$yama,memo",
+        '2,00123,+15,2026/04/01 9:05:00,plain,',
+        '3,000,1.5,2026-04-01T14:00:00.123Z,plain,\N',
+        '4,00,-3,2026-04-01,plain,NULL',
+        '5,08,20,2026-04-01 14:00:00.5,plain,(null)'
+    ), $fastUtf8)
+    $widePath = Join-Path $fastDir 'wide.csv'
+    $wideFs = New-Object System.IO.FileStream($widePath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $wideWriter = New-Object System.IO.StreamWriter($wideFs, $fastUtf8)
+    $wideWriter.NewLine = "`r`n"
+    $wideWriter.WriteLine('id,blob,tail')
+    $wideChars = New-Object char[] 70010
+    for ($wi = 0; $wi -lt $wideChars.Length; $wi++) { $wideChars[$wi] = 'B' }
+    $wideChars[65523] = '"'
+    $wideChars[65524] = '"'
+    $wideChars[100] = ','
+    $wideChars[200] = "`n"
+    $wideWriter.Write('1,"')
+    $wideWriter.Write($wideChars, 0, $wideChars.Length)
+    $wideWriter.WriteLine('",tail')
+    $wideWriter.WriteLine('2,short,x')
+    $wideWriter.Dispose()
+    $fastAn = [AuroraAnalyzer.CsvAnalysisEngine]::AnalyzeFolder($fastDir)
+    $fastTbl = $fastAn.Tables | Where-Object { $_.TableName -eq 'fast' }
+    $wideTbl = $fastAn.Tables | Where-Object { $_.TableName -eq 'wide' }
+    $fastDate = $fastTbl.Columns | Where-Object { $_.ColumnName -eq 'created_at' }
+    $fastAmt = $fastTbl.Columns | Where-Object { $_.ColumnName -eq 'amount' }
+    $fastCode = $fastTbl.Columns | Where-Object { $_.ColumnName -eq 'code' }
+    $fastLabel = $fastTbl.Columns | Where-Object { $_.ColumnName -eq 'label' }
+    $fastNote = $fastTbl.Columns | Where-Object { $_.ColumnName -eq 'note' }
+    $wideBlob = $wideTbl.Columns | Where-Object { $_.ColumnName -eq 'blob' }
+    $fastMin = New-Object System.DateTime 2026, 4, 1, 0, 0, 0, ([System.DateTimeKind]::Utc)
+    $fastMax = (New-Object System.DateTime 2026, 4, 1, 14, 0, 0, ([System.DateTimeKind]::Utc)).AddTicks(5000000)
+    Assert-True ($fastTbl.RowCount -eq 5 -and $fastTbl.RaggedRowCount -eq 0 -and $fastTbl.RowMultisetHash -eq '4d46d6e4df74917cbc84dee93faa3a74e50ba34d3cb2f7f960aced09ce6a8edd') "Fast-path sample keeps row count and row-multiset hash"
+    Assert-True ($fastDate.InferredType -eq '日時 (DateTime)' -and $fastDate.PeakDay -eq '2026-04-01' -and $fastDate.PeakDayCount -eq 5 -and $fastDate.HourlyCounts[14] -eq 3 -and $fastDate.HourlyCounts[9] -eq 1 -and $fastDate.HasTimeComponent) "Padded, fractional, Z, and unpadded slash hours stay on 2026-04-01 with H14=3 and H9=1"
+    Assert-True ($fastDate.MinDate.Ticks -eq $fastMin.Ticks -and $fastDate.MaxDate.Ticks -eq $fastMax.Ticks -and $fastDate.MinDate.Kind -eq [DateTimeKind]::Utc) "Fast-path dates keep UTC kind and exact ticks for midnight and .5 seconds"
+    Assert-True ($fastAmt.IsNumeric -and [math]::Abs($fastAmt.NumSum - 53.5) -lt 0.0000001 -and -not $fastCode.IsNumeric -and $fastCode.InferredType -eq '文字列 (VARCHAR)') "2e1/+15/1.5 sum to 53.5 while leading-zero codes stay non-numeric"
+    Assert-True ($fastLabel.MaxByteLen -eq 6 -and $fastLabel.NonAsciiCount -eq 1 -and $fastNote.NullCount -eq 4) "UTF-8 byte length of 山田 is 6 and NULL tokens stay excluded from values"
+    Assert-True ($wideTbl.RowCount -eq 2 -and $wideTbl.ColumnCount -eq 3 -and $wideTbl.RaggedRowCount -eq 0 -and $wideBlob.MaxCharLen -eq 70009 -and $wideBlob.MultilineCount -eq 1 -and $wideTbl.RowMultisetHash -eq '6bae71939fdc7e1ecd2ab265bfe0b637af85a66ff7cd64d1174abdb3ba9f551c') "Quoted field straddling the 65536-char buffer keeps one record, an escaped quote, and the following column"
+
     # 9.2 Atomic comparison export preservation on cancel + relative OutputPath resolution
     $atomicTarget = Join-Path $workDir 'existing_compare.xlsx'
     [System.IO.File]::WriteAllText($atomicTarget, 'PREVIOUS_GOOD_CONTENT')

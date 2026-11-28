@@ -390,6 +390,42 @@ namespace AuroraAnalyzer
         }
     }
 
+    public static class XmlText
+    {
+        public static string Escape(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return value ?? "";
+            bool dirty = false;
+            for (int i = 0; i < value.Length; i++)
+            {
+                char ch = value[i];
+                if ((ch <= 0x1F && ch != 0x09 && ch != 0x0A && ch != 0x0D) ||
+                    ch == '&' || ch == '<' || ch == '>' || ch == '"' || ch == '\'')
+                {
+                    dirty = true;
+                    break;
+                }
+            }
+            if (!dirty) return value;
+            StringBuilder sb = new StringBuilder(value.Length + 16);
+            for (int i = 0; i < value.Length; i++)
+            {
+                char ch = value[i];
+                if (ch <= 0x1F && ch != 0x09 && ch != 0x0A && ch != 0x0D) continue;
+                switch (ch)
+                {
+                    case '&': sb.Append("&amp;"); break;
+                    case '<': sb.Append("&lt;"); break;
+                    case '>': sb.Append("&gt;"); break;
+                    case '"': sb.Append("&quot;"); break;
+                    case '\'': sb.Append("&apos;"); break;
+                    default: sb.Append(ch); break;
+                }
+            }
+            return sb.ToString();
+        }
+    }
+
     public sealed class ProcessOutputDrain
     {
         private readonly object _sync = new object();
@@ -468,6 +504,7 @@ namespace AuroraAnalyzer
         private TcpClient _tcp;
         private Stream _stream;
         private readonly byte[] _packetHeader = new byte[4];
+        private byte[] _bulkPacket = new byte[8192];
         private bool _isSsl;
         private byte _seqId;
         private string _serverVersion;
@@ -525,6 +562,9 @@ namespace AuroraAnalyzer
             if (cancelState != null) cancelState.ThrowIfCancelled();
 
             _tcp = new TcpClient();
+            _tcp.NoDelay = true;
+            _tcp.ReceiveBufferSize = 1024 * 1024;
+            _tcp.SendBufferSize = 262144;
             if (cancelState != null)
             {
                 _cancelReg = cancelState.RegisterAbort(delegate() { Abort(); });
@@ -746,7 +786,7 @@ namespace AuroraAnalyzer
             // 4. Process Authentication Loop (OK / AuthMoreData / AuthSwitchRequest / ERR)
             HandleAuthLoop(authPlugin, password ?? "", nonce);
             // Buffer complete command responses after the TLS/authentication handshake.
-            _stream = new BufferedStream(_stream, 65536);
+            _stream = new BufferedStream(_stream, 262144);
         }
 
         private bool ValidateServerCertificate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
@@ -1152,7 +1192,8 @@ namespace AuroraAnalyzer
                 CsvTableProfile profile = analysis == null ? null : new CsvTableProfile(csvFilePath,
                     writeUtf8Bom ? "UTF-8 (BOM)" : "UTF-8", cols.Select(c => c.Name).ToArray());
                 string[] values = profile == null ? null : new string[colCount];
-                using (StreamWriter sw = new StreamWriter(tempPartPath, false, enc, 65536))
+                using (FileStream csvOut = new FileStream(tempPartPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1048576, FileOptions.SequentialScan))
+                using (StreamWriter sw = new StreamWriter(csvOut, enc, 65536))
                 {
                     for (int c = 0; c < colCount; c++)
                     {
@@ -1165,10 +1206,10 @@ namespace AuroraAnalyzer
                     {
                         if (effCancel != null) effCancel.ThrowIfCancelled();
 
-                        byte[] rowPkt = ReadPacket();
-                        if (rowPkt.Length == 0) throw new InvalidDataException("Missing CSV row data.");
-                        if (rowPkt[0] == 0xFF) throw ParseErrorPacket(rowPkt);
-                        if (rowPkt[0] == 0xFE && rowPkt.Length < 9) break;
+                        int pktLen = ReadBulkPacket();
+                        if (pktLen <= 0) throw new InvalidDataException("Missing CSV row data.");
+                        if (_bulkPacket[0] == 0xFF) throw ParseErrorPacket(_bulkPacket, pktLen);
+                        if (_bulkPacket[0] == 0xFE && pktLen < 9) break;
 
                         if (maxRows > 0 && writtenRows >= maxRows)
                         {
@@ -1180,7 +1221,7 @@ namespace AuroraAnalyzer
                         for (int c = 0; c < colCount; c++)
                         {
                             if (c > 0) sw.Write(',');
-                            string value = ReadTextField(rowPkt, ref rp);
+                            string value = ReadTextField(_bulkPacket, pktLen, ref rp);
                             WriteCsvField(sw, value);
                             if (values != null) values[c] = value;
                         }
@@ -1269,10 +1310,10 @@ namespace AuroraAnalyzer
             {
                 if (effCancel != null) effCancel.ThrowIfCancelled();
 
-                byte[] rowPkt = ReadPacket();
-                if (rowPkt.Length == 0) throw new InvalidDataException("Missing analysis row data.");
-                if (rowPkt[0] == 0xFF) throw ParseErrorPacket(rowPkt);
-                if (rowPkt[0] == 0xFE && rowPkt.Length < 9) break;
+                int pktLen = ReadBulkPacket();
+                if (pktLen <= 0) throw new InvalidDataException("Missing analysis row data.");
+                if (_bulkPacket[0] == 0xFF) throw ParseErrorPacket(_bulkPacket, pktLen);
+                if (_bulkPacket[0] == 0xFE && pktLen < 9) break;
 
                 if (maxRows > 0 && rowCount >= maxRows)
                 {
@@ -1285,13 +1326,13 @@ namespace AuroraAnalyzer
                 int rp = 0;
                 for (int c = 0; c < colCount; c++)
                 {
-                    string val = ReadTextField(rowPkt, ref rp);
+                    string val = ReadTextField(_bulkPacket, pktLen, ref rp);
                     rowBuf[c] = val;
                     if (!string.IsNullOrEmpty(val))
                     {
                         // Binary columns can decode to replacement characters. Measure the
                         // text that the CSV writer actually produces, including escaping.
-                        int textBytes = Encoding.UTF8.GetByteCount(val);
+                        int textBytes = ContentHashHelper.Utf8ByteCount(val);
                         rawRowBytes += textBytes;
                         csvLineBytes += textBytes + CsvEscapeOverhead(val);
                     }
@@ -1311,16 +1352,40 @@ namespace AuroraAnalyzer
             return rowCount;
         }
 
-        private static string ReadTextField(byte[] packet, ref int offset)
+        private int ReadBulkPacket()
         {
-            if (offset >= packet.Length) throw new InvalidDataException("Missing MySQL row field.");
+            int total = 0;
+            while (true)
+            {
+                ReadExact(_packetHeader, 0, 4);
+                int len = _packetHeader[0] | (_packetHeader[1] << 8) | (_packetHeader[2] << 16);
+                _seqId = (byte)(_packetHeader[3] + 1);
+                int need = total + len;
+                if (need > _bulkPacket.Length)
+                {
+                    int cap = _bulkPacket.Length;
+                    while (cap < need) cap = cap < 1048576 ? cap * 2 : cap + 1048576;
+                    byte[] grown = new byte[cap];
+                    if (total > 0) Buffer.BlockCopy(_bulkPacket, 0, grown, 0, total);
+                    _bulkPacket = grown;
+                }
+                if (len > 0) ReadExact(_bulkPacket, total, len);
+                total += len;
+                if (len < 0xFFFFFF) return total;
+            }
+        }
+
+        private static string ReadTextField(byte[] packet, int packetLen, ref int offset)
+        {
+            if (offset >= packetLen) throw new InvalidDataException("Missing MySQL row field.");
             if (packet[offset] == 0xFB)
             {
                 offset++;
                 return null;
             }
             ulong len = ReadLenEncInt(packet, ref offset);
-            if (len > (ulong)(packet.Length - offset)) throw new InvalidDataException("Truncated MySQL row field.");
+            if (len > (ulong)(packetLen - offset)) throw new InvalidDataException("Truncated MySQL row field.");
+            if (len == 0) return "";
             string val = Encoding.UTF8.GetString(packet, offset, (int)len);
             offset += (int)len;
             return val;
@@ -1339,7 +1404,7 @@ namespace AuroraAnalyzer
 
         internal static long CalcCsvEncodedUtf8Length(string val)
         {
-            return Encoding.UTF8.GetByteCount(val) + CsvEscapeOverhead(val);
+            return ContentHashHelper.Utf8ByteCount(val) + CsvEscapeOverhead(val);
         }
 
         private static void WriteCsvField(StreamWriter writer, string val)
@@ -1469,20 +1534,25 @@ namespace AuroraAnalyzer
 
         private static Exception ParseErrorPacket(byte[] pkt)
         {
-            if (pkt.Length < 3) return new Exception("Unknown MySQL error.");
+            return ParseErrorPacket(pkt, pkt == null ? 0 : pkt.Length);
+        }
+
+        private static Exception ParseErrorPacket(byte[] pkt, int length)
+        {
+            if (pkt == null || length < 3) return new Exception("Unknown MySQL error.");
             int errCode = pkt[1] | (pkt[2] << 8);
             int p = 3;
             string sqlState = "";
-            if (p < pkt.Length && pkt[p] == (byte)'#')
+            if (p < length && pkt[p] == (byte)'#')
             {
                 p++;
-                if (p + 5 <= pkt.Length)
+                if (p + 5 <= length)
                 {
                     sqlState = Encoding.ASCII.GetString(pkt, p, 5);
                     p += 5;
                 }
             }
-            string msg = (p < pkt.Length) ? Encoding.UTF8.GetString(pkt, p, pkt.Length - p) : "";
+            string msg = (p < length) ? Encoding.UTF8.GetString(pkt, p, length - p) : "";
             return new Exception(string.Format("MySQL Error {0} ({1}): {2}", errCode, sqlState, msg));
         }
 
@@ -1726,51 +1796,132 @@ namespace AuroraAnalyzer
 
         internal static void HashString128(string s, out ulong h1, out ulong h2)
         {
+            int ignored;
+            HashString128Utf8(s, out h1, out h2, out ignored);
+        }
+
+        internal static int Utf8ByteCount(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            int bytes = 0;
+            bool fallback = false;
+            bool pair = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char ch = s[i];
+                if (pair)
+                {
+                    pair = false;
+                    if (!char.IsLowSurrogate(ch)) fallback = true;
+                    continue;
+                }
+                if (ch <= 0x7F) bytes++;
+                else if (ch <= 0x7FF) bytes += 2;
+                else if (char.IsHighSurrogate(ch))
+                {
+                    if (i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                    {
+                        bytes += 4;
+                        pair = true;
+                    }
+                    else fallback = true;
+                }
+                else if (char.IsLowSurrogate(ch)) fallback = true;
+                else bytes += 3;
+                if (fallback) return Encoding.UTF8.GetByteCount(s);
+            }
+            return bytes;
+        }
+
+        // Hash matches the previous character walk, including the CRLF normalization.
+        // byteLen matches Encoding.UTF8.GetByteCount for the original text.
+        internal static void HashString128Utf8(string s, out ulong h1, out ulong h2, out int byteLen)
+        {
             unchecked
             {
                 ulong a = 0xCBF29CE484222325UL;
                 ulong b = 0x9E3779B97F4A7C15UL;
                 int len = s != null ? s.Length : 0;
                 int normLen = 0;
+                int bytes = 0;
+                bool fallback = false;
+                bool pair = false;
                 for (int i = 0; i < len; i++)
                 {
                     char ch = s[i];
-                    if (ch == '\r' && i + 1 < len && s[i + 1] == '\n') continue;
+                    if (ch == '\r' && i + 1 < len && s[i + 1] == '\n')
+                    {
+                        if (!fallback) bytes++;
+                        continue;
+                    }
                     a = (a ^ ch) * 0x100000001B3UL;
                     b = (b * 0x517CC1B727220A95UL) ^ ((ulong)ch + 0x9E3779B97F4A7C15UL);
                     normLen++;
+                    if (fallback) continue;
+                    if (pair)
+                    {
+                        pair = false;
+                        if (!char.IsLowSurrogate(ch)) fallback = true;
+                    }
+                    else if (ch <= 0x7F) bytes++;
+                    else if (ch <= 0x7FF) bytes += 2;
+                    else if (char.IsHighSurrogate(ch))
+                    {
+                        if (i + 1 < len && char.IsLowSurrogate(s[i + 1]))
+                        {
+                            bytes += 4;
+                            pair = true;
+                        }
+                        else fallback = true;
+                    }
+                    else if (char.IsLowSurrogate(ch)) fallback = true;
+                    else bytes += 3;
                 }
                 h1 = Mix64(a ^ ((ulong)normLen * 0x9E3779B185EBCA87UL));
                 h2 = Mix64(b ^ ((ulong)normLen * 0xC2B2AE3D27D4EB4FUL) ^ (h1 >> 17));
+                byteLen = fallback ? Encoding.UTF8.GetByteCount(s ?? "") : bytes;
+            }
+        }
+
+        internal static void BeginRowHash(int colCount, out ulong a, out ulong b)
+        {
+            unchecked
+            {
+                a = 0x84222325CBF29CE4UL ^ ((ulong)colCount * 0x9E3779B97F4A7C15UL);
+                b = 0x6A09E667F3BCC908UL ^ ((ulong)colCount * 0xBF58476D1CE4E5B9UL);
+            }
+        }
+
+        internal static void NullColumnHash(int index, out ulong h1, out ulong h2)
+        {
+            h1 = Mix64(0x1111111111111111UL ^ (ulong)(index + 1));
+            h2 = Mix64(0x2222222222222222UL ^ (ulong)(index + 1));
+        }
+
+        internal static void MixRowColumn(ref ulong a, ref ulong b, int index, ulong ch1, ulong ch2)
+        {
+            unchecked
+            {
+                a = Mix64(a ^ (ch1 + (ulong)(index + 1) * 0x9E3779B97F4A7C15UL));
+                b = Mix64(b ^ (ch2 + (ulong)(index + 1) * 0x517CC1B727220A95UL));
             }
         }
 
         internal static void ComputeRowHash128(IList<string> values, int colCount, out ulong h1, out ulong h2)
         {
-            unchecked
+            ulong a, b;
+            BeginRowHash(colCount, out a, out b);
+            int vCount = values != null ? values.Count : 0;
+            for (int i = 0; i < colCount; i++)
             {
-                ulong a = 0x84222325CBF29CE4UL ^ ((ulong)colCount * 0x9E3779B97F4A7C15UL);
-                ulong b = 0x6A09E667F3BCC908UL ^ ((ulong)colCount * 0xBF58476D1CE4E5B9UL);
-                int vCount = values != null ? values.Count : 0;
-                for (int i = 0; i < colCount; i++)
-                {
-                    string raw = i < vCount ? values[i] : null;
-                    ulong ch1, ch2;
-                    if (IsNullToken(raw))
-                    {
-                        ch1 = Mix64(0x1111111111111111UL ^ (ulong)(i + 1));
-                        ch2 = Mix64(0x2222222222222222UL ^ (ulong)(i + 1));
-                    }
-                    else
-                    {
-                        HashString128(raw, out ch1, out ch2);
-                    }
-                    a = Mix64(a ^ (ch1 + (ulong)(i + 1) * 0x9E3779B97F4A7C15UL));
-                    b = Mix64(b ^ (ch2 + (ulong)(i + 1) * 0x517CC1B727220A95UL));
-                }
-                h1 = a;
-                h2 = b;
+                string raw = i < vCount ? values[i] : null;
+                ulong ch1, ch2;
+                if (IsNullToken(raw)) NullColumnHash(i, out ch1, out ch2);
+                else HashString128(raw, out ch1, out ch2);
+                MixRowColumn(ref a, ref b, i, ch1, ch2);
             }
+            h1 = a;
+            h2 = b;
         }
 
         internal static ulong ComputeKeyHash64(IList<string> values, int[] keyCols, out bool isNullKey)
@@ -1957,6 +2108,33 @@ namespace AuroraAnalyzer
                 _invalidKey = true;
                 return;
             }
+            Insert(pkHash, rowHash);
+        }
+
+        internal void AddFromHashes(ulong[] hash1, ulong[] hash2, bool[] hashed, ulong rowHash)
+        {
+            _totalRows++;
+            if (_invalidKey || _heap == null) return;
+            int keyCount = _keyCols.Length;
+            int nHash = hashed == null ? 0 : hashed.Length;
+            ulong acc = 0xA0761D6478BD642FUL ^ ((ulong)keyCount * 0x9E3779B97F4A7C15UL);
+            for (int k = 0; k < keyCount; k++)
+            {
+                int ci = _keyCols[k];
+                if (ci < 0 || ci >= nHash || !hashed[ci])
+                {
+                    _invalidKey = true;
+                    return;
+                }
+                ulong h1 = hash1[ci];
+                ulong h2 = hash2[ci];
+                acc = ContentHashHelper.Mix64(acc ^ h1 ^ (h2 * 0x9E3779B185EBCA87UL) ^ ((ulong)(k + 1) * 0xBF58476D1CE4E5B9UL));
+            }
+            Insert(acc, rowHash);
+        }
+
+        private void Insert(ulong pkHash, ulong rowHash)
+        {
             if (_count < _cap)
             {
                 RowSketchEntry entry;
@@ -2402,6 +2580,9 @@ namespace AuroraAnalyzer
         public long[] HourlyCounts;
 
         private Random _rng;
+        private int _cachedDayKey;
+        private string _cachedDayText;
+        private string _cachedMonthText;
 
         public ColumnAccumulator(string name, int idx)
         {
@@ -2413,12 +2594,13 @@ namespace AuroraAnalyzer
             NumMax = double.MinValue;
             ByteLenSample = new List<int>(256);
             NumSample = new List<double>(256);
-            Freq = new Dictionary<string, long>(StringComparer.Ordinal);
+            Freq = new Dictionary<string, long>(32, StringComparer.Ordinal);
             MonthlyCounts = new SortedDictionary<string, long>(StringComparer.Ordinal);
             DailyCounts = new Dictionary<string, long>(StringComparer.Ordinal);
             DayOfWeekCounts = new long[7];
             HourlyCounts = new long[24];
             _rng = new Random(1337 + idx * 31);
+            _cachedDayKey = -1;
         }
 
         private static readonly string[] DateFormats = new string[]
@@ -2444,29 +2626,33 @@ namespace AuroraAnalyzer
             "yyyy/M/d"
         };
 
-        private static readonly Regex UuidRegex = new Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", RegexOptions.Compiled);
-
-        public void Add(string raw)
+        public void Add(string raw, out int rowUtf8Bytes, out ulong hash1, out ulong hash2, out bool hashed)
         {
+            hash1 = 0UL;
+            hash2 = 0UL;
+            hashed = false;
+            rowUtf8Bytes = 0;
             TotalRows++;
             if (ContentHashHelper.IsNullToken(raw))
             {
                 NullCount++;
+                if (raw != null && raw.Length != 0) rowUtf8Bytes = ContentHashHelper.Utf8ByteCount(raw);
                 return;
             }
 
             NonNullCount++;
-            ulong vh1, vh2;
-            ContentHashHelper.HashString128(raw, out vh1, out vh2);
+            hashed = true;
+            int byteLen;
+            ContentHashHelper.HashString128Utf8(raw, out hash1, out hash2, out byteLen);
+            rowUtf8Bytes = byteLen;
             unchecked
             {
-                HashSum1 += vh1;
-                HashSum2 += vh2;
-                HashXor1 ^= vh1;
-                HashXor2 ^= vh2;
+                HashSum1 += hash1;
+                HashSum2 += hash2;
+                HashXor1 ^= hash1;
+                HashXor2 ^= hash2;
             }
             int charLen = raw.Length;
-            int byteLen = Encoding.UTF8.GetByteCount(raw);
             if (charLen < MinCharLen) MinCharLen = charLen;
             if (charLen > MaxCharLen) MaxCharLen = charLen;
             SumCharLen += charLen;
@@ -2524,12 +2710,13 @@ namespace AuroraAnalyzer
             {
                 long intVal;
                 double dblVal;
-                if (long.TryParse(trimmed, NumberStyles.Integer, CultureInfo.InvariantCulture, out intVal))
+                if (TryParseInt64Strict(trimmed, out intVal))
                 {
                     IntCount++;
                     AddNumeric((double)intVal);
                 }
-                else if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out dblVal) &&
+                else if (ShouldTryFloat(trimmed) &&
+                         double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out dblVal) &&
                          !double.IsNaN(dblVal) && !double.IsInfinity(dblVal))
                 {
                     FloatCount++;
@@ -2544,43 +2731,18 @@ namespace AuroraAnalyzer
                 (trimmed[4] == '-' || trimmed[4] == '/'))
             {
                 DateTime dt;
-                if (DateTime.TryParseExact(trimmed, DateFormats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out dt))
+                bool hasTimePart;
+                bool parsed = TryParsePaddedDate(trimmed, out dt, out hasTimePart);
+                if (!parsed && DateTime.TryParseExact(trimmed, DateFormats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out dt))
                 {
-                    if (dt.Year >= 1970 && dt.Year <= 2100)
-                    {
-                        bool hasTimePart = (trimmed.Length > 10 && trimmed.IndexOf(':') >= 0);
-                        if (hasTimePart)
-                        {
-                            DateTimeCount++;
-                            HasTime = true;
-                        }
-                        else
-                        {
-                            DateOnlyCount++;
-                        }
-                        if (!MinDate.HasValue || dt < MinDate.Value) MinDate = dt;
-                        if (!MaxDate.HasValue || dt > MaxDate.Value) MaxDate = dt;
-
-                        string ym = dt.ToString("yyyy-MM", CultureInfo.InvariantCulture);
-                        long mc;
-                        MonthlyCounts[ym] = MonthlyCounts.TryGetValue(ym, out mc) ? mc + 1 : 1;
-
-                        string ymd = dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-                        long dc;
-                        DailyCounts[ymd] = DailyCounts.TryGetValue(ymd, out dc) ? dc + 1 : 1;
-
-                        int dow = ((int)dt.DayOfWeek + 6) % 7; // Mon=0 .. Sun=6
-                        DayOfWeekCounts[dow]++;
-                        if (hasTimePart)
-                        {
-                            HourlyCounts[dt.Hour]++;
-                        }
-                    }
+                    parsed = true;
+                    hasTimePart = (trimmed.Length > 10 && trimmed.IndexOf(':') >= 0);
                 }
+                if (parsed && dt.Year >= 1970 && dt.Year <= 2100) NoteDate(dt, hasTimePart);
             }
 
             // Check UUID / JSON / Email
-            if (trimmed.Length == 36 && UuidRegex.IsMatch(trimmed))
+            if (IsUuid(trimmed))
             {
                 UuidCount++;
             }
@@ -2599,6 +2761,206 @@ namespace AuroraAnalyzer
                     EmailCount++;
                 }
             }
+        }
+
+        private static bool TryParseInt64Strict(string s, out long value)
+        {
+            value = 0L;
+            if (string.IsNullOrEmpty(s)) return false;
+            int i = 0;
+            bool neg = false;
+            if (s[0] == '+' || s[0] == '-')
+            {
+                neg = s[0] == '-';
+                i++;
+                if (i >= s.Length) return false;
+            }
+            ulong acc = 0UL;
+            ulong limit = neg ? 9223372036854775808UL : 9223372036854775807UL;
+            for (; i < s.Length; i++)
+            {
+                char ch = s[i];
+                if (ch < '0' || ch > '9') return false;
+                ulong d = (ulong)(ch - '0');
+                if (acc > limit / 10UL || (acc == limit / 10UL && d > limit % 10UL)) return false;
+                acc = acc * 10UL + d;
+            }
+            value = neg ? unchecked(-(long)acc) : (long)acc;
+            return true;
+        }
+
+        private static bool ShouldTryFloat(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return false;
+            bool digit = false;
+            bool mark = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char ch = s[i];
+                if (ch >= '0' && ch <= '9') digit = true;
+                else if (ch == '.' || ch == 'e' || ch == 'E' || ch == '+' || ch == '-') mark = true;
+                else return false;
+            }
+            if (!digit) return false;
+            return mark || s.Length > 18;
+        }
+
+        private static bool IsUuid(string s)
+        {
+            if (s == null || s.Length != 36) return false;
+            for (int i = 0; i < 36; i++)
+            {
+                char ch = s[i];
+                if (i == 8 || i == 13 || i == 18 || i == 23)
+                {
+                    if (ch != '-') return false;
+                }
+                else if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static bool IsAsciiDigit(char ch)
+        {
+            return ch >= '0' && ch <= '9';
+        }
+
+        private static int TwoDigits(string s, int i)
+        {
+            return (s[i] - '0') * 10 + (s[i + 1] - '0');
+        }
+
+        private static bool TryMakeUtc(int year, int month, int day, int hour, int minute, int second, long fractionTicks, out DateTime dt)
+        {
+            dt = default(DateTime);
+            try
+            {
+                dt = new DateTime(year, month, day, hour, minute, second, DateTimeKind.Utc);
+                if (fractionTicks != 0L) dt = dt.AddTicks(fractionTicks);
+                return true;
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return false;
+            }
+        }
+
+        // Zero-padded MySQL / ISO forms only. Every other shape falls back to TryParseExact.
+        private static bool TryParsePaddedDate(string s, out DateTime dt, out bool hasTime)
+        {
+            dt = default(DateTime);
+            hasTime = false;
+            int n = s.Length;
+            if (n < 10 || n > 27) return false;
+            char sep = s[4];
+            if ((sep != '-' && sep != '/') || s[7] != sep) return false;
+            if (!IsAsciiDigit(s[0]) || !IsAsciiDigit(s[1]) || !IsAsciiDigit(s[2]) || !IsAsciiDigit(s[3]) ||
+                !IsAsciiDigit(s[5]) || !IsAsciiDigit(s[6]) || !IsAsciiDigit(s[8]) || !IsAsciiDigit(s[9])) return false;
+            int year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+            int month = TwoDigits(s, 5);
+            int day = TwoDigits(s, 8);
+            if (n == 10) return TryMakeUtc(year, month, day, 0, 0, 0, 0L, out dt);
+
+            bool tee = s[10] == 'T';
+            if (s[10] != ' ' && !tee) return false;
+            if (sep == '/' && tee) return false;
+            if (n < 19 || s[13] != ':' || s[16] != ':') return false;
+            if (!IsAsciiDigit(s[11]) || !IsAsciiDigit(s[12]) || !IsAsciiDigit(s[14]) ||
+                !IsAsciiDigit(s[15]) || !IsAsciiDigit(s[17]) || !IsAsciiDigit(s[18])) return false;
+            int hour = TwoDigits(s, 11);
+            int minute = TwoDigits(s, 14);
+            int second = TwoDigits(s, 17);
+            long fractionTicks = 0L;
+            if (n == 19)
+            {
+                hasTime = true;
+                return TryMakeUtc(year, month, day, hour, minute, second, 0L, out dt);
+            }
+            if (n == 20 && s[19] == 'Z')
+            {
+                if (!tee || sep != '-') return false;
+                hasTime = true;
+                return TryMakeUtc(year, month, day, hour, minute, second, 0L, out dt);
+            }
+            if (s[19] != '.') return false;
+            int fracEnd = n;
+            if (s[n - 1] == 'Z')
+            {
+                if (!tee || sep != '-') return false;
+                fracEnd = n - 1;
+            }
+            int digits = fracEnd - 20;
+            if (digits < 1 || digits > 6) return false;
+            if (sep == '/') return false;
+            if (tee && digits != 3) return false;
+            int frac = 0;
+            for (int i = 20; i < fracEnd; i++)
+            {
+                if (!IsAsciiDigit(s[i])) return false;
+                frac = frac * 10 + (s[i] - '0');
+            }
+            for (int k = digits; k < 7; k++) frac *= 10;
+            fractionTicks = frac;
+            hasTime = true;
+            return TryMakeUtc(year, month, day, hour, minute, second, fractionTicks, out dt);
+        }
+
+        private void NoteDate(DateTime dt, bool hasTimePart)
+        {
+            if (hasTimePart)
+            {
+                DateTimeCount++;
+                HasTime = true;
+            }
+            else
+            {
+                DateOnlyCount++;
+            }
+            if (!MinDate.HasValue || dt < MinDate.Value) MinDate = dt;
+            if (!MaxDate.HasValue || dt > MaxDate.Value) MaxDate = dt;
+
+            int dayKey = dt.Year * 10000 + dt.Month * 100 + dt.Day;
+            string ymd;
+            string ym;
+            if (_cachedDayKey == dayKey)
+            {
+                ymd = _cachedDayText;
+                ym = _cachedMonthText;
+            }
+            else
+            {
+                ymd = FormatDay(dt.Year, dt.Month, dt.Day);
+                ym = ymd.Substring(0, 7);
+                _cachedDayKey = dayKey;
+                _cachedDayText = ymd;
+                _cachedMonthText = ym;
+            }
+            long mc;
+            MonthlyCounts[ym] = MonthlyCounts.TryGetValue(ym, out mc) ? mc + 1 : 1;
+            long dc;
+            DailyCounts[ymd] = DailyCounts.TryGetValue(ymd, out dc) ? dc + 1 : 1;
+            int dow = ((int)dt.DayOfWeek + 6) % 7;
+            DayOfWeekCounts[dow]++;
+            if (hasTimePart) HourlyCounts[dt.Hour]++;
+        }
+
+        private static string FormatDay(int year, int month, int day)
+        {
+            char[] chars = new char[10];
+            chars[0] = (char)('0' + year / 1000);
+            chars[1] = (char)('0' + (year / 100) % 10);
+            chars[2] = (char)('0' + (year / 10) % 10);
+            chars[3] = (char)('0' + year % 10);
+            chars[4] = '-';
+            chars[5] = (char)('0' + month / 10);
+            chars[6] = (char)('0' + month % 10);
+            chars[7] = '-';
+            chars[8] = (char)('0' + day / 10);
+            chars[9] = (char)('0' + day % 10);
+            return new string(chars);
         }
 
         private void AddNumeric(double v)
@@ -2646,6 +3008,9 @@ namespace AuroraAnalyzer
             new Dictionary<string, Dictionary<string, long>>(StringComparer.OrdinalIgnoreCase);
         private List<ColumnAccumulator> _columns;
         private RowChurnSketchBuilder _sketchBuilder;
+        private ulong[] _h1;
+        private ulong[] _h2;
+        private bool[] _hashed;
         private ulong _rowHashSum1, _rowHashSum2, _rowHashXor1, _rowHashXor2;
         private long _rows, _raggedRows, _sumRowBytes, _minRowBytes = long.MaxValue, _maxRowBytes;
 
@@ -2661,33 +3026,27 @@ namespace AuroraAnalyzer
             string keyLabel;
             int[] keyCols = ContentHashHelper.SelectSketchKeyColumns(normHeaders, null, out keyLabel);
             _sketchBuilder = new RowChurnSketchBuilder(keyCols, keyLabel, false, RowChurnSketchBuilder.DefaultCap);
+            _h1 = new ulong[_columns.Count];
+            _h2 = new ulong[_columns.Count];
+            _hashed = new bool[_columns.Count];
         }
 
         internal void AddRow(IList<string> row)
         {
             if (row.Count == 1 && string.IsNullOrEmpty(row[0]) && _columns.Count > 1) return;
             if (row.Count != _columns.Count) _raggedRows++;
-            long bytes = 0;
-            for (int i = 0; i < _columns.Count; i++)
-            {
-                string value = i < row.Count ? row[i] : null;
-                if (!string.IsNullOrEmpty(value)) bytes += Encoding.UTF8.GetByteCount(value);
-                _columns[i].Add(value);
-            }
-            ulong rh1, rh2;
-            ContentHashHelper.ComputeRowHash128(row, _columns.Count, out rh1, out rh2);
+            CsvAnalysisEngine.RowHashAccum rh = CsvAnalysisEngine.AccumulateRow(row, _columns, _h1, _h2, _hashed, _sketchBuilder);
             unchecked
             {
-                _rowHashSum1 += rh1;
-                _rowHashSum2 += rh2;
-                _rowHashXor1 ^= rh1;
-                _rowHashXor2 ^= rh2;
+                _rowHashSum1 += rh.H1;
+                _rowHashSum2 += rh.H2;
+                _rowHashXor1 ^= rh.H1;
+                _rowHashXor2 ^= rh.H2;
             }
-            if (_sketchBuilder != null) _sketchBuilder.Add(row, rh1);
             _rows++;
-            _sumRowBytes += bytes;
-            if (bytes < _minRowBytes) _minRowBytes = bytes;
-            _maxRowBytes = Math.Max(_maxRowBytes, bytes);
+            _sumRowBytes += rh.Utf8Bytes;
+            if (rh.Utf8Bytes < _minRowBytes) _minRowBytes = rh.Utf8Bytes;
+            if (rh.Utf8Bytes > _maxRowBytes) _maxRowBytes = rh.Utf8Bytes;
         }
 
         internal void Complete(long size)
@@ -2715,6 +3074,52 @@ namespace AuroraAnalyzer
 
     public static class CsvAnalysisEngine
     {
+        internal struct RowHashAccum
+        {
+            public ulong H1;
+            public ulong H2;
+            public long Utf8Bytes;
+        }
+
+        internal static RowHashAccum AccumulateRow(
+            IList<string> row,
+            List<ColumnAccumulator> columns,
+            ulong[] hash1,
+            ulong[] hash2,
+            bool[] hashed,
+            RowChurnSketchBuilder sketch)
+        {
+            RowHashAccum result = new RowHashAccum();
+            int colCount = columns.Count;
+            int vCount = row != null ? row.Count : 0;
+            ulong a, b;
+            ContentHashHelper.BeginRowHash(colCount, out a, out b);
+            for (int i = 0; i < colCount; i++)
+            {
+                string value = i < vCount ? row[i] : null;
+                int fieldBytes;
+                ulong ch1, ch2;
+                bool colHashed;
+                columns[i].Add(value, out fieldBytes, out hash1[i], out hash2[i], out colHashed);
+                hashed[i] = colHashed;
+                result.Utf8Bytes += fieldBytes;
+                if (colHashed)
+                {
+                    ch1 = hash1[i];
+                    ch2 = hash2[i];
+                }
+                else
+                {
+                    ContentHashHelper.NullColumnHash(i, out ch1, out ch2);
+                }
+                ContentHashHelper.MixRowColumn(ref a, ref b, i, ch1, ch2);
+            }
+            result.H1 = a;
+            result.H2 = b;
+            if (sketch != null) sketch.AddFromHashes(hash1, hash2, hashed, a);
+            return result;
+        }
+
         public static FolderAnalysisResult AnalyzeFolder(string folderPath)
         {
             return AnalyzeFolder(folderPath, null, null);
@@ -2831,7 +3236,7 @@ namespace AuroraAnalyzer
         {
             byte[] buf = new byte[65536];
             int read = 0;
-            using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536, FileOptions.SequentialScan))
             {
                 read = fs.Read(buf, 0, buf.Length);
             }
@@ -2885,90 +3290,140 @@ namespace AuroraAnalyzer
             }
         }
 
-        private static List<string> ReadNextCsvRecord(TextReader reader)
+        private sealed class CsvRecordReader
         {
-            int c = reader.Read();
-            if (c == -1) return null;
+            private readonly TextReader _reader;
+            private readonly char[] _buf = new char[65536];
+            private readonly StringBuilder _sb = new StringBuilder(64);
+            private readonly List<string> _fields = new List<string>();
+            private int _pos;
+            private int _len;
 
-            List<string> fields = new List<string>();
-            StringBuilder sb = new StringBuilder();
-            bool inQuotes = false;
-            bool fieldStart = true;
+            internal List<string> Fields { get { return _fields; } }
 
-            while (c != -1)
+            internal CsvRecordReader(TextReader reader)
             {
-                char ch = (char)c;
-                if (inQuotes)
+                _reader = reader;
+            }
+
+            internal bool Read()
+            {
+                if (!Ensure()) return false;
+                _fields.Clear();
+                _sb.Length = 0;
+                bool inQuotes = false;
+                bool fieldStart = true;
+                while (true)
                 {
-                    if (ch == '"')
+                    if (_pos >= _len && !Fill())
                     {
-                        int next = reader.Peek();
-                        if (next == '"')
+                        _fields.Add(FinishField());
+                        return true;
+                    }
+                    char ch = _buf[_pos];
+                    if (inQuotes)
+                    {
+                        if (ch == '"')
                         {
-                            reader.Read();
-                            sb.Append('"');
+                            _pos++;
+                            if (!Ensure())
+                            {
+                                inQuotes = false;
+                                continue;
+                            }
+                            if (_buf[_pos] == '"')
+                            {
+                                _pos++;
+                                _sb.Append('"');
+                            }
+                            else
+                            {
+                                inQuotes = false;
+                            }
                         }
                         else
                         {
-                            inQuotes = false;
+                            int start = _pos;
+                            while (_pos < _len && _buf[_pos] != '"') _pos++;
+                            _sb.Append(_buf, start, _pos - start);
                         }
                     }
-                    else
+                    else if (fieldStart && ch == '"')
                     {
-                        sb.Append(ch);
-                    }
-                }
-                else
-                {
-                    if (fieldStart && ch == '"')
-                    {
+                        _pos++;
                         inQuotes = true;
                         fieldStart = false;
                     }
                     else if (ch == ',')
                     {
-                        fields.Add(sb.ToString());
-                        sb.Length = 0;
+                        _pos++;
+                        _fields.Add(FinishField());
                         fieldStart = true;
                     }
                     else if (ch == '\r')
                     {
-                        if (reader.Peek() == '\n') reader.Read();
-                        fields.Add(sb.ToString());
-                        return fields;
+                        _pos++;
+                        if (Ensure() && _buf[_pos] == '\n') _pos++;
+                        _fields.Add(FinishField());
+                        return true;
                     }
                     else if (ch == '\n')
                     {
-                        fields.Add(sb.ToString());
-                        return fields;
+                        _pos++;
+                        _fields.Add(FinishField());
+                        return true;
                     }
                     else
                     {
-                        sb.Append(ch);
+                        int start = _pos;
+                        while (_pos < _len)
+                        {
+                            char c2 = _buf[_pos];
+                            if (c2 == ',' || c2 == '\r' || c2 == '\n') break;
+                            _pos++;
+                        }
+                        _sb.Append(_buf, start, _pos - start);
                         fieldStart = false;
                     }
                 }
-                c = reader.Read();
             }
 
-            fields.Add(sb.ToString());
-            return fields;
+            private string FinishField()
+            {
+                string value = _sb.ToString();
+                _sb.Length = 0;
+                return value;
+            }
+
+            private bool Ensure()
+            {
+                if (_pos < _len) return true;
+                return Fill();
+            }
+
+            private bool Fill()
+            {
+                _len = _reader.Read(_buf, 0, _buf.Length);
+                _pos = 0;
+                return _len > 0;
+            }
         }
 
         private static CsvTableProfile AnalyzeCsvFile(string filePath, OperationCancelState cancelState)
         {
             string encName;
             Encoding enc = DetectEncoding(filePath, out encName);
-            using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (StreamReader sr = new StreamReader(fs, enc, true, 65536))
+            using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 262144, FileOptions.SequentialScan))
+            using (StreamReader sr = new StreamReader(fs, enc, true, 262144))
             {
-                CsvTableProfile profile = new CsvTableProfile(filePath, encName, ReadNextCsvRecord(sr));
-                List<string> row;
+                CsvRecordReader csv = new CsvRecordReader(sr);
+                IList<string> header = csv.Read() ? csv.Fields : null;
+                CsvTableProfile profile = new CsvTableProfile(filePath, encName, header);
                 long rowsRead = 0;
-                while ((row = ReadNextCsvRecord(sr)) != null)
+                while (csv.Read())
                 {
                     if (cancelState != null && (rowsRead++ & 2047) == 0) cancelState.ThrowIfCancelled();
-                    profile.AddRow(row);
+                    profile.AddRow(csv.Fields);
                 }
                 if (cancelState != null) cancelState.ThrowIfCancelled();
                 profile.Complete(fs.Length);
@@ -4396,6 +4851,9 @@ namespace AuroraAnalyzer
 
             List<ColumnAccumulator> accs = new List<ColumnAccumulator>();
             RowChurnSketchBuilder sketchBuilder = null;
+            ulong[] hash1 = null;
+            ulong[] hash2 = null;
+            bool[] hashed = null;
             ulong rowHashSum1 = 0UL, rowHashSum2 = 0UL, rowHashXor1 = 0UL, rowHashXor2 = 0UL;
             long rowCount = 0;
             long sumRowBytes = 0;
@@ -4433,23 +4891,20 @@ namespace AuroraAnalyzer
                     string keyLabel;
                     int[] keyCols = ContentHashHelper.SelectSketchKeyColumns(normHeaders, pkSrc, out keyLabel);
                     sketchBuilder = new RowChurnSketchBuilder(keyCols, keyLabel, pkSrc != null && pkSrc.Count > 0, RowChurnSketchBuilder.DefaultCap);
+                    hash1 = new ulong[colCount];
+                    hash2 = new ulong[colCount];
+                    hashed = new bool[colCount];
                 },
                 delegate(string[] rowVals, long rawRowBytes, long csvLineBytes)
                 {
-                    for (int c = 0; c < colCount; c++)
-                    {
-                        accs[c].Add(rowVals[c]);
-                    }
-                    ulong rh1, rh2;
-                    ContentHashHelper.ComputeRowHash128(rowVals, colCount, out rh1, out rh2);
+                    CsvAnalysisEngine.RowHashAccum rh = CsvAnalysisEngine.AccumulateRow(rowVals, accs, hash1, hash2, hashed, sketchBuilder);
                     unchecked
                     {
-                        rowHashSum1 += rh1;
-                        rowHashSum2 += rh2;
-                        rowHashXor1 ^= rh1;
-                        rowHashXor2 ^= rh2;
+                        rowHashSum1 += rh.H1;
+                        rowHashSum2 += rh.H2;
+                        rowHashXor1 ^= rh.H1;
+                        rowHashXor2 ^= rh.H2;
                     }
-                    if (sketchBuilder != null) sketchBuilder.Add(rowVals, rh1);
                     sumRowBytes += rawRowBytes;
                     if (rawRowBytes < minRowBytes) minRowBytes = rawRowBytes;
                     if (rawRowBytes > maxRowBytes) maxRowBytes = rawRowBytes;
@@ -11740,6 +12195,7 @@ function Export-AnalysisToExcelCom {
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
         $excel.ScreenUpdating = $false
+        try { $excel.EnableEvents = $false } catch { }
         $targetSheetCount = if ($DetailedAnalysis) { 8 } else { 3 }
         $excel.SheetsInNewWorkbook = $targetSheetCount
         $wb = $excel.Workbooks.Add()
@@ -12941,9 +13397,7 @@ function Export-AnalysisToOpenXml {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     function XmlEsc([string]$s) {
-        if ($null -eq $s) { return '' }
-        $clean = [regex]::Replace($s, '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
-        return [System.Security.SecurityElement]::Escape($clean)
+        return [AuroraAnalyzer.XmlText]::Escape($s)
     }
 
     function ColLetter([int]$colIndex1Based) {
@@ -14022,6 +14476,7 @@ function Export-ComparisonToExcelCom {
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
         $excel.ScreenUpdating = $false
+        try { $excel.EnableEvents = $false } catch { }
         $targetCmpSheets = 8
         $excel.SheetsInNewWorkbook = $targetCmpSheets
         $wb = $excel.Workbooks.Add()
@@ -14953,9 +15408,7 @@ function Export-ComparisonToOpenXml {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     function XmlEscCmp([string]$s) {
-        if ($null -eq $s) { return '' }
-        $clean = [regex]::Replace($s, '[\x00-\x08\x0B\x0C\x0E-\x1F]', '')
-        return [System.Security.SecurityElement]::Escape($clean)
+        return [AuroraAnalyzer.XmlText]::Escape($s)
     }
 
     function ColLetterCmp([int]$colIndex1Based) {
